@@ -5,6 +5,7 @@ import { useBranding } from "../context/BrandingContext";
 import { Icon } from "../data/icons";
 import CommandPalette from "./CommandPalette";
 import LayoutSwitcher from "./LayoutSwitcher";
+import { PANEL_VERSION } from "../constants";
 import { useState, useRef, useEffect } from "react";
 import { GlobalNotificationBanner } from "../context/NotificationContext";
 
@@ -132,7 +133,7 @@ export default function CommandLayout() {
                 {!branding.hideBranding && (
                   <span className="text-lg font-bold logo-glow">
                     {branding.panelName === "DockPanel" ? (
-                      <><span className="text-rust-400">Dock</span><span className="text-dark-50">Panel</span></>
+                      <><span className="text-rust-400">Re-</span><span className="text-rust-400">Dock</span><span className="text-dark-50">Panel</span></>
                     ) : (
                       <span className="text-dark-50">{branding.panelName}</span>
                     )}
@@ -339,16 +340,28 @@ export default function CommandLayout() {
                 </button>
               </div>
             </div>
+
+            {/* Version & Update Indicator */}
+            <div className="px-3 pt-2 mt-2 border-t border-dark-700/40 flex items-center justify-between text-[11px]">
+              <span className="font-mono text-dark-300 font-medium">Re-dockpanel v{PANEL_VERSION}</span>
+              <span className="inline-flex items-center gap-1 text-[10px] text-rust-400 bg-rust-500/10 px-1.5 py-0.5 rounded font-mono">
+                <span className="w-1.5 h-1.5 rounded-full bg-rust-400" />
+                Up to date
+              </span>
+            </div>
           </div>
         )}
 
         {/* Minimal sidebar footer when header is shown */}
-        {showHeader && state.canSeeHealth && (
-          <div className="px-4 py-3 border-t border-dark-600/50">
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full shrink-0 ${state.apiHealthy === null ? "bg-dark-400" : state.apiHealthy ? "bg-rust-500" : "bg-danger-500 animate-pulse"}`} />
-              <span className="text-[10px] text-dark-400 flex-1">{state.apiHealthy === null ? "Checking..." : state.apiHealthy ? "All Systems OK" : "Issues Detected"}</span>
-            </div>
+        {showHeader && (
+          <div className="px-4 py-2.5 border-t border-dark-600/50 flex items-center justify-between">
+            {state.canSeeHealth && (
+              <div className="flex items-center gap-2">
+                <div className={`w-2 h-2 rounded-full shrink-0 ${state.apiHealthy === null ? "bg-dark-400" : state.apiHealthy ? "bg-rust-500" : "bg-danger-500 animate-pulse"}`} />
+                <span className="text-[10px] text-dark-400">{state.apiHealthy === null ? "Checking..." : state.apiHealthy ? "All Systems OK" : "Issues Detected"}</span>
+              </div>
+            )}
+            <span className="text-[10px] font-mono text-dark-400">v{PANEL_VERSION}</span>
           </div>
         )}
       </aside>

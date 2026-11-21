@@ -381,17 +381,25 @@ pub async fn all_wp_sites(
     AuthUser(claims): AuthUser,
     ServerScope(server_id, agent): ServerScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // No admin check — query already filters by user_id so owners only see their own sites
-
-    // Get all sites for this server
-    let sites: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, domain FROM sites WHERE user_id = $1 AND server_id = $2 ORDER BY domain",
-    )
-    .bind(claims.sub)
-    .bind(server_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| internal_error("all wp sites", e))?;
+    // Admin sees all sites on the server; regular users/resellers see their own sites
+    let sites: Vec<(Uuid, String)> = if claims.role == "admin" {
+        sqlx::query_as(
+            "SELECT id, domain FROM sites WHERE server_id = $1 ORDER BY domain",
+        )
+        .bind(server_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| internal_error("all wp sites (admin)", e))?
+    } else {
+        sqlx::query_as(
+            "SELECT id, domain FROM sites WHERE user_id = $1 AND server_id = $2 ORDER BY domain",
+        )
+        .bind(claims.sub)
+        .bind(server_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| internal_error("all wp sites", e))?
+    };
 
     let mut wp_sites = Vec::new();
 
@@ -453,7 +461,7 @@ pub async fn bulk_update(
     ServerScope(server_id, agent): ServerScope,
     Json(body): Json<BulkUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
+    // Both admins and site owners can trigger bulk updates; site access is enforced below via SITE_CALLER_PREDICATE
 
     if !["plugins", "themes", "core", "all"].contains(&body.target.as_str()) {
         return Err(err(

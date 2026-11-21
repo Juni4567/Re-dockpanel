@@ -77,7 +77,7 @@ export const navGroups: NavGroup[] = [
       { to: "/", label: "Dashboard", iconName: "dashboard" },
       { to: "/sites", label: "Sites", iconName: "sites" },
       { to: "/databases", label: "Databases", iconName: "databases" },
-      { to: "/wordpress-toolkit", label: "WP Toolkit", iconName: "wordpress", adminOnly: true },
+      { to: "/wordpress-toolkit", label: "WP Toolkit", iconName: "wordpress" },
       { to: "/apps", label: "Docker Apps", iconName: "apps", adminOnly: true },
       { to: "/git-deploys", label: "Git Deploy", iconName: "gitDeploys", adminOnly: true },
       { to: "/migration", label: "Migration", iconName: "migration", adminOnly: true },

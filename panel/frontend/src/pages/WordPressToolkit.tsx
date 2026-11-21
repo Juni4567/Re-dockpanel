@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import { api, ApiError } from "../api";
 import { Link } from "react-router-dom";
 import { timeAgo } from "../utils/format";
+import SiteThumbnail from "../components/SiteThumbnail";
 
 interface WPSite {
   site_id: string;
@@ -105,7 +106,7 @@ interface HardenResult {
 
 export default function WordPressToolkit() {
   const { user } = useAuth();
-  if (!user || user.role !== "admin") return <Navigate to="/" replace />;
+  if (!user) return <Navigate to="/login" replace />;
   const [tab, setTab] = useState<"overview" | "security">("overview");
   const [sites, setSites] = useState<WPSite[]>([]);
   const [loading, setLoading] = useState(true);
@@ -533,7 +534,8 @@ export default function WordPressToolkit() {
                     className="mt-1 w-4 h-4 rounded border-dark-500 bg-dark-700 text-rust-500 focus:ring-rust-500 focus:ring-offset-0"
                   />
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
+                    <div className="flex items-center gap-2.5 mb-1">
+                      <SiteThumbnail domain={site.domain} className="w-9 h-6" />
                       <h3 className="text-sm font-semibold text-dark-50 truncate">
                         {site.domain}
                       </h3>

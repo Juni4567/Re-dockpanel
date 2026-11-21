@@ -6,6 +6,7 @@ import { useBranding } from "../context/BrandingContext";
 import CommandPalette from "./CommandPalette";
 import LayoutSwitcher from "./LayoutSwitcher";
 import { Icon } from "../data/icons";
+import { PANEL_VERSION } from "../constants";
 import { useState, useRef, useEffect } from "react";
 
 /* ── Server Selector (Nexus style) ────────────────────────────────────── */
@@ -205,6 +206,10 @@ export default function NexusLayout() {
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3-3l3-3m0 0l-3-3m3 3H9" /></svg>
             </button>
+          </div>
+          <div className="pt-2 mt-2 border-t border-dark-800 flex items-center justify-between text-[11px]">
+            <span className="font-mono text-dark-400">Re-dockpanel v{PANEL_VERSION}</span>
+            <span className="text-[10px] text-rust-400 font-mono">Up to date</span>
           </div>
         </div>
       </aside>

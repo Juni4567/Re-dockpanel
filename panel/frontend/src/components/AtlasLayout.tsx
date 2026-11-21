@@ -6,6 +6,7 @@ import { useServer } from "../context/ServerContext";
 import { Icon } from "../data/icons";
 import CommandPalette from "./CommandPalette";
 import LayoutSwitcher from "./LayoutSwitcher";
+import { PANEL_VERSION } from "../constants";
 
 export default function AtlasLayout() {
   const {
@@ -116,8 +117,13 @@ export default function AtlasLayout() {
               </svg>
             </div>
             <span className="text-sm font-bold">
+              <span className="text-rust-400">Re-</span>
               <span className="text-rust-400">Dock</span>
               <span className="text-dark-50">Panel</span>
+            </span>
+            <span className="hidden sm:inline-flex items-center gap-1 text-[10px] font-mono text-rust-400 bg-rust-500/10 border border-rust-500/20 px-1.5 py-0.5 rounded">
+              <span className="w-1.5 h-1.5 rounded-full bg-rust-400" />
+              v{PANEL_VERSION}
             </span>
           </Link>
 
@@ -459,8 +465,8 @@ export default function AtlasLayout() {
             </nav>
 
             {/* User section at bottom */}
-            <div className="px-4 py-4 border-t border-dark-600">
-              <div className="flex items-center justify-between">
+            <div className="px-4 py-3 border-t border-dark-600">
+              <div className="flex items-center justify-between mb-2">
                 <div className="min-w-0">
                   <p className="text-sm font-medium text-dark-100 truncate">{user.email}</p>
                   <p className="text-xs text-dark-400 capitalize">{user.role}</p>
@@ -473,6 +479,13 @@ export default function AtlasLayout() {
                 >
                   <Icon name="logout" className="w-5 h-5" />
                 </button>
+              </div>
+              <div className="pt-2 border-t border-dark-700/40 flex items-center justify-between text-[11px]">
+                <span className="font-mono text-dark-300 font-medium">Re-dockpanel v{PANEL_VERSION}</span>
+                <span className="inline-flex items-center gap-1 text-[10px] text-rust-400 bg-rust-500/10 px-1.5 py-0.5 rounded font-mono">
+                  <span className="w-1.5 h-1.5 rounded-full bg-rust-400" />
+                  Up to date
+                </span>
               </div>
             </div>
           </div>

@@ -6,6 +6,7 @@ import { statusColors, runtimeLabelsDetailed as runtimeLabels } from "../constan
 import { PrereqCallout, useDnsPrereq, prereqBlocks } from "../components/Prerequisite";
 import PhpVersionPicker from "../components/PhpVersionPicker";
 import ConfirmDialog from "../components/ConfirmDialog";
+import SiteThumbnail from "../components/SiteThumbnail";
 import { useAuth } from "../context/AuthContext";
 import { showGlobalNotification } from "../context/NotificationContext";
 
@@ -679,48 +680,78 @@ export default function SiteDetail() {
 
       {/* Header */}
       <div className="flex items-start justify-between mb-6">
-        <div>
-          <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">{site.domain}</h1>
-          <div className="flex items-center gap-3 mt-2">
-            <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
-              site.enabled === false ? "bg-warn-500/10 text-warn-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
-            }`}>
-              {site.enabled === false ? "disabled" : site.status}
-            </span>
-            <span className="text-sm text-dark-200">
-              {runtimeLabels[site.runtime] || site.runtime}
-            </span>
-            <button disabled={checkingHealth} onClick={async () => {
-              setCheckingHealth(true);
-              try { const data = await api.get<{ healthy: boolean; status: number; response_time_ms: number }>(`/sites/${id}/health`); setHealth(data); }
-              catch { setHealth({ healthy: false, status: 0, response_time_ms: 0 }); }
-              finally { setCheckingHealth(false); }
-            }} className="px-3 py-1.5 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors">
-              {checkingHealth ? "Checking..." : "Health Check"}
-            </button>
-            {health && (
-              <span className={`text-xs font-mono ${health.healthy ? "text-rust-400" : "text-danger-400"}`}>
-                {health.status > 0 ? `${health.status}` : "Down"} · {health.response_time_ms}ms
-              </span>
-            )}
-            {healthSummary && (
-              <span
-                title={[
-                  `SSL: ${healthSummary.ssl_status.enabled ? (healthSummary.ssl_status.days_until_expiry != null ? `expires in ${healthSummary.ssl_status.days_until_expiry}d` : "enabled") : "not enabled"}`,
-                  `Backup: ${healthSummary.backup_freshness.hours_since != null ? `${healthSummary.backup_freshness.hours_since}h ago` : "none on record"}`,
-                  `Uptime: ${healthSummary.uptime.monitor_enabled ? (healthSummary.uptime.status || "unknown") : "not monitored"}`,
-                ].join(" · ")}
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono ${
-                  healthSummary.score >= 80
-                    ? "bg-rust-500/10 text-rust-400"
-                    : healthSummary.score >= 50
-                      ? "bg-warn-500/10 text-warn-400"
-                      : "bg-danger-500/10 text-danger-400"
-                }`}
+        <div className="flex items-start gap-4">
+          <div className="w-20 h-14 rounded-lg border border-dark-600 bg-dark-800 shrink-0 overflow-hidden relative shadow-md group/thumb">
+            <SiteThumbnail domain={site.domain} className="w-full h-full" w={400} />
+            <a
+              href={`${site.ssl_enabled ? "https" : "http"}://${site.domain}`}
+              target="_blank"
+              rel="noreferrer"
+              className="absolute inset-0 bg-dark-950/60 opacity-0 group-hover/thumb:opacity-100 flex items-center justify-center transition-opacity text-white text-xs font-medium gap-1"
+              title="Open site in new tab"
+            >
+              <span>Visit</span>
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
+              </svg>
+            </a>
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-base font-semibold text-dark-50 font-mono tracking-tight">{site.domain}</h1>
+              <a
+                href={`${site.ssl_enabled ? "https" : "http"}://${site.domain}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-dark-400 hover:text-rust-400 transition-colors"
+                title="Open site in new tab"
               >
-                Health {healthSummary.score}
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25" />
+                </svg>
+              </a>
+            </div>
+            <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+              <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                site.enabled === false ? "bg-warn-500/10 text-warn-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
+              }`}>
+                {site.enabled === false ? "disabled" : site.status}
               </span>
-            )}
+              <span className="text-sm text-dark-200">
+                {runtimeLabels[site.runtime] || site.runtime}
+              </span>
+              <button disabled={checkingHealth} onClick={async () => {
+                setCheckingHealth(true);
+                try { const data = await api.get<{ healthy: boolean; status: number; response_time_ms: number }>(`/sites/${id}/health`); setHealth(data); }
+                catch { setHealth({ healthy: false, status: 0, response_time_ms: 0 }); }
+                finally { setCheckingHealth(false); }
+              }} className="px-3 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors">
+                {checkingHealth ? "Checking..." : "Health Check"}
+              </button>
+              {health && (
+                <span className={`text-xs font-mono ${health.healthy ? "text-rust-400" : "text-danger-400"}`}>
+                  {health.status > 0 ? `${health.status}` : "Down"} · {health.response_time_ms}ms
+                </span>
+              )}
+              {healthSummary && (
+                <span
+                  title={[
+                    `SSL: ${healthSummary.ssl_status.enabled ? (healthSummary.ssl_status.days_until_expiry != null ? `expires in ${healthSummary.ssl_status.days_until_expiry}d` : "enabled") : "not enabled"}`,
+                    `Backup: ${healthSummary.backup_freshness.hours_since != null ? `${healthSummary.backup_freshness.hours_since}h ago` : "none on record"}`,
+                    `Uptime: ${healthSummary.uptime.monitor_enabled ? (healthSummary.uptime.status || "unknown") : "not monitored"}`,
+                  ].join(" · ")}
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-mono ${
+                    healthSummary.score >= 80
+                      ? "bg-rust-500/10 text-rust-400"
+                      : healthSummary.score >= 50
+                        ? "bg-warn-500/10 text-warn-400"
+                        : "bg-danger-500/10 text-danger-400"
+                  }`}
+                >
+                  Health {healthSummary.score}
+                </span>
+              )}
+            </div>
           </div>
         </div>
         <div>
@@ -1509,7 +1540,7 @@ export default function SiteDetail() {
             </div>
           </div>
         </Link>
-        {site.php_preset === "wordpress" && (
+        {(site.php_preset === "wordpress" || site.runtime === "php") && (
           <Link
             to={`/sites/${id}/wordpress`}
             className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
@@ -1522,7 +1553,7 @@ export default function SiteDetail() {
               </div>
               <div>
                 <p className="text-sm font-medium text-dark-50">WordPress</p>
-                <p className="text-xs text-dark-200">Manage WP</p>
+                <p className="text-xs text-dark-200">{site.php_preset === "wordpress" ? "Manage WP" : "Toolkit / Install"}</p>
               </div>
             </div>
           </Link>

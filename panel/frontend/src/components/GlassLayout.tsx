@@ -6,6 +6,7 @@ import { useServer } from "../context/ServerContext";
 import { Icon } from "../data/icons";
 import CommandPalette from "./CommandPalette";
 import LayoutSwitcher from "./LayoutSwitcher";
+import { PANEL_VERSION } from "../constants";
 
 export default function GlassLayout() {
   const {
@@ -110,6 +111,7 @@ export default function GlassLayout() {
               </svg>
             </div>
             <span className="text-base font-semibold whitespace-nowrap overflow-hidden">
+              <span className="text-rust-400">Re-</span>
               <span className="text-rust-400">Dock</span>
               <span className="text-dark-50">Panel</span>
             </span>
@@ -293,26 +295,31 @@ export default function GlassLayout() {
 
         {/* ── Footer ─────────────────────────────────────────────── */}
         <div className="px-2 py-3 border-t border-dark-600/30">
-          {/* Collapsed: just the health dot centered — admins only. */}
-          {!expanded && !sidebarOpen && canSeeHealth && (
-            <div className="flex flex-col items-center gap-3">
-              <div
-                className={[
-                  "w-2.5 h-2.5 rounded-full shrink-0",
-                  apiHealthy === null
-                    ? "bg-dark-400"
-                    : apiHealthy
-                      ? "bg-rust-500"
-                      : "bg-danger-500 animate-pulse",
-                ].join(" ")}
-                title={
-                  apiHealthy === null
-                    ? "Checking..."
-                    : apiHealthy
-                      ? "All systems OK"
-                      : "Health issue"
-                }
-              />
+          {/* Collapsed: health dot + mini version */}
+          {!expanded && !sidebarOpen && (
+            <div className="flex flex-col items-center gap-2">
+              {canSeeHealth && (
+                <div
+                  className={[
+                    "w-2.5 h-2.5 rounded-full shrink-0",
+                    apiHealthy === null
+                      ? "bg-dark-400"
+                      : apiHealthy
+                        ? "bg-rust-500"
+                        : "bg-danger-500 animate-pulse",
+                  ].join(" ")}
+                  title={
+                    apiHealthy === null
+                      ? "Checking..."
+                      : apiHealthy
+                        ? "All systems OK"
+                        : "Health issue"
+                  }
+                />
+              )}
+              <span className="text-[9px] font-mono text-dark-400" title={`Re-dockpanel v${PANEL_VERSION} (Up to date)`}>
+                v{PANEL_VERSION.slice(0, 5)}
+              </span>
             </div>
           )}
 
@@ -392,6 +399,15 @@ export default function GlassLayout() {
                   </svg>
                 </button>
                 </div>
+              </div>
+
+              {/* Version & Update Indicator */}
+              <div className="px-3 pt-2 mt-2 border-t border-dark-600/30 flex items-center justify-between text-[11px]">
+                <span className="font-mono text-dark-300 font-medium">Re-dockpanel v{PANEL_VERSION}</span>
+                <span className="inline-flex items-center gap-1 text-[10px] text-rust-400 bg-rust-500/10 px-1.5 py-0.5 rounded font-mono">
+                  <span className="w-1.5 h-1.5 rounded-full bg-rust-400" />
+                  Up to date
+                </span>
               </div>
             </div>
           )}

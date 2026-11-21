@@ -1,3 +1,6 @@
+export const PANEL_NAME = "Re-dockpanel";
+export const PANEL_VERSION = "2.244.0";
+
 /**
  * The largest file the file manager accepts, in bytes.
  *

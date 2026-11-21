@@ -7,6 +7,7 @@ import ProvisionLog from "../components/ProvisionLog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
 import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
+import SiteThumbnail from "../components/SiteThumbnail";
 import { useAuth } from "../context/AuthContext";
 
 interface Site {
@@ -488,19 +489,15 @@ export default function Sites() {
                   {displayed.map((site) => (
                 <tr key={site.id} className="hover:bg-dark-700/30 transition-colors">
                   <td className="px-5 py-4">
-                    {/* Every row links to its own page, including a site this
-                        admin does not own. That used to be rendered as inert
-                        text, correctly, because a per-site read answered 404 for
-                        anybody but the owner — so the operator who had handed a
-                        site to a client could see it here and go no further.
-                        An administrator now reaches any site on a machine they
-                        run, so the link goes somewhere. */}
-                    <Link
-                      to={`/sites/${site.id}`}
-                      className="text-sm font-medium text-rust-400 hover:text-rust-300 font-mono"
-                    >
-                      {site.domain}
-                    </Link>
+                    <div className="flex items-center gap-3">
+                      <SiteThumbnail domain={site.domain} className="w-12 h-8" />
+                      <Link
+                        to={`/sites/${site.id}`}
+                        className="text-sm font-medium text-rust-400 hover:text-rust-300 font-mono"
+                      >
+                        {site.domain}
+                      </Link>
+                    </div>
                   </td>
                   <td className="px-5 py-4 text-sm text-dark-200 hidden sm:table-cell">
                     {runtimeLabels[site.runtime] || site.runtime}

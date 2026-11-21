@@ -4,6 +4,33 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.244.0] - 2026-11-22
+
+### Major: WordPress Toolkit Accessibility, Website Screenshot Thumbnails, Version Display & Database Improvements
+
+#### 1. WordPress Toolkit Visibility & Role Decoupling
+- **Universal Sidebar Access:** Removed `adminOnly` lock on `/wordpress-toolkit`, placing "WP Toolkit" directly in the main navigation sidebar under "Hosting" so all site operators can find and manage their WordPress installations easily.
+- **Scope-Aware Backend Queries:** Updated `/api/wordpress/sites` so that administrators view and monitor all WordPress installations across the entire server, while resellers and users view all installations they own.
+- **Per-Site Shortcut for PHP & WP:** Site Details now displays the WordPress Toolkit shortcut for both explicit `wordpress` presets and generic PHP runtimes, allowing one-click installation or management.
+- **Bulk Update Access:** Allowed site owners to run bulk core, theme, and plugin updates safely across their own WordPress sites.
+
+#### 2. Live Website Screenshot Thumbnails
+- **Site List Preview Thumbnails:** Added fast, cached live website screenshot thumbnails directly next to each domain name in the Sites table (`/sites`).
+- **Site Details Hero Thumbnail:** Site Overview page now displays a live preview banner of the website with a direct "Visit" link to open the site in a new tab.
+- **WP Toolkit Thumbnails:** Rendered preview thumbnails for every discovered WordPress site in the WP Toolkit dashboard.
+- **Graceful Fallbacks & Shimmer:** Smooth loading animation during screenshot retrieval and graceful fallback to an interactive globe icon if a site is unreachable or still propagating DNS.
+
+#### 3. Visible Panel Version & Up-to-Date Indicator
+- **Global Layout Badges:** Prominently displayed `Re-dockpanel v2.244.0` with an active green "Up to date" status dot across all layout styles:
+  - **Glass Layout (Compact / Collapsible):** Displayed in sidebar footer with mini badge in collapsed mode.
+  - **Command Layout (Sidebar):** Displayed in both standard and minimal sidebar footers.
+  - **Atlas Layout (Top Navigation):** Displayed as an inline badge next to the logo in the header and in the mobile drawer footer.
+  - **Nexus Layout:** Displayed in the sidebar status footer.
+
+#### 4. Database Dump Import Fix & Multi-Table Bulk Actions
+- **422 Upload Fix:** Added deserialization aliases (`content`, `content_base64`, `base64`, `data`) and resilient base64 padding handlers in `panel/backend/src/routes/databases.rs`, resolving HTTP 422 errors when importing database dumps.
+- **Multi-Table Operations:** Added checkboxes, filter search, select all/none, and bulk Drop and Truncate operations with consequence verification modals.
+
 ## [2.243.0] - 2026-11-21
 
 ### Major: Feature-Rich File Manager, 1GB Uploads, Multi-Site SSL & Git Deploy Resilience
