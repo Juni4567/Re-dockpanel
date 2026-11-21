@@ -6,6 +6,7 @@ import { statusColors, runtimeLabelsDetailed as runtimeLabels } from "../constan
 import { PrereqCallout, useDnsPrereq, prereqBlocks } from "../components/Prerequisite";
 import PhpVersionPicker from "../components/PhpVersionPicker";
 import { useAuth } from "../context/AuthContext";
+import { showGlobalNotification } from "../context/NotificationContext";
 
 interface Site {
   id: string;
@@ -13,6 +14,7 @@ interface Site {
   runtime: string;
   status: string;
   proxy_port: number | null;
+  app_command: string | null;
   php_version: string | null;
   ssl_enabled: boolean;
   ssl_expiry: string | null;
@@ -47,6 +49,22 @@ interface StagingInfo {
   disk_usage_bytes?: number;
 }
 
+interface AppStatus {
+  exists: boolean;
+  service_name?: string;
+  active_state?: string;
+  sub_state?: string;
+  pid?: number;
+  exit_code?: number;
+  memory_bytes?: number;
+  cpu_usage_ns?: number;
+  started_at?: string;
+  domain?: string;
+  runtime?: string;
+  proxy_port?: number;
+  app_command?: string;
+}
+
 export default function SiteDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -58,6 +76,14 @@ export default function SiteDetail() {
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // App Process management
+  const [appStatus, setAppStatus] = useState<AppStatus | null>(null);
+  const [appActionLoading, setAppActionLoading] = useState<string | null>(null);
+  const [appLogs, setAppLogs] = useState<string>("");
+  const [showAppLogs, setShowAppLogs] = useState(false);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [autoRefreshLogs, setAutoRefreshLogs] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
   const [sslMessage, setSslMessage] = useState("");
   const [sslMessageIsError, setSslMessageIsError] = useState(false);
@@ -353,6 +379,42 @@ export default function SiteDetail() {
     }
   };
 
+  const loadAppStatus = useCallback(async () => {
+    try {
+      const data = await api.get<AppStatus>(`/sites/${id}/app/status`);
+      setAppStatus(data);
+    } catch {
+      // ignore
+    }
+  }, [id]);
+
+  const loadAppLogs = useCallback(async () => {
+    setLogsLoading(true);
+    try {
+      const res = await api.get<{ logs: string }>(`/sites/${id}/app/logs?lines=100`);
+      setAppLogs(res.logs || "No logs recorded for this service.");
+    } catch (e) {
+      setAppLogs(e instanceof Error ? `Failed to load logs: ${e.message}` : "Failed to load logs");
+    } finally {
+      setLogsLoading(false);
+    }
+  }, [id]);
+
+  const handleAppAction = async (action: "start" | "stop" | "restart") => {
+    setAppActionLoading(action);
+    try {
+      const updated = await api.post<AppStatus>(`/sites/${id}/app/action`, { action });
+      setAppStatus(updated);
+      showGlobalNotification("success", `App ${action}ed successfully`, "App Process");
+      if (showAppLogs) loadAppLogs();
+    } catch (e) {
+      const err = e instanceof Error ? e.message : `Failed to ${action} app`;
+      showGlobalNotification("error", err, "App Process");
+    } finally {
+      setAppActionLoading(null);
+    }
+  };
+
   const loadStats = async () => {
     setStatsLoading(true);
     try {
@@ -460,6 +522,21 @@ export default function SiteDetail() {
       .then(setBandwidthUsage)
       .catch(() => setBandwidthUsage(null));
   }, [id]);
+
+  useEffect(() => {
+    if (site && (site.runtime === "node" || site.runtime === "python" || site.runtime === "proxy" || site.app_command)) {
+      loadAppStatus();
+      const interval = setInterval(loadAppStatus, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [site, loadAppStatus]);
+
+  useEffect(() => {
+    if (showAppLogs && autoRefreshLogs) {
+      const interval = setInterval(loadAppLogs, 3000);
+      return () => clearInterval(interval);
+    }
+  }, [showAppLogs, autoRefreshLogs, loadAppLogs]);
 
   const handleDelete = async () => {
     if (!confirmDelete) {
@@ -1405,6 +1482,161 @@ export default function SiteDetail() {
           </Link>
         )}
       </div>
+
+      {/* Application Process & Lifecycle (Node/Python/Proxy apps) */}
+      {(site.runtime === "node" || site.runtime === "python" || site.runtime === "proxy" || site.app_command) && (
+        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6 shadow-md">
+          <div className="px-5 py-4 border-b border-dark-600 flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-rust-500/10 rounded-lg text-rust-400">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 14.25h13.5m-13.5 0a3 3 0 0 1-3-3m3 3a3 3 0 1 0 0 6h13.5a3 3 0 1 0 0-6m-16.5-3a3 3 0 0 1 3-3h13.5a3 3 0 0 1 3 3m-19.5 0a4.5 4.5 0 0 1 .9-2.7L5.75 5.1a4.5 4.5 0 0 1 3.6-1.85h5.3a4.5 4.5 0 0 1 3.6 1.85l2.1 3.45a4.5 4.5 0 0 1 .9 2.7" />
+                </svg>
+              </div>
+              <div>
+                <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">
+                  Application Process & Service ({site.runtime.toUpperCase()})
+                </h2>
+                <div className="flex items-center gap-2 mt-0.5">
+                  {appStatus?.active_state === "active" && appStatus?.sub_state === "running" ? (
+                    <span className="flex items-center gap-1.5 text-xs text-rust-400 font-medium font-mono">
+                      <span className="w-2 h-2 rounded-full bg-rust-400 animate-pulse" />
+                      Running (PID: {appStatus.pid})
+                    </span>
+                  ) : appStatus?.active_state === "active" ? (
+                    <span className="flex items-center gap-1.5 text-xs text-warn-400 font-medium font-mono">
+                      <span className="w-2 h-2 rounded-full bg-warn-400 animate-pulse" />
+                      Restarting / {appStatus.sub_state}
+                    </span>
+                  ) : appStatus?.active_state === "failed" ? (
+                    <span className="flex items-center gap-1.5 text-xs text-danger-400 font-medium font-mono">
+                      <span className="w-2 h-2 rounded-full bg-danger-400" />
+                      Failed / Crashed (exit code: {appStatus.exit_code ?? 1})
+                    </span>
+                  ) : appStatus?.active_state === "inactive" ? (
+                    <span className="flex items-center gap-1.5 text-xs text-dark-400 font-medium font-mono">
+                      <span className="w-2 h-2 rounded-full bg-dark-500" />
+                      Stopped
+                    </span>
+                  ) : (
+                    <span className="text-xs text-dark-400 font-mono">Checking service...</span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Action Controls */}
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleAppAction("start")}
+                disabled={appActionLoading !== null || (appStatus?.active_state === "active" && appStatus?.sub_state === "running")}
+                className="px-3 py-1.5 bg-rust-500/10 text-rust-400 hover:bg-rust-500/20 disabled:opacity-40 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1"
+              >
+                {appActionLoading === "start" ? "Starting..." : "▶ Start"}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAppAction("restart")}
+                disabled={appActionLoading !== null}
+                className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 disabled:opacity-40 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1"
+              >
+                {appActionLoading === "restart" ? "Restarting..." : "↻ Restart"}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAppAction("stop")}
+                disabled={appActionLoading !== null || appStatus?.active_state !== "active"}
+                className="px-3 py-1.5 bg-danger-500/10 text-danger-400 hover:bg-danger-500/20 disabled:opacity-40 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1"
+              >
+                {appActionLoading === "stop" ? "Stopping..." : "⏹ Stop"}
+              </button>
+              <Link
+                to={`/sites/${id}/deploy`}
+                className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1 ml-1"
+              >
+                🚀 Git Deploy
+              </Link>
+            </div>
+          </div>
+
+          <div className="p-5">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs font-mono">
+              <div className="p-3 bg-dark-900 rounded-lg border border-dark-700">
+                <span className="text-dark-400 block mb-1">Service Unit</span>
+                <span className="text-dark-100 font-semibold truncate block" title={appStatus?.service_name}>
+                  {appStatus?.service_name || `dockpanel-app-${site.domain.replace(/\./g, "-")}`}
+                </span>
+              </div>
+              <div className="p-3 bg-dark-900 rounded-lg border border-dark-700">
+                <span className="text-dark-400 block mb-1">Internal Target</span>
+                <span className="text-rust-400 font-semibold block">
+                  127.0.0.1:{site.proxy_port || appStatus?.proxy_port || "5000"}
+                </span>
+              </div>
+              <div className="p-3 bg-dark-900 rounded-lg border border-dark-700">
+                <span className="text-dark-400 block mb-1">Exec Command</span>
+                <span className="text-dark-100 font-semibold truncate block" title={site.app_command || "npm start"}>
+                  {site.app_command || "npm start"}
+                </span>
+              </div>
+              <div className="p-3 bg-dark-900 rounded-lg border border-dark-700">
+                <span className="text-dark-400 block mb-1">Memory Usage</span>
+                <span className="text-dark-100 font-semibold block">
+                  {appStatus?.memory_bytes ? `${(appStatus.memory_bytes / 1024 / 1024).toFixed(1)} MB` : "—"}
+                </span>
+              </div>
+            </div>
+
+            {/* Live Logs Collapsible */}
+            <div className="mt-4 pt-4 border-t border-dark-700">
+              <div className="flex items-center justify-between">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !showAppLogs;
+                    setShowAppLogs(next);
+                    if (next) loadAppLogs();
+                  }}
+                  className="text-xs font-mono text-dark-200 hover:text-dark-50 flex items-center gap-1.5 font-medium"
+                >
+                  <span>{showAppLogs ? "▲ Hide Service Console Logs" : "▼ View Live Service Console Logs"}</span>
+                </button>
+
+                {showAppLogs && (
+                  <div className="flex items-center gap-3">
+                    <label className="flex items-center gap-1.5 text-xs text-dark-300 font-mono cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={autoRefreshLogs}
+                        onChange={(e) => setAutoRefreshLogs(e.target.checked)}
+                        className="rounded border-dark-600"
+                      />
+                      Auto-refresh (3s)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={loadAppLogs}
+                      disabled={logsLoading}
+                      className="text-xs text-dark-300 hover:text-dark-100 font-mono underline"
+                    >
+                      {logsLoading ? "Refreshing..." : "Refresh"}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {showAppLogs && (
+                <div className="mt-3 bg-dark-950 border border-dark-700 rounded-lg p-3 overflow-hidden shadow-inner">
+                  <pre className="text-xs font-mono text-dark-200 max-h-64 overflow-y-auto whitespace-pre-wrap break-words leading-relaxed select-text">
+                    {appLogs || (logsLoading ? "Fetching logs from journalctl..." : "No logs available.")}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Resource Limits */}
       {site.status === "active" && (

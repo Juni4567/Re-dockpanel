@@ -1141,6 +1141,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/optimize-images", post(sites::optimize_images))
         .route("/api/sites/{id}/security-headers", put(sites::update_security_headers))
         .route("/api/sites/{id}/bot-protection", put(sites::toggle_bot_protection))
+        .route("/api/sites/{id}/app/status", get(sites::app_status))
+        .route("/api/sites/{id}/app/action", post(sites::app_action))
+        .route("/api/sites/{id}/app/logs", get(sites::app_logs))
         // PHP versions
         .route("/api/php/versions", get(sites::php_versions))
         .route("/api/php/install", post(sites::php_install))

@@ -4,6 +4,7 @@ import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import ProvisionLog from "../components/ProvisionLog";
 import ConfirmDialog from "../components/ConfirmDialog";
+import { showGlobalNotification } from "../context/NotificationContext";
 
 interface ActiveIncidentInfo {
   id: string;
@@ -166,8 +167,10 @@ export default function Deploy() {
       if (result.deploy_id) {
         setDeployId(result.deploy_id);
         setActiveIncidentBlock(null);
+        showGlobalNotification("info", "Deployment started — monitoring live logs...", "Git Deploy");
       } else {
         setMessage({ text: "Deployment completed.", type: "success" });
+        showGlobalNotification("success", "Deployment completed.", "Git Deploy");
         setDeploying(false);
         setActiveIncidentBlock(null);
         await load();
@@ -179,7 +182,9 @@ export default function Deploy() {
           message: err.message,
         });
       } else {
-        setMessage({ text: err instanceof Error ? err.message : "Deploy failed", type: "error" });
+        const errorMsg = err instanceof Error ? err.message : "Deploy failed";
+        setMessage({ text: errorMsg, type: "error" });
+        showGlobalNotification("error", errorMsg, "Deploy Failed");
       }
       setDeploying(false);
     }
@@ -416,14 +421,28 @@ export default function Deploy() {
 
       {/* Deploy provisioning log */}
       {deployId && (
-        <ProvisionLog
-          sseUrl={`/api/services/install/${deployId}/log`}
-          onComplete={() => {
-            setDeployId(null);
-            setDeploying(false);
-            load();
-          }}
-        />
+        <div className="relative">
+          <ProvisionLog
+            sseUrl={`/api/services/install/${deployId}/log`}
+            title={`Deploying ${siteDomain || "site"}...`}
+            onComplete={() => {
+              setDeploying(false);
+              load();
+            }}
+          />
+          <div className="flex justify-end mb-4 -mt-3">
+            <button
+              type="button"
+              onClick={() => {
+                setDeployId(null);
+                setDeploying(false);
+              }}
+              className="px-3 py-1 bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 text-xs font-mono rounded border border-dark-600 transition-colors"
+            >
+              ✕ Dismiss Deployment Log
+            </button>
+          </div>
+        </div>
       )}
 
       {/* Configuration */}
@@ -466,7 +485,26 @@ export default function Deploy() {
             </div>
           </div>
           <div>
-            <label className="block text-sm font-medium text-dark-100 mb-1">Deploy Script (optional)</label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-sm font-medium text-dark-100">Deploy Script (optional)</label>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11px] text-dark-400 font-mono">Presets:</span>
+                <button
+                  type="button"
+                  onClick={() => setDeployScript("npm install\nnpm run build")}
+                  className="px-2 py-0.5 rounded text-[11px] font-mono bg-dark-700 text-dark-200 hover:text-dark-50 hover:bg-dark-600 border border-dark-600 transition-colors"
+                >
+                  + Next.js / Node
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDeployScript("composer install --no-dev\nphp artisan migrate --force")}
+                  className="px-2 py-0.5 rounded text-[11px] font-mono bg-dark-700 text-dark-200 hover:text-dark-50 hover:bg-dark-600 border border-dark-600 transition-colors"
+                >
+                  + Laravel
+                </button>
+              </div>
+            </div>
             <textarea
               value={deployScript}
               onChange={(e) => setDeployScript(e.target.value)}
@@ -474,6 +512,9 @@ export default function Deploy() {
               rows={4}
               className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
             />
+            <p className="text-xs text-dark-400 mt-1">
+              Note: If left empty on Node.js/Next.js sites, DockPanel automatically executes <code className="text-rust-400">npm install && npm run build --if-present</code> and restarts the application service.
+            </p>
           </div>
 
           {/* Zero-Downtime Deploy */}

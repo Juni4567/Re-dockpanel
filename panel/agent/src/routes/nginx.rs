@@ -2789,6 +2789,55 @@ pub fn router() -> Router<AppState> {
         .route("/nginx/clone-site", post(clone_site))
         // Environment Variables
         .route("/nginx/env/{domain}", get(get_env).put(set_env))
+        // App Process Management (Node/Python apps)
+        .route("/nginx/sites/{domain}/app-process/status", get(app_process_status))
+        .route("/nginx/sites/{domain}/app-process/action", post(app_process_action))
+        .route("/nginx/sites/{domain}/app-process/logs", get(app_process_logs))
+}
+
+#[derive(serde::Deserialize)]
+pub struct AppActionRequest {
+    pub action: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AppLogsQuery {
+    pub lines: Option<u32>,
+}
+
+async fn app_process_status(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let status = services::app_process::get_app_service_status(&domain);
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+}
+
+async fn app_process_action(
+    Path(domain): Path<String>,
+    Json(body): Json<AppActionRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let res = services::app_process::control_app_service(&domain, &body.action)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(serde_json::to_value(res).unwrap_or_default()))
+}
+
+async fn app_process_logs(
+    Path(domain): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AppLogsQuery>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let lines = query.lines.unwrap_or(100);
+    let logs = services::app_process::get_app_service_logs(&domain, lines)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(serde_json::json!({ "logs": logs })))
 }
 
 #[cfg(test)]

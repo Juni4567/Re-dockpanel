@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useParams, Link } from "react-router-dom";
 import { api } from "../api";
 import { UPLOAD_MAX_FILE_BYTES, uploadTooLargeMessage } from "../constants";
+import { showGlobalNotification } from "../context/NotificationContext";
 
 interface FileEntry {
   name: string;
@@ -155,6 +156,7 @@ export default function Files() {
 
   const showSuccess = (msg: string) => {
     setSuccessMessage(msg);
+    showGlobalNotification("success", msg, "File Manager");
     setTimeout(() => setSuccessMessage(""), 4000);
   };
 
@@ -799,13 +801,15 @@ export default function Files() {
                   setUploadProgress(null);
                   setUploading(false);
                   if (failedCount > 0) {
-                    setUploadMessage(
-                      successCount > 0
-                        ? `${successCount} uploaded, ${failedCount} failed — ${firstError}`
-                        : firstError
-                    );
+                    const msg = successCount > 0
+                      ? `${successCount} uploaded, ${failedCount} failed — ${firstError}`
+                      : firstError;
+                    setUploadMessage(msg);
+                    showGlobalNotification("error", msg, "Upload Incomplete");
                   } else {
-                    setUploadMessage(`${successCount} file(s) uploaded successfully`);
+                    const msg = `${successCount} file(s) uploaded successfully`;
+                    setUploadMessage(msg);
+                    showGlobalNotification("success", msg, "Upload Complete");
                   }
                   loadDir(currentPath);
                   e.target.value = "";

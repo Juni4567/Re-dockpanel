@@ -1,4 +1,5 @@
 import { Navigate, Outlet, NavLink, Link, useNavigate } from "react-router-dom";
+import { GlobalNotificationBanner } from "../context/NotificationContext";
 import { useLayoutState, badgeCount } from "../hooks/useLayoutState";
 import { useServer } from "../context/ServerContext";
 import { useBranding } from "../context/BrandingContext";
@@ -298,6 +299,7 @@ export default function NexusLayout() {
 
         {/* Content */}
         <main id="main-content" className="flex-1 overflow-y-auto bg-dark-950">
+          <GlobalNotificationBanner />
           <Outlet />
         </main>
       </div>

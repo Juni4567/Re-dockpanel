@@ -4,6 +4,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
 import { ServerProvider } from "./context/ServerContext";
 import { BrandingProvider } from "./context/BrandingContext";
+import { NotificationProvider } from "./context/NotificationContext";
 import LayoutShell from "./components/LayoutShell";
 import Login from "./pages/Login";
 import Setup from "./pages/Setup";
@@ -124,6 +125,7 @@ createRoot(document.getElementById("root")!).render(
     <AuthProvider>
       <ServerProvider>
       <BrowserRouter>
+        <NotificationProvider>
         <ChunkErrorBoundary>
         <Suspense fallback={<div className="flex items-center justify-center h-screen bg-dark-900"><div className="w-6 h-6 border-2 border-dark-600 border-t-rust-500 rounded-full animate-spin" /></div>}>
           <Routes>
@@ -187,6 +189,7 @@ createRoot(document.getElementById("root")!).render(
           </Routes>
         </Suspense>
         </ChunkErrorBoundary>
+        </NotificationProvider>
       </BrowserRouter>
       </ServerProvider>
     </AuthProvider>

@@ -4525,6 +4525,99 @@ pub async fn transfer(
     })))
 }
 
+#[derive(serde::Deserialize)]
+pub struct AppActionPayload {
+    pub action: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AppLogsParams {
+    pub lines: Option<u32>,
+}
+
+/// GET /api/sites/{id}/app/status — Check the status of a managed app process (Node/Python).
+pub async fn app_status(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let site: crate::models::Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("app status", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    let agent_res = agent
+        .get(&format!("/nginx/sites/{domain}/app-process/status"))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "exists": false }));
+
+    let mut res = agent_res;
+    if let Some(obj) = res.as_object_mut() {
+        obj.insert("domain".into(), serde_json::json!(domain));
+        obj.insert("runtime".into(), serde_json::json!(site.runtime));
+        obj.insert("proxy_port".into(), serde_json::json!(site.proxy_port));
+        obj.insert("app_command".into(), serde_json::json!(site.app_command));
+    }
+
+    Ok(Json(res))
+}
+
+/// POST /api/sites/{id}/app/action — Control a managed app process (start, stop, restart).
+pub async fn app_action(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AppActionPayload>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let res = agent
+        .post(
+            &format!("/nginx/sites/{domain}/app-process/action"),
+            Some(serde_json::json!({ "action": body.action })),
+        )
+        .await
+        .map_err(|e| agent_error("app action", e))?;
+
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "site.app_action",
+        Some("site"),
+        Some(&domain),
+        Some(&body.action),
+        None,
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(res))
+}
+
+/// GET /api/sites/{id}/app/logs — Fetch recent console logs for a managed app process.
+pub async fn app_logs(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Query(params): Query<AppLogsParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let lines = params.lines.unwrap_or(100);
+    let res = agent
+        .get(&format!("/nginx/sites/{domain}/app-process/logs?lines={lines}"))
+        .await
+        .map_err(|e| agent_error("app logs", e))?;
+
+    Ok(Json(res))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

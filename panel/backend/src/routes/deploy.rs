@@ -305,11 +305,12 @@ pub async fn trigger(
         match execute_deploy(&db, &agent, id, &domain_clone, &config, "manual").await {
             Ok(log) => {
                 let ok = log.status == "success";
+                let full_output = log.output.clone();
                 emit("deploy", "Running deployment", if ok { "done" } else { "error" },
-                    log.output.as_ref().map(|o| o.chars().take(500).collect()));
+                    full_output.clone());
                 emit("complete",
                     if ok { "Deployment complete" } else { "Deployment failed" },
-                    if ok { "done" } else { "error" }, None);
+                    if ok { "done" } else { "error" }, full_output);
 
                 activity::log_activity(
                     &db, user_id, &email, "deploy.trigger",
@@ -319,8 +320,8 @@ pub async fn trigger(
             Err((_status, body)) => {
                 let msg = body.0.get("error").and_then(|v| v.as_str())
                     .unwrap_or("Unknown error").to_string();
-                emit("deploy", "Running deployment", "error", Some(msg));
-                emit("complete", "Deployment failed", "error", None);
+                emit("deploy", "Running deployment", "error", Some(msg.clone()));
+                emit("complete", "Deployment failed", "error", Some(msg));
             }
         }
 
@@ -523,13 +524,34 @@ async fn execute_deploy(
     ).await;
     tracing::info!("Pre-deploy backup requested for {domain}");
 
+    // Auto-detect deploy script if not explicitly provided
+    let mut deploy_script = config.deploy_script.clone();
+    if deploy_script.trim().is_empty() {
+        let site_runtime: Option<(String,)> = sqlx::query_as(
+            "SELECT runtime FROM sites WHERE id = $1"
+        )
+        .bind(site_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some((runtime,)) = site_runtime {
+            if runtime == "node" {
+                deploy_script = "npm install && npm run build --if-present".into();
+            } else if runtime == "python" {
+                deploy_script = "pip install -r requirements.txt --break-system-packages".into();
+            }
+        }
+    }
+
     // Choose atomic or standard deploy path
     let result = if config.atomic_deploy {
         let agent_body = serde_json::json!({
             "domain": domain,
             "repo_url": config.repo_url,
             "branch": config.branch,
-            "deploy_script": if config.deploy_script.is_empty() { None } else { Some(&config.deploy_script) },
+            "deploy_script": if deploy_script.is_empty() { None } else { Some(&deploy_script) },
             "key_path": config.deploy_key_path,
             "keep_releases": config.keep_releases,
         });
@@ -542,7 +564,7 @@ async fn execute_deploy(
             "domain": domain,
             "repo_url": config.repo_url,
             "branch": config.branch,
-            "deploy_script": if config.deploy_script.is_empty() { None } else { Some(&config.deploy_script) },
+            "deploy_script": if deploy_script.is_empty() { None } else { Some(&deploy_script) },
             "key_path": config.deploy_key_path,
         });
         agent
@@ -556,6 +578,14 @@ async fn execute_deploy(
     let commit_hash = result.get("commit_hash").and_then(|v| v.as_str());
     let duration_ms = result.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
     let status = if success { "success" } else { "failed" };
+
+    // Auto-restart app service if deployed successfully
+    if success {
+        let _ = agent.post(
+            &format!("/nginx/sites/{domain}/app-process/action"),
+            Some(serde_json::json!({ "action": "restart" })),
+        ).await;
+    }
 
     // GAP 26: Auto-rollback on failed deploy — restore from most recent pre-deploy backup
     if !success {

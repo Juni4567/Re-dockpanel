@@ -6,6 +6,7 @@ import { Icon } from "../data/icons";
 import CommandPalette from "./CommandPalette";
 import LayoutSwitcher from "./LayoutSwitcher";
 import { useState, useRef, useEffect } from "react";
+import { GlobalNotificationBanner } from "../context/NotificationContext";
 
 function ServerSelector() {
   const { servers, activeServer, setActiveServerId } = useServer();
@@ -451,6 +452,7 @@ export default function CommandLayout() {
         )}
 
         <main id="main-content" className={`flex-1 ${showHeader ? "overflow-y-auto bg-dark-950" : "overflow-auto"}`}>
+          <GlobalNotificationBanner />
           <Outlet />
         </main>
       </div>

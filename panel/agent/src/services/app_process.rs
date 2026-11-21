@@ -146,7 +146,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 ProtectProc=invisible
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ReadWritePaths=/var/www/{domain}
 
 # Logging
@@ -266,5 +266,163 @@ pub fn remove_app_service(domain: &str) -> Result<(), String> {
 
     tracing::info!("App service removed: {svc}");
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppServiceStatus {
+    pub exists: bool,
+    pub service_name: Option<String>,
+    pub active_state: Option<String>,
+    pub sub_state: Option<String>,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub memory_bytes: Option<u64>,
+    pub cpu_usage_ns: Option<u64>,
+    pub started_at: Option<String>,
+}
+
+/// Query systemd for the status of an app process
+pub fn get_app_service_status(domain: &str) -> AppServiceStatus {
+    let svc = match owned_service_name(domain) {
+        Some(s) => s,
+        None => {
+            return AppServiceStatus {
+                exists: false,
+                service_name: None,
+                active_state: None,
+                sub_state: None,
+                pid: None,
+                exit_code: None,
+                memory_bytes: None,
+                cpu_usage_ns: None,
+                started_at: None,
+            };
+        }
+    };
+
+    let output = safe_command_sync("systemctl")
+        .args([
+            "show",
+            &svc,
+            "--property=ActiveState,SubState,MainPID,ExecMainStatus,ActiveEnterTimestamp,MemoryCurrent,CPUUsageNSec",
+        ])
+        .output();
+
+    let text = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => {
+            return AppServiceStatus {
+                exists: true,
+                service_name: Some(svc),
+                active_state: Some("unknown".into()),
+                sub_state: None,
+                pid: None,
+                exit_code: None,
+                memory_bytes: None,
+                cpu_usage_ns: None,
+                started_at: None,
+            };
+        }
+    };
+
+    let mut active_state = None;
+    let mut sub_state = None;
+    let mut pid = None;
+    let mut exit_code = None;
+    let mut started_at = None;
+    let mut memory_bytes = None;
+    let mut cpu_usage_ns = None;
+
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            match k {
+                "ActiveState" => active_state = Some(v.to_string()),
+                "SubState" => sub_state = Some(v.to_string()),
+                "MainPID" => {
+                    if let Ok(p) = v.parse::<u32>() {
+                        if p > 0 {
+                            pid = Some(p);
+                        }
+                    }
+                }
+                "ExecMainStatus" => {
+                    if let Ok(code) = v.parse::<i32>() {
+                        exit_code = Some(code);
+                    }
+                }
+                "ActiveEnterTimestamp" => {
+                    if !v.is_empty() && v != "[not set]" {
+                        started_at = Some(v.to_string());
+                    }
+                }
+                "MemoryCurrent" => {
+                    if let Ok(m) = v.parse::<u64>() {
+                        if m < u64::MAX - 1000 {
+                            memory_bytes = Some(m);
+                        }
+                    }
+                }
+                "CPUUsageNSec" => {
+                    if let Ok(c) = v.parse::<u64>() {
+                        cpu_usage_ns = Some(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    AppServiceStatus {
+        exists: true,
+        service_name: Some(svc),
+        active_state,
+        sub_state,
+        pid,
+        exit_code,
+        memory_bytes,
+        cpu_usage_ns,
+        started_at,
+    }
+}
+
+/// Control an app service: start, stop, restart
+pub fn control_app_service(domain: &str, action: &str) -> Result<AppServiceStatus, String> {
+    if !["start", "stop", "restart"].contains(&action) {
+        return Err(format!("Invalid action: {action}. Allowed: start, stop, restart"));
+    }
+
+    let svc = owned_service_name(domain)
+        .ok_or_else(|| format!("No managed app service found for {domain}"))?;
+
+    let output = safe_command_sync("systemctl")
+        .args([action, &svc])
+        .output()
+        .map_err(|e| format!("systemctl {action} failed: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to {action} {svc}: {err}"));
+    }
+
+    // Return the updated status
+    Ok(get_app_service_status(domain))
+}
+
+/// Get recent logs for an app service using journalctl
+pub fn get_app_service_logs(domain: &str, lines: u32) -> Result<String, String> {
+    let svc = owned_service_name(domain)
+        .ok_or_else(|| format!("No managed app service found for {domain}"))?;
+
+    let line_count = lines.clamp(1, 500);
+
+    let output = safe_command_sync("journalctl")
+        .args(["-u", &svc, "-n", &line_count.to_string(), "--no-pager"])
+        .output()
+        .map_err(|e| format!("journalctl failed: {e}"))?;
+
+    let logs = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(logs)
 }
 
