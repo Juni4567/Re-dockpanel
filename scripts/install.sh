@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# DockPanel Quick Installer
-# Usage: curl -sL https://dockpanel.dev/install.sh | bash
+# DockPanel Quick Installer (Re-dockpanel fork)
+# Usage: curl -sL https://raw.githubusercontent.com/Juni4567/Re-dockpanel/main/scripts/install.sh | sudo bash
 #
 # Modes:
 #   Default:              Clone repo, download pre-built binaries (fast, no Rust needed)
@@ -60,7 +60,7 @@ if [ -d "$INSTALL_DIR/.git" ]; then
 else
     echo -e "${GREEN}[+]${NC} Downloading DockPanel..."
     rm -rf "$INSTALL_DIR"
-    git clone --quiet --depth 1 -b "$VERSION" https://github.com/ovexro/dockpanel.git "$INSTALL_DIR"
+    git clone --quiet --depth 1 -b "$VERSION" https://github.com/Juni4567/Re-dockpanel.git "$INSTALL_DIR"
 fi
 
 # Default to pre-built binaries unless BUILD_FROM_SOURCE=1

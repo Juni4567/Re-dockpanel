@@ -5,6 +5,8 @@ import { useServer } from "../context/ServerContext";
 import { useAuth } from "../context/AuthContext";
 import { isNavVisible, navFlagsFor } from "../data/navItems";
 import { formatSize, formatRate, formatUptime, timeAgo } from "../utils/format";
+import ConfirmDialog from "../components/ConfirmDialog";
+import { showGlobalNotification } from "../context/NotificationContext";
 
 interface SiteDetail {
   id: string;
@@ -897,40 +899,54 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Feature #4: Action confirmation bar */}
-      {confirmAction && (
-        <div className={`rounded-lg border px-4 py-3 mb-4 flex items-center justify-between ${
-          confirmAction === "reboot" ? "border-danger-500/30 bg-danger-500/5" : "border-warn-500/30 bg-warn-500/5"
-        }`}>
-          <span className={`text-xs font-mono ${confirmAction === "reboot" ? "text-danger-400" : "text-warn-400"}`}>
+      {/* Action confirmation dialog for reboot */}
+      {confirmAction === "reboot" && (
+        <ConfirmDialog
+          title="Confirm Server Reboot"
+          label="You are requesting an immediate operating system reboot of this server."
+          consequences={[
+            "All active web connections, active API sessions, and SSH terminals will be immediately terminated.",
+            "All hosted websites, backend services (Node.js, Python, PHP), databases, and Docker containers will experience 1–3 minutes of downtime.",
+            "Any in-flight background tasks or file operations will be aborted.",
+            "The panel will be unreachable until the operating system and panel services finish booting."
+          ]}
+          confirmLabel="Reboot Server Now"
+          tone="danger"
+          onConfirm={async () => {
+            setConfirmAction(null);
+            try {
+              await api.post("/system/reboot");
+              setActionMessage({ text: "Server rebooting...", type: "success" });
+              showGlobalNotification("info", "Server reboot command issued. Services will be back online shortly.", "Rebooting");
+            } catch (err) {
+              const why = err instanceof Error ? err.message : "";
+              setActionMessage({ text: why ? `Could not reboot the server: ${why}` : "Could not reboot the server", type: "error" });
+              setTimeout(() => setActionMessage(null), 10000);
+            }
+          }}
+          onCancel={() => setConfirmAction(null)}
+        />
+      )}
+
+      {/* Action confirmation bar for non-lethal service restarts */}
+      {confirmAction && confirmAction !== "reboot" && (
+        <div className="rounded-lg border px-4 py-3 mb-4 flex items-center justify-between border-warn-500/30 bg-warn-500/5">
+          <span className="text-xs font-mono text-warn-400">
             {confirmAction === "nginx" ? "Restart Nginx? This will briefly interrupt web traffic." :
-             confirmAction === "php" ? "Restart PHP-FPM? Active requests may be interrupted." :
-             "Reboot server? All services will be temporarily unavailable."}
+             "Restart PHP-FPM? Active requests may be interrupted."}
           </span>
           <div className="flex items-center gap-2 shrink-0 ml-4">
             <button onClick={async () => {
               const action = confirmAction;
               setConfirmAction(null);
               try {
-                if (action === "reboot") {
-                  await api.post("/system/reboot");
-                  setActionMessage({ text: "Server rebooting...", type: "success" });
-                  setTimeout(() => setActionMessage(null), 5000);
-                } else {
-                  await api.post("/agent/diagnostics/fix", {
-                    fix_id: action === "nginx" ? "restart-service:nginx" : "restart-service:php-fpm",
-                  });
-                  setActionMessage({ text: action === "nginx" ? "Nginx restarted" : "PHP-FPM restarted", type: "success" });
-                  setTimeout(() => setActionMessage(null), 3000);
-                }
+                await api.post("/agent/diagnostics/fix", {
+                  fix_id: action === "nginx" ? "restart-service:nginx" : "restart-service:php-fpm",
+                });
+                setActionMessage({ text: action === "nginx" ? "Nginx restarted" : "PHP-FPM restarted", type: "success" });
+                setTimeout(() => setActionMessage(null), 3000);
               } catch (err) {
-                // The agent authors a real sentence for these — nginx's own
-                // "[emerg] invalid parameter" is what tells the operator which
-                // line of which vhost to fix — and `error.rs::agent_error`
-                // passes a 4xx through intact precisely so it survives. Bare
-                // catching it here deleted the useful half and left "Failed to
-                // restart Nginx", which is the #90/#91/#92 class all over again.
-                const what = action === "reboot" ? "reboot the server" : `restart ${action === "nginx" ? "Nginx" : "PHP-FPM"}`;
+                const what = `restart ${action === "nginx" ? "Nginx" : "PHP-FPM"}`;
                 const why = err instanceof Error ? err.message : "";
                 setActionMessage({ text: why ? `Could not ${what}: ${why}` : `Could not ${what}`, type: "error" });
                 setTimeout(() => setActionMessage(null), 10000);

@@ -48,13 +48,17 @@ import { createPortal } from "react-dom";
  *    from.
  */
 export default function ConfirmDialog({
+  title,
   label,
+  consequences,
   confirmLabel = "Confirm",
   tone = "danger",
   onConfirm,
   onCancel,
 }: {
+  title?: string;
   label: string;
+  consequences?: string[];
   confirmLabel?: string;
   tone?: "danger" | "warn";
   onConfirm: () => void;
@@ -73,9 +77,7 @@ export default function ConfirmDialog({
 
   return createPortal(
     <div
-      className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4 dp-modal-overlay"
-      // Clicking the backdrop cancels; clicking the card must not, hence the
-      // target check rather than a stopPropagation on the child.
+      className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 dp-modal-overlay animate-fade-in"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onCancel();
       }}
@@ -83,21 +85,55 @@ export default function ConfirmDialog({
       <div
         role="alertdialog"
         aria-modal="true"
-        aria-label={label}
-        className="bg-dark-800 rounded-lg shadow-xl p-6 w-full max-w-md dp-modal"
+        aria-label={title || label}
+        className="bg-dark-800 rounded-xl shadow-2xl p-6 w-full max-w-lg border border-dark-600 dp-modal animate-scale-in"
       >
-        <p className="text-sm text-dark-100 mb-5 whitespace-pre-line">{label}</p>
-        <div className="flex justify-end gap-2">
+        <div className="flex items-start gap-3.5 mb-4">
+          <div className={`p-2.5 rounded-lg shrink-0 ${
+            tone === "warn"
+              ? "bg-warn-500/15 text-warn-400 border border-warn-500/30"
+              : "bg-danger-500/15 text-danger-400 border border-danger-500/30"
+          }`}>
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+            </svg>
+          </div>
+          <div>
+            <h3 className="text-base font-bold text-white tracking-tight">
+              {title || (tone === "danger" ? "Confirm Lethal Action" : "Confirm Action")}
+            </h3>
+            <p className="text-xs text-dark-300 mt-1 leading-relaxed whitespace-pre-line">{label}</p>
+          </div>
+        </div>
+
+        {consequences && consequences.length > 0 && (
+          <div className="mb-5 bg-dark-900/90 border border-dark-700/80 rounded-lg p-4">
+            <h4 className="text-[11px] font-bold text-dark-300 uppercase tracking-wider mb-2.5 flex items-center gap-1.5 font-mono">
+              <span className="w-1.5 h-1.5 rounded-full bg-danger-400 animate-pulse"></span>
+              Consequences & System Impact:
+            </h4>
+            <ul className="space-y-1.5 text-xs text-dark-200">
+              {consequences.map((c, i) => (
+                <li key={i} className="flex items-start gap-2">
+                  <span className="text-danger-400 font-bold mt-0.5">•</span>
+                  <span className="leading-snug">{c}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2.5 pt-2 border-t border-dark-700/50">
           <button
             ref={cancelRef}
             onClick={onCancel}
-            className="px-4 py-2 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider rounded hover:bg-dark-500 transition-colors"
+            className="px-4 py-2 bg-dark-700 text-dark-200 text-xs font-semibold rounded-lg hover:bg-dark-600 transition-colors"
           >
             Cancel
           </button>
           <button
             onClick={onConfirm}
-            className={`px-4 py-2 text-white text-xs font-bold uppercase tracking-wider rounded transition-colors ${
+            className={`px-4 py-2 text-white text-xs font-semibold rounded-lg shadow-sm transition-colors ${
               tone === "warn"
                 ? "bg-warn-500 hover:bg-warn-600"
                 : "bg-danger-500 hover:bg-danger-600"

@@ -31,7 +31,7 @@ CLI_BIN="/usr/local/bin/dockpanel"
 DB_PORT=5450
 DB_CONTAINER="dockpanel-postgres"
 INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-0}"
-GITHUB_REPO="ovexro/dockpanel"
+GITHUB_REPO="${GITHUB_REPO:-Juni4567/Re-dockpanel}"
 # Set to 1 by configure_nginx when the panel is served over a self-signed
 # certificate (no domain → no Let's Encrypt). print_summary reads it to print
 # the right scheme and explain the browser warning before it happens.

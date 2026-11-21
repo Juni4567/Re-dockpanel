@@ -5,6 +5,7 @@ import { formatDate } from "../utils/format";
 import { statusColors, runtimeLabelsDetailed as runtimeLabels } from "../constants";
 import { PrereqCallout, useDnsPrereq, prereqBlocks } from "../components/Prerequisite";
 import PhpVersionPicker from "../components/PhpVersionPicker";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { useAuth } from "../context/AuthContext";
 import { showGlobalNotification } from "../context/NotificationContext";
 
@@ -97,6 +98,7 @@ export default function SiteDetail() {
     retry: () => Promise<void>;
   } | null>(null);
   const [forcingSsl, setForcingSsl] = useState(false);
+  const [renewingSsl, setRenewingSsl] = useState(false);
   // Only run the DNS prerequisite while SSL is still unconfigured; a live cert
   // is proof enough that the domain resolves here. autoPoll covers propagation:
   // a blocking gate opens by itself once the record goes live.
@@ -539,17 +541,15 @@ export default function SiteDetail() {
   }, [showAppLogs, autoRefreshLogs, loadAppLogs]);
 
   const handleDelete = async () => {
-    if (!confirmDelete) {
-      setConfirmDelete(true);
-      return;
-    }
     setDeleting(true);
     try {
       await api.delete(`/sites/${id}`);
+      showGlobalNotification("info", `Site ${site?.domain || id} has been permanently deleted`, "Site Deleted");
       navigate("/sites");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Delete failed");
       setDeleting(false);
+      setConfirmDelete(false);
     }
   };
 
@@ -581,6 +581,33 @@ export default function SiteDetail() {
       }
     } finally {
       if (force) setForcingSsl(false); else setProvisioning(false);
+    }
+  };
+
+  const handleRenewSSL = async () => {
+    if (!site) return;
+    setRenewingSsl(true);
+    setSslMessage("");
+    setForeignCertRefusal(null);
+    try {
+      try {
+        await api.post(`/ssl/${id}/renew`);
+      } catch {
+        await api.post(`/sites/${id}/ssl?force=true`);
+      }
+      const updated = await api.get<Site>(`/sites/${id}`);
+      setSite(updated);
+      const successText = `SSL certificate for ${site.domain} renewed successfully! New expiry: ${updated.ssl_expiry ? new Date(updated.ssl_expiry).toLocaleDateString() : 'Active'}`;
+      setSslMessage(successText);
+      setSslMessageIsError(false);
+      showGlobalNotification("success", successText, "SSL Certificate Renewed");
+    } catch (err) {
+      const errorText = err instanceof Error ? err.message : "SSL renewal failed";
+      setSslMessage(errorText);
+      setSslMessageIsError(true);
+      showGlobalNotification("error", errorText, "SSL Renewal Failed");
+    } finally {
+      setRenewingSsl(false);
     }
   };
 
@@ -697,25 +724,7 @@ export default function SiteDetail() {
           </div>
         </div>
         <div>
-          {confirmDelete ? (
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-danger-400">Are you sure?</span>
-              <button
-                onClick={handleDelete}
-                disabled={deleting}
-                className="px-3 py-1.5 bg-danger-500 text-white rounded-lg text-sm hover:bg-danger-600 disabled:opacity-50"
-              >
-                {deleting ? "Deleting..." : "Yes, delete"}
-              </button>
-              <button
-                onClick={() => setConfirmDelete(false)}
-                className="px-3 py-1.5 bg-dark-600 text-dark-100 rounded-lg text-sm hover:bg-dark-500"
-              >
-                Cancel
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
               {/* Enable/Disable toggle */}
               <button disabled={toggling} onClick={async () => {
                 setToggling(true);
@@ -841,14 +850,29 @@ export default function SiteDetail() {
                 )
               )}
               <button
-                onClick={handleDelete}
+                onClick={() => setConfirmDelete(true)}
                 className="px-4 py-2 bg-danger-500/10 text-danger-400 rounded-lg text-sm font-medium hover:bg-danger-500/20 transition-colors"
               >
                 Delete
               </button>
             </div>
-          )}
         </div>
+        {confirmDelete && (
+          <ConfirmDialog
+            title={`Permanently Delete "${site?.domain}"?`}
+            label={`You are about to permanently delete ${site?.domain}. This is an irreversible destructive action.`}
+            consequences={[
+              `All web files and directories located in /var/www/${site?.domain} will be permanently wiped.`,
+              "Nginx reverse proxy virtual host configuration will be removed and Nginx reloaded.",
+              "Active background application services (Node.js, Python, or PHP-FPM pools) will be stopped and deleted.",
+              "All SSL/TLS certificates, environment variables (.env), and associated staging clones will be removed."
+            ]}
+            confirmLabel={deleting ? "Deleting Site..." : "Permanently Delete Site"}
+            tone="danger"
+            onConfirm={handleDelete}
+            onCancel={() => setConfirmDelete(false)}
+          />
+        )}
       </div>
       {/* Disabled banner */}
       {site.enabled === false && (
@@ -1155,17 +1179,39 @@ export default function SiteDetail() {
                       branch — see below the ternary — so this is a disclosure,
                       not a second copy. */}
                   {site.status === "active" && (
-                    <div className="pt-1">
-                      <button
-                        type="button"
-                        onClick={() => setShowSslUpload(!showSslUpload)}
-                        aria-expanded={showSslUpload}
-                        className="text-xs text-dark-300 hover:text-dark-100 underline decoration-dotted underline-offset-2 transition-colors"
-                      >
-                        Replace certificate
-                      </button>
-                      <p className="mt-1 text-xs text-dark-400">
-                        Paste a certificate and private key you already hold. You renew it yourself.
+                    <div className="pt-2 flex flex-col gap-2">
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={handleRenewSSL}
+                          disabled={renewingSsl || provisioning}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rust-500/15 border border-rust-500/30 text-rust-400 hover:bg-rust-500/25 rounded-md text-xs font-medium disabled:opacity-50 transition-colors"
+                        >
+                          {renewingSsl ? (
+                            <>
+                              <div className="w-3.5 h-3.5 border-2 border-rust-400/30 border-t-rust-400 rounded-full animate-spin" />
+                              Renewing Certificate...
+                            </>
+                          ) : (
+                            <>
+                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99" />
+                              </svg>
+                              Renew Certificate (Let's Encrypt)
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowSslUpload(!showSslUpload)}
+                          aria-expanded={showSslUpload}
+                          className="text-xs text-dark-300 hover:text-dark-100 underline decoration-dotted underline-offset-2 transition-colors"
+                        >
+                          {showSslUpload ? "Hide certificate upload" : "Replace certificate"}
+                        </button>
+                      </div>
+                      <p className="text-xs text-dark-400">
+                        Renew automatically from Let's Encrypt or paste a custom certificate & private key.
                       </p>
                     </div>
                   )}

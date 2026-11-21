@@ -32,9 +32,172 @@ pub const PLACEHOLDER_MARKER: &str = "Site is ready. Upload your files to replac
 /// The filler page written into a new site's document root.
 pub fn placeholder_page(domain: &str) -> String {
     format!(
-        "<!DOCTYPE html><html><head><title>{domain}</title></head>\
-         <body><h1>Welcome to {domain}</h1>\
-         <p>{PLACEHOLDER_MARKER}</p></body></html>"
+r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{domain} &mdash; Coming Soon</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(circle at 50% 20%, #1e2638 0%, #0d111a 100%);
+            color: #e2e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            padding: 1.5rem;
+            overflow-x: hidden;
+        }}
+        .container {{
+            max-width: 680px;
+            width: 100%;
+            background: rgba(22, 27, 39, 0.75);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 20px;
+            padding: 3rem 2.5rem;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
+            text-align: center;
+            position: relative;
+        }}
+        .badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(34, 197, 94, 0.12);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            color: #4ade80;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            padding: 0.35rem 0.9rem;
+            border-radius: 9999px;
+            margin-bottom: 1.75rem;
+        }}
+        .pulse-dot {{
+            width: 8px;
+            height: 8px;
+            background-color: #22c55e;
+            border-radius: 50%;
+            box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+            animation: pulse 2s infinite;
+        }}
+        @keyframes pulse {{
+            0% {{ box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }}
+            70% {{ box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }}
+            100% {{ box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }}
+        }}
+        h1 {{
+            font-size: 2.5rem;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            color: #ffffff;
+            margin-bottom: 0.75rem;
+            word-break: break-word;
+        }}
+        .subtitle {{
+            font-size: 1.15rem;
+            color: #94a3b8;
+            margin-bottom: 2rem;
+            line-height: 1.6;
+        }}
+        .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2.25rem;
+            text-align: left;
+        }}
+        .card {{
+            background: rgba(30, 41, 59, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 1rem;
+        }}
+        .card-label {{
+            font-size: 0.72rem;
+            color: #64748b;
+            text-transform: uppercase;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.25rem;
+        }}
+        .card-value {{
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #f1f5f9;
+        }}
+        .instructions {{
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px dashed rgba(255, 255, 255, 0.15);
+            border-radius: 12px;
+            padding: 1.25rem;
+            font-size: 0.88rem;
+            color: #cbd5e1;
+            line-height: 1.6;
+        }}
+        .instructions strong {{
+            color: #f87171;
+        }}
+        .marker-text {{
+            margin-top: 0.5rem;
+            font-size: 0.8rem;
+            color: #64748b;
+        }}
+        footer {{
+            margin-top: 2rem;
+            font-size: 0.78rem;
+            color: #475569;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="badge">
+            <span class="pulse-dot"></span>
+            Domain Configured
+        </div>
+        <h1>{domain}</h1>
+        <p class="subtitle">Coming Soon &mdash; Something exciting is in the works!</p>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Status</div>
+                <div class="card-value" style="color: #4ade80;">Active</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Server</div>
+                <div class="card-value">Nginx High-Perf</div>
+            </div>
+            <div class="card">
+                <div class="card-label">SSL / TLS</div>
+                <div class="card-value">Ready</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Storage</div>
+                <div class="card-value">SSD Protected</div>
+            </div>
+        </div>
+
+        <div class="instructions">
+            <strong>Website Administrator Notice:</strong><br>
+            Upload your web files to <code>/public</code> using the File Manager, FTP, or Git Deploy to replace this holding page.
+            <div class="marker-text">{PLACEHOLDER_MARKER}</div>
+        </div>
+
+        <footer>
+            Hosted securely &bull; Powered by DockPanel
+        </footer>
+    </div>
+</body>
+</html>"#,
+        domain = domain,
+        PLACEHOLDER_MARKER = PLACEHOLDER_MARKER
     )
 }
 

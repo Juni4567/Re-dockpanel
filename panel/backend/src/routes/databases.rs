@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use base64::Engine;
 use uuid::Uuid;
 
 use crate::auth::{AuthUser, ServerScope};
@@ -1270,8 +1271,6 @@ pub async fn dumps(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
-
     let (name, engine, _password, _port, site_server_id) =
         get_db_info(&state, id, claims.sub).await?;
     let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
@@ -1358,8 +1357,6 @@ pub async fn import(
     headers: axum::http::HeaderMap,
     Json(body): Json<ImportDbRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&claims.role)?;
-
     let filename = body.filename.trim();
     // The agent's `is_safe_filename` is the real gate, but this name is about to be
     // interpolated into an HTTP request line, and a character that is merely UNUSUAL
@@ -1467,6 +1464,181 @@ pub async fn import(
     tracing::info!("Database import completed: {name} from {filename}");
 
     Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+pub struct UploadDumpRequest {
+    pub filename: String,
+    pub content: String,
+    pub auto_import: Option<bool>,
+}
+
+/// POST /api/databases/{id}/export — Trigger an on-demand dump of the database.
+pub async fn export(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
+
+    let agent_body = serde_json::json!({
+        "container_name": format!("dockpanel-db-{name}"),
+        "db_name": name,
+        "db_type": engine,
+        "user": name,
+        "password": password,
+    });
+
+    let res = agent
+        .post_long("/db-backups/dump", Some(agent_body), 600)
+        .await
+        .map_err(|e| agent_error("Database export", e))?;
+
+    Ok(Json(res))
+}
+
+/// POST /api/databases/{id}/upload-dump — Upload a dump file and optionally import it immediately.
+pub async fn upload_dump(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<UploadDumpRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+
+    let raw_filename = body.filename.trim();
+    let sanitized_filename = raw_filename
+        .replace(['/', '\\', ' ', ':', ';', '&', '|', '`', '$'], "_");
+    if sanitized_filename.is_empty() || sanitized_filename.contains("..") {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid filename"));
+    }
+
+    let decoded_bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.content.trim())
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid base64 encoding"))?;
+
+    if decoded_bytes.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "File is empty"));
+    }
+
+    let is_gzipped = decoded_bytes.starts_with(&[0x1f, 0x8b]);
+    let target_filename = if is_gzipped {
+        if sanitized_filename.ends_with(".gz") {
+            sanitized_filename
+        } else {
+            format!("{sanitized_filename}.gz")
+        }
+    } else {
+        if sanitized_filename.ends_with(".sql") {
+            sanitized_filename
+        } else {
+            format!("{sanitized_filename}.sql")
+        }
+    };
+
+    let target_dir = format!("/var/backups/dockpanel/databases/{name}");
+    tokio::fs::create_dir_all(&target_dir)
+        .await
+        .map_err(|e| internal_error("create dump directory", e))?;
+
+    let target_path = format!("{target_dir}/{target_filename}");
+    tokio::fs::write(&target_path, &decoded_bytes)
+        .await
+        .map_err(|e| internal_error("write dump file", e))?;
+
+    // If file is plain SQL and not gzipped, compress it with gzip
+    let final_filename = if !is_gzipped && target_filename.ends_with(".sql") {
+        let gz_path = format!("{target_path}.gz");
+        let gz_status = tokio::process::Command::new("gzip")
+            .arg("-c")
+            .arg(&target_path)
+            .output()
+            .await;
+        match gz_status {
+            Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+                let _ = tokio::fs::write(&gz_path, &output.stdout).await;
+                format!("{target_filename}.gz")
+            }
+            _ => target_filename,
+        }
+    } else {
+        target_filename
+    };
+
+    let auto_import = body.auto_import.unwrap_or(false);
+    let mut import_result = None;
+
+    if auto_import {
+        let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
+        let agent_body = serde_json::json!({
+            "container_name": format!("dockpanel-db-{name}"),
+            "db_type": engine,
+            "user": name,
+            "password": password,
+        });
+        let budget = crate::services::agent::DB_RESTORE_TIMEOUT_SECS;
+        let agent_path = format!("/db-backups/{name}/restore/{final_filename}");
+        let call = agent.post_long(&agent_path, Some(agent_body), budget + 60);
+        match tokio::time::timeout(std::time::Duration::from_secs(budget), call).await {
+            Ok(Ok(val)) => {
+                import_result = Some(val);
+            }
+            Ok(Err(e)) => {
+                return Err(agent_error("Database import", e));
+            }
+            Err(_) => {
+                import_result = Some(serde_json::json!({
+                    "status": "in_progress",
+                    "message": "Import was started and is running in background"
+                }));
+            }
+        }
+    }
+
+    let ip = crate::routes::client_ip(&headers);
+    crate::services::activity::log_activity_on_server(
+        &state.db, claims.sub, &claims.email, "database.upload_dump",
+        Some("database"), Some(&name), Some(&final_filename), ip.as_deref(), site_server_id, claims.key_id,
+    ).await;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "filename": final_filename,
+        "auto_imported": auto_import,
+        "result": import_result,
+    })))
+}
+
+/// GET /api/databases/{id}/dumps/{filename}/download — Download dump file directly.
+pub async fn download_dump(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path((id, filename)): Path<(Uuid, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    let (name, _engine, _password, _port, _site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+
+    let clean_filename = filename.trim();
+    if clean_filename.contains("..") || clean_filename.contains('/') || clean_filename.contains('\\') {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid filename"));
+    }
+
+    let file_path = format!("/var/backups/dockpanel/databases/{name}/{clean_filename}");
+    let bytes = tokio::fs::read(&file_path)
+        .await
+        .map_err(|_| err(StatusCode::NOT_FOUND, "Dump file not found on disk"))?;
+
+    let content_disposition = format!("attachment; filename=\"{clean_filename}\"");
+
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(axum::http::header::CONTENT_DISPOSITION, content_disposition)
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| internal_error("build download response", e))?)
 }
 
 #[cfg(test)]

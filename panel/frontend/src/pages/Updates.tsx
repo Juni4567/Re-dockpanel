@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { Navigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../api";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 interface PackageUpdate {
   name: string;
@@ -49,6 +50,7 @@ export default function Updates() {
   const [updateDone, setUpdateDone] = useState<"success" | "error" | null>(null);
   const [lastChecked, setLastChecked] = useState<Date | null>(null);
   const [confirmReboot, setConfirmReboot] = useState(false);
+  const [confirmApply, setConfirmApply] = useState(false);
   const termRef = useRef<HTMLDivElement>(null);
 
   if (user?.role !== "admin") return <Navigate to="/" replace />;
@@ -278,7 +280,7 @@ export default function Updates() {
         <div className="flex items-center gap-2">
           {packages.length > 0 && (
             <button
-              onClick={applyUpdates}
+              onClick={() => setConfirmApply(true)}
               disabled={applying}
               className="px-4 py-2 bg-rust-600 text-white rounded-lg text-sm font-medium hover:bg-rust-700 disabled:opacity-50 flex items-center gap-2"
             >
@@ -313,7 +315,7 @@ export default function Updates() {
 
       {/* Reboot Required Banner */}
       {rebootRequired && (
-        <div className="border border-warn-500/50 bg-warn-500/5 p-4 flex items-start gap-3 mb-6">
+        <div className="border border-warn-500/50 bg-warn-500/5 p-4 flex items-start gap-3 mb-6 rounded-lg">
           <svg className="w-5 h-5 text-warn-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
           </svg>
@@ -323,31 +325,51 @@ export default function Updates() {
               Recent package updates (such as a new kernel version) require a reboot to be fully applied.
             </p>
           </div>
-          {!confirmReboot ? (
-            <button
-              onClick={() => setConfirmReboot(true)}
-              className="px-4 py-2 bg-warn-500 text-dark-900 text-xs font-bold uppercase tracking-wider hover:bg-warn-400 transition-colors shrink-0"
-            >
-              Reboot Now
-            </button>
-          ) : (
-            <div className="flex items-center gap-2 shrink-0">
-              <span className="text-xs text-warn-400 font-mono">Are you sure?</span>
-              <button
-                onClick={handleReboot}
-                className="px-3 py-1.5 bg-danger-500 text-white text-xs font-bold uppercase tracking-wider hover:bg-danger-600 transition-colors"
-              >
-                Confirm
-              </button>
-              <button
-                onClick={() => setConfirmReboot(false)}
-                className="px-3 py-1.5 bg-dark-600 text-dark-200 text-xs font-bold uppercase tracking-wider hover:bg-dark-500 transition-colors"
-              >
-                Cancel
-              </button>
-            </div>
-          )}
+          <button
+            onClick={() => setConfirmReboot(true)}
+            className="px-4 py-2 bg-warn-500 text-dark-900 text-xs font-bold uppercase tracking-wider hover:bg-warn-400 transition-colors shrink-0 rounded"
+          >
+            Reboot Now
+          </button>
         </div>
+      )}
+
+      {/* Lethal Confirmation for Reboot */}
+      {confirmReboot && (
+        <ConfirmDialog
+          title="Confirm Server Reboot"
+          label="A reboot will immediately restart the host machine to apply updated packages and kernel modules."
+          consequences={[
+            "All active SSH connections, web traffic, and open panels will be severed immediately.",
+            "All websites, reverse proxies, and containers will experience 1–3 minutes of downtime.",
+            "Any unsaved configuration or transient in-flight jobs will be terminated.",
+            "The system will come back online once POST and boot sequencing finish."
+          ]}
+          confirmLabel="Reboot Server Now"
+          tone="danger"
+          onConfirm={handleReboot}
+          onCancel={() => setConfirmReboot(false)}
+        />
+      )}
+
+      {/* Confirmation for System Package Upgrades */}
+      {confirmApply && (
+        <ConfirmDialog
+          title={`Install ${selected.size > 0 ? `${selected.size} Selected Package Updates` : "All System Package Updates"}?`}
+          label={`You are about to install ${selected.size > 0 ? selected.size : packages.length} package updates on the host operating system.`}
+          consequences={[
+            "Core shared system libraries, daemon binaries, or runtimes may be upgraded in-place.",
+            "Associated system daemons may momentarily restart during package configuration.",
+            "A server reboot may be required afterwards if kernel, systemd, or libc packages are upgraded."
+          ]}
+          confirmLabel="Confirm & Install Updates"
+          tone="warn"
+          onConfirm={() => {
+            setConfirmApply(false);
+            applyUpdates();
+          }}
+          onCancel={() => setConfirmApply(false)}
+        />
       )}
 
       {message.text && (

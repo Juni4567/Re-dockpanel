@@ -969,10 +969,10 @@ pub(crate) async fn record_renewal_provenance(
     }
 }
 
-/// POST /api/ssl/{id}/renew — Force-renew SSL certificate (admin only).
+/// POST /api/ssl/{id}/renew — Force-renew SSL certificate (site owner or admin).
 pub async fn renew(
     State(state): State<AppState>,
-    AdminUser(claims): AdminUser,
+    AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // ⚠ This read used to be `WHERE id = $1` with no caller and no server term,

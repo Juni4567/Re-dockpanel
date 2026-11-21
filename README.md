@@ -78,7 +78,7 @@ This fork (`Re-dockpanel`) includes key production improvements, bug fixes, and 
 ## Install
 
 ```bash
-curl -sL https://dockpanel.dev/install.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/Juni4567/Re-dockpanel/main/scripts/install.sh | sudo bash
 ```
 
 Open `https://YOUR_SERVER_IP:8443`, create your admin account, done. Without a domain the

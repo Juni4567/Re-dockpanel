@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback, FormEvent } from "react";
 import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import { useAuth } from "../context/AuthContext";
+import ConfirmDialog from "../components/ConfirmDialog";
+import { showGlobalNotification } from "../context/NotificationContext";
 
 interface Site {
   id: string;
@@ -53,633 +55,21 @@ const engineLabels: Record<string, string> = {
   mariadb: "MariaDB",
 };
 
-/* ─── SQL Browser ───────────────────────────────────────────────── */
+/* ─── Advanced Database Manager (phpMyAdmin Alternative) ───────────── */
 
-interface SchemaOverview {
-  tables?: QueryResult;
-  foreign_keys?: QueryResult;
-}
-
-function SchemaBrowser({ database, onClose }: { database: Database; onClose: () => void }) {
-  const [overview, setOverview] = useState<SchemaOverview | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [selectedTable, setSelectedTable] = useState<string | null>(null);
-  const [tableSchema, setTableSchema] = useState<QueryResult | null>(null);
-  const [tableIndexes, setTableIndexes] = useState<QueryResult | null>(null);
-  const [detailError, setDetailError] = useState("");
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const data = await api.get<SchemaOverview>(`/databases/${database.id}/schema-overview`);
-        setOverview(data);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to load schema");
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [database.id]);
-
-  // Settled, not all-or-nothing, and never silent. These are two independent
-  // endpoints against two independent statements; sharing one `Promise.all` meant
-  // the first rejection discarded the other's result, so when the columns query
-  // broke in `29d959b` it took the working index pane down with it. And the
-  // rejection landed in a bare `catch {}`, which is why five months of a dead pane
-  // produced not one report: the panes render empty either way, so an empty pane
-  // could mean "no columns", "request failed" or "never asked".
-  const loadTableDetails = async (table: string) => {
-    setSelectedTable(table);
-    setTableSchema(null);
-    setTableIndexes(null);
-    setDetailError("");
-
-    const [schema, indexes] = await Promise.allSettled([
-      api.get<QueryResult>(`/databases/${database.id}/tables/${encodeURIComponent(table)}`),
-      api.get<QueryResult>(`/databases/${database.id}/indexes/${encodeURIComponent(table)}`),
-    ]);
-
-    if (schema.status === "fulfilled") setTableSchema(schema.value);
-    if (indexes.status === "fulfilled") setTableIndexes(indexes.value);
-
-    const failed = [
-      schema.status === "rejected" ? "columns" : null,
-      indexes.status === "rejected" ? "indexes" : null,
-    ].filter(Boolean);
-    if (failed.length) {
-      const reason = [schema, indexes].find(r => r.status === "rejected") as PromiseRejectedResult;
-      const detail = reason.reason instanceof Error ? reason.reason.message : "request failed";
-      setDetailError(`Could not load ${failed.join(" or ")} for ${table}: ${detail}`);
-    }
-  };
-
-  const tables = overview?.tables?.rows || [];
-  const fks = overview?.foreign_keys?.rows || [];
-  const fkCols = overview?.foreign_keys?.columns || [];
-
-  // Map FK columns to named fields
-  const srcTableIdx = fkCols.indexOf("source_table");
-  const srcColIdx = fkCols.indexOf("source_column");
-  const tgtTableIdx = fkCols.indexOf("target_table");
-  const tgtColIdx = fkCols.indexOf("target_column");
-
-  return (
-    <div className="animate-fade-up">
-      <div className="flex items-center gap-3 mb-5 pb-4 border-b border-dark-600">
-        <button onClick={onClose} className="px-3 py-1.5 text-sm text-dark-300 border border-dark-600 rounded-lg hover:text-dark-100 hover:border-dark-400 transition-colors">
-          &larr; Back
-        </button>
-        <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">Schema Browser</h1>
-        <span className="text-sm font-mono text-dark-50">{database.name}</span>
-        <span className="px-2 py-0.5 bg-dark-700 text-dark-200 rounded text-xs font-medium">{database.engine}</span>
-      </div>
-
-      {loading && <p className="text-dark-400 text-sm">Loading schema...</p>}
-      {error && <div className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20">{error}</div>}
-
-      {!loading && !error && (
-        <div className="flex gap-4" style={{ minHeight: "calc(100vh - 220px)" }}>
-          {/* Left: Table list */}
-          <div className="w-56 shrink-0 bg-dark-800 rounded-lg border border-dark-500 overflow-hidden flex flex-col">
-            <div className="px-3 py-2.5 border-b border-dark-600">
-              <span className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">
-                Tables ({tables.length})
-              </span>
-            </div>
-            <div className="overflow-y-auto flex-1 py-1">
-              {tables.map((row: string[]) => {
-                const name = row[0];
-                const rowCount = row[2] || "0";
-                const sizeKb = row[3] || "0";
-                const hasFk = fks.some((fk: string[]) => fk[srcTableIdx] === name || fk[tgtTableIdx] === name);
-                return (
-                  <button
-                    key={name}
-                    onClick={() => loadTableDetails(name)}
-                    className={`w-full text-left px-3 py-2 text-sm hover:bg-dark-700 transition-colors flex items-center justify-between ${
-                      selectedTable === name ? "bg-dark-700 text-dark-50" : "text-dark-200"
-                    }`}
-                  >
-                    <span className="flex items-center gap-1.5 truncate">
-                      {hasFk && <span className="w-1.5 h-1.5 rounded-full bg-rust-400 shrink-0" title="Has relationships" />}
-                      {name}
-                    </span>
-                    <span className="text-xs text-dark-400 shrink-0 ml-2">{rowCount}r</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Right: Table detail + relationships */}
-          <div className="flex-1 space-y-4">
-            {selectedTable && (tableSchema || tableIndexes || detailError) ? (
-              <>
-                {detailError && (
-                  <div className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20">
-                    {detailError}
-                  </div>
-                )}
-
-                {tableSchema && (
-                <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
-                  <div className="px-4 py-3 border-b border-dark-600 flex items-center justify-between">
-                    <h3 className="text-sm font-medium text-dark-100 font-mono">{selectedTable}</h3>
-                    <span className="text-xs text-dark-400">{tableSchema.rows?.length || 0} columns</span>
-                  </div>
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-dark-600 bg-dark-700/50">
-                        <th className="text-left px-4 py-2 text-xs text-dark-300 uppercase">Column</th>
-                        <th className="text-left px-4 py-2 text-xs text-dark-300 uppercase">Type</th>
-                        <th className="text-left px-4 py-2 text-xs text-dark-300 uppercase">Nullable</th>
-                        <th className="text-left px-4 py-2 text-xs text-dark-300 uppercase">Default</th>
-                        {database.engine !== "postgres" && <th className="text-left px-4 py-2 text-xs text-dark-300 uppercase">Key</th>}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(tableSchema.rows || []).map((col: string[], i: number) => (
-                        <tr key={i} className="border-b border-dark-700 hover:bg-dark-700/30">
-                          <td className="px-4 py-2 font-mono text-dark-100">{col[0]}</td>
-                          <td className="px-4 py-2 font-mono text-accent-400">{col[1]}</td>
-                          <td className="px-4 py-2 text-dark-300">{col[database.engine === "postgres" ? 3 : 2] === "YES" ? "Yes" : "No"}</td>
-                          <td className="px-4 py-2 text-dark-400 font-mono text-xs">{col[database.engine === "postgres" ? 4 : 3] || "-"}</td>
-                          {database.engine !== "postgres" && <td className="px-4 py-2 text-rust-400">{col[4] || ""}</td>}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                )}
-
-                {/* Indexes. Rendered independently of the columns pane above — they are
-                    separate endpoints and one must not be able to blank the other. */}
-                {tableIndexes && tableIndexes.rows?.length > 0 && (
-                  <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
-                    <div className="px-4 py-3 border-b border-dark-600">
-                      <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Indexes</h3>
-                    </div>
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="border-b border-dark-600 bg-dark-700/50">
-                          {(tableIndexes.columns || []).map((c: string, i: number) => (
-                            <th key={i} className="text-left px-4 py-2 text-xs text-dark-300 uppercase">{c}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(tableIndexes.rows || []).map((row: string[], i: number) => (
-                          <tr key={i} className="border-b border-dark-700">
-                            {row.map((cell: string, j: number) => (
-                              <td key={j} className="px-4 py-2 font-mono text-dark-200 text-xs">{cell}</td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-
-                {/* Foreign Keys involving this table */}
-                {(() => {
-                  const relatedFks = fks.filter((fk: string[]) => fk[srcTableIdx] === selectedTable || fk[tgtTableIdx] === selectedTable);
-                  if (relatedFks.length === 0) return null;
-                  return (
-                    <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
-                      <div className="px-4 py-3 border-b border-dark-600">
-                        <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Relationships</h3>
-                      </div>
-                      <div className="p-4 space-y-2">
-                        {relatedFks.map((fk: string[], i: number) => (
-                          <div key={i} className="flex items-center gap-2 text-sm">
-                            <span className="font-mono text-dark-100">{fk[srcTableIdx]}</span>
-                            <span className="text-dark-400">.</span>
-                            <span className="font-mono text-accent-400">{fk[srcColIdx]}</span>
-                            <svg className="w-4 h-4 text-rust-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
-                            <span className="font-mono text-dark-100">{fk[tgtTableIdx]}</span>
-                            <span className="text-dark-400">.</span>
-                            <span className="font-mono text-accent-400">{fk[tgtColIdx]}</span>
-                            {fk[4] && <span className="text-xs text-dark-400 ml-2">({fk[4]})</span>}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })()}
-              </>
-            ) : (
-              <div className="bg-dark-800 rounded-lg border border-dark-500 p-8 text-center">
-                <p className="text-dark-400 text-sm">Select a table to view its schema, indexes, and relationships.</p>
-                {fks.length > 0 && (
-                  <div className="mt-6 text-left">
-                    <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest mb-3">All Relationships ({fks.length})</h3>
-                    <div className="space-y-1.5">
-                      {fks.map((fk: string[], i: number) => (
-                        <div key={i} className="flex items-center gap-2 text-sm">
-                          <button onClick={() => loadTableDetails(fk[srcTableIdx])} className="font-mono text-dark-100 hover:text-rust-400">{fk[srcTableIdx]}</button>
-                          <span className="text-dark-400">.</span>
-                          <span className="font-mono text-accent-400">{fk[srcColIdx]}</span>
-                          <svg className="w-3 h-3 text-dark-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
-                          <button onClick={() => loadTableDetails(fk[tgtTableIdx])} className="font-mono text-dark-100 hover:text-rust-400">{fk[tgtTableIdx]}</button>
-                          <span className="text-dark-400">.</span>
-                          <span className="font-mono text-accent-400">{fk[tgtColIdx]}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SqlBrowser({
-  database,
-  onClose,
-}: {
-  database: Database;
-  onClose: () => void;
-}) {
-  const [tables, setTables] = useState<string[]>([]);
-  const [tablesLoading, setTablesLoading] = useState(true);
-  const [selectedTable, setSelectedTable] = useState<string | null>(null);
-  const [sql, setSql] = useState("");
-  const [result, setResult] = useState<QueryResult | null>(null);
-  const [queryLoading, setQueryLoading] = useState(false);
-  const [queryError, setQueryError] = useState("");
-  const [history, setHistory] = useState<string[]>([]);
-  const [historyIdx, setHistoryIdx] = useState(-1);
-  const editorRef = useRef<HTMLTextAreaElement>(null);
-
-  const engine = database.engine;
-  const q = engine === "postgres" ? '"' : "`";
-
-  const loadTables = useCallback(async () => {
-    setTablesLoading(true);
-    try {
-      const res = await api.get<QueryResult>(
-        `/databases/${database.id}/tables`
-      );
-      setTables(res.rows.map((r) => r[0]));
-    } catch (e) {
-      setQueryError(e instanceof Error ? e.message : "Failed to load tables");
-    } finally {
-      setTablesLoading(false);
-    }
-  }, [database.id]);
-
-  useEffect(() => {
-    loadTables();
-  }, [loadTables]);
-
-  const executeQuery = useCallback(
-    async (queryStr?: string) => {
-      const toRun = queryStr || sql;
-      if (!toRun.trim()) return;
-
-      setQueryLoading(true);
-      setQueryError("");
-      setResult(null);
-      try {
-        const res = await api.post<QueryResult>(
-          `/databases/${database.id}/query`,
-          { sql: toRun }
-        );
-        setResult(res);
-        // Add to history (deduplicate)
-        setHistory((prev) => {
-          const deduped = prev.filter((h) => h !== toRun);
-          return [toRun, ...deduped].slice(0, 50);
-        });
-        setHistoryIdx(-1);
-      } catch (e) {
-        setQueryError(e instanceof Error ? e.message : "Query failed");
-      } finally {
-        setQueryLoading(false);
-      }
-    },
-    [database.id, sql]
-  );
-
-  const selectTable = (table: string) => {
-    setSelectedTable(table);
-    const query = `SELECT * FROM ${q}${table}${q} LIMIT 100`;
-    setSql(query);
-    executeQuery(query);
-  };
-
-  const showSchema = async (table: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setSelectedTable(table);
-    setQueryLoading(true);
-    setQueryError("");
-    try {
-      const res = await api.get<QueryResult>(
-        `/databases/${database.id}/tables/${encodeURIComponent(table)}`
-      );
-      setResult(res);
-      setSql("");
-    } catch (err) {
-      setQueryError(
-        err instanceof Error ? err.message : "Failed to load schema"
-      );
-    } finally {
-      setQueryLoading(false);
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-      e.preventDefault();
-      executeQuery();
-    }
-    // History navigation with Ctrl+Up/Down
-    if (e.ctrlKey && e.key === "ArrowUp" && history.length > 0) {
-      e.preventDefault();
-      const next = Math.min(historyIdx + 1, history.length - 1);
-      setHistoryIdx(next);
-      setSql(history[next]);
-    }
-    if (e.ctrlKey && e.key === "ArrowDown" && historyIdx > 0) {
-      e.preventDefault();
-      const next = historyIdx - 1;
-      setHistoryIdx(next);
-      setSql(history[next]);
-    }
-  };
-
-  return (
-    <div className="animate-fade-up">
-      {/* Header */}
-      <div className="flex items-center gap-3 mb-5 pb-4 border-b border-dark-600">
-        <button
-          onClick={onClose}
-          className="px-3 py-1.5 text-sm text-dark-300 border border-dark-600 rounded-lg hover:text-dark-100 hover:border-dark-400 transition-colors"
-        >
-          &larr; Back
-        </button>
-        <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">
-          SQL Browser
-        </h1>
-        <span className="text-sm font-mono text-dark-50">{database.name}</span>
-        <span className="px-2 py-0.5 bg-dark-700 text-dark-200 rounded text-xs font-medium">
-          {engineLabels[engine] || engine}
-        </span>
-      </div>
-
-      {/* Two-column layout */}
-      <div className="flex gap-4" style={{ minHeight: "calc(100vh - 220px)" }}>
-        {/* Left: Tables sidebar */}
-        <div className="w-52 shrink-0 bg-dark-800 rounded-lg border border-dark-500 overflow-hidden flex flex-col">
-          <div className="px-3 py-2.5 border-b border-dark-600 flex items-center justify-between">
-            <span className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">
-              Tables
-            </span>
-            <button
-              onClick={loadTables}
-              className="text-dark-400 hover:text-dark-200 transition-colors"
-              title="Refresh tables"
-            >
-              <svg
-                className="w-3.5 h-3.5"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2}
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182"
-                />
-              </svg>
-            </button>
-          </div>
-          <div className="flex-1 overflow-y-auto p-1.5">
-            {tablesLoading ? (
-              <div className="space-y-1.5 p-2">
-                {[...Array(5)].map((_, i) => (
-                  <div
-                    key={i}
-                    className="h-5 bg-dark-700 rounded animate-pulse"
-                  />
-                ))}
-              </div>
-            ) : tables.length === 0 ? (
-              <div className="text-center text-dark-400 text-xs py-6">
-                No tables found
-              </div>
-            ) : (
-              tables.map((t) => (
-                <div
-                  key={t}
-                  onClick={() => selectTable(t)}
-                  className={`group flex items-center justify-between px-2.5 py-1.5 rounded cursor-pointer text-sm font-mono transition-colors ${
-                    selectedTable === t
-                      ? "bg-dark-600 text-dark-50"
-                      : "text-dark-200 hover:bg-dark-700"
-                  }`}
-                >
-                  <span className="truncate">{t}</span>
-                  <button
-                    onClick={(e) => showSchema(t, e)}
-                    title="View schema"
-                    className="opacity-0 group-hover:opacity-100 text-dark-400 hover:text-dark-200 transition-opacity shrink-0 ml-1"
-                  >
-                    <svg
-                      className="w-3.5 h-3.5"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      strokeWidth={2}
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        d="m11.25 11.25.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z"
-                      />
-                    </svg>
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-
-        {/* Right: Editor + Results */}
-        <div className="flex-1 min-w-0 flex flex-col gap-4">
-          {/* SQL Editor */}
-          <div className="bg-dark-800 rounded-lg border border-dark-500 p-3">
-            <textarea
-              ref={editorRef}
-              value={sql}
-              onChange={(e) => setSql(e.target.value)}
-              onKeyDown={handleKeyDown}
-              className="w-full h-28 bg-dark-900 border border-dark-500 rounded-lg p-3 text-sm font-mono text-dark-100 resize-y focus:outline-none focus:border-dark-400 placeholder-dark-500"
-              placeholder="SELECT * FROM ..."
-              spellCheck={false}
-            />
-            <div className="flex items-center justify-between mt-2">
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => executeQuery()}
-                  disabled={queryLoading || !sql.trim()}
-                  className="flex items-center gap-2 px-4 py-1.5 bg-rust-500 text-white rounded text-sm font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors"
-                >
-                  {queryLoading && (
-                    <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  )}
-                  Execute
-                </button>
-                <span className="text-xs text-dark-400">Ctrl+Enter</span>
-              </div>
-              {result && (
-                <span className="text-xs text-dark-300">
-                  {result.execution_time_ms}ms &middot; {result.row_count} row
-                  {result.row_count !== 1 ? "s" : ""}
-                  {result.truncated && " (truncated to 1000)"}
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* Error */}
-          {queryError && (
-            <div
-              role="alert"
-              className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20"
-            >
-              <button
-                onClick={() => setQueryError("")}
-                className="float-right font-bold ml-2"
-                aria-label="Close error"
-              >
-                &times;
-              </button>
-              <pre className="whitespace-pre-wrap font-mono text-xs">
-                {queryError}
-              </pre>
-            </div>
-          )}
-
-          {/* Results table */}
-          {result && result.columns.length > 0 && (
-            <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto flex-1">
-              <table className="w-full">
-                <thead className="sticky top-0">
-                  <tr className="border-b border-dark-500 bg-dark-900">
-                    <th className="text-left text-[10px] font-medium text-dark-400 uppercase font-mono px-3 py-2 w-10">
-                      #
-                    </th>
-                    {result.columns.map((col, i) => (
-                      <th
-                        key={i}
-                        className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-3 py-2 whitespace-nowrap"
-                      >
-                        {col}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-dark-700">
-                  {result.rows.map((row, i) => (
-                    <tr
-                      key={i}
-                      className="hover:bg-dark-700/30 transition-colors"
-                    >
-                      <td className="px-3 py-1.5 text-[10px] text-dark-400 font-mono">
-                        {i + 1}
-                      </td>
-                      {row.map((val, j) => (
-                        <td
-                          key={j}
-                          className="px-3 py-1.5 text-sm text-dark-100 font-mono whitespace-nowrap max-w-xs truncate"
-                          title={val}
-                        >
-                          {val === "" || val === "\\N" ? (
-                            <span className="text-dark-400 italic text-xs">
-                              NULL
-                            </span>
-                          ) : (
-                            val
-                          )}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {/* Empty result (DML/DDL) */}
-          {result &&
-            result.columns.length === 0 &&
-            result.rows.length === 0 &&
-            !queryError && (
-              <div className="bg-dark-800 rounded-lg border border-dark-500 p-8 text-center text-dark-300 text-sm">
-                <svg
-                  className="w-8 h-8 mx-auto text-rust-400 mb-2"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M4.5 12.75l6 6 9-13.5"
-                  />
-                </svg>
-                Query executed successfully ({result.execution_time_ms}ms)
-              </div>
-            )}
-
-          {/* Initial state */}
-          {!result && !queryError && !queryLoading && (
-            <div className="bg-dark-800 rounded-lg border border-dark-500 p-12 text-center flex-1 flex flex-col items-center justify-center">
-              <svg
-                className="w-10 h-10 text-dark-400 mb-3"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={1}
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"
-                />
-              </svg>
-              <p className="text-dark-300 text-sm">
-                Select a table or write a query
-              </p>
-              <p className="text-dark-400 text-xs mt-1">
-                Ctrl+Up/Down to navigate query history
-              </p>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ─── Import a dump the operator placed on the server ───────────── */
+type ManagerTab = "browse" | "structure" | "sql" | "import" | "export" | "find_replace";
 
 interface DumpFile {
   filename: string;
   size_bytes: number;
   created_at: string;
-  /** Present when the file is not a database backup at all (agent's verdict). */
   unsupported?: string;
-  /** Present when it IS a backup but cannot go into THIS database (panel's verdict). */
   import_blocked?: string;
+}
+
+interface SchemaOverview {
+  tables?: QueryResult;
+  foreign_keys?: QueryResult;
 }
 
 function formatBytes(n: number): string {
@@ -689,202 +79,1656 @@ function formatBytes(n: number): string {
   return `${n} B`;
 }
 
-function ImportDatabase({ database, onClose }: { database: Database; onClose: () => void }) {
+function AdvancedDatabaseManager({
+  database,
+  initialTab = "browse",
+  onClose,
+}: {
+  database: Database;
+  initialTab?: ManagerTab;
+  onClose: () => void;
+}) {
+  const [activeTab, setActiveTab] = useState<ManagerTab>(initialTab);
+  const [tables, setTables] = useState<string[]>([]);
+  const [tableDetails, setTableDetails] = useState<Record<string, { rows: string; sizeKb: string }>>({});
+  const [foreignKeys, setForeignKeys] = useState<string[][]>([]);
+  const [fkColumns, setFkColumns] = useState<string[]>([]);
+  const [tablesLoading, setTablesLoading] = useState(true);
+  const [selectedTable, setSelectedTable] = useState<string | null>(null);
+
+  // Common quote char for identifiers: Postgres uses double-quotes, MySQL/MariaDB backticks
+  const q = database.engine === "postgres" ? '"' : "`";
+
+  // Lethal action confirmations
+  const [confirmModal, setConfirmModal] = useState<{
+    title: string;
+    label: string;
+    consequences: string[];
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
+
+  // Load tables & schema overview
+  const loadTables = useCallback(async () => {
+    setTablesLoading(true);
+    try {
+      const overview = await api.get<SchemaOverview>(`/databases/${database.id}/schema-overview`);
+      if (overview.tables?.rows) {
+        const tNames: string[] = [];
+        const details: Record<string, { rows: string; sizeKb: string }> = {};
+        for (const r of overview.tables.rows) {
+          tNames.push(r[0]);
+          details[r[0]] = { rows: r[2] || "0", sizeKb: r[3] || "0" };
+        }
+        setTables(tNames);
+        setTableDetails(details);
+        if (tNames.length > 0 && !selectedTable) {
+          setSelectedTable(tNames[0]);
+        }
+      } else {
+        const res = await api.get<QueryResult>(`/databases/${database.id}/tables`);
+        const tNames = res.rows.map((r) => r[0]);
+        setTables(tNames);
+        if (tNames.length > 0 && !selectedTable) {
+          setSelectedTable(tNames[0]);
+        }
+      }
+      if (overview.foreign_keys?.rows) {
+        setForeignKeys(overview.foreign_keys.rows);
+        setFkColumns(overview.foreign_keys.columns || []);
+      }
+    } catch {
+      try {
+        const res = await api.get<QueryResult>(`/databases/${database.id}/tables`);
+        const tNames = res.rows.map((r) => r[0]);
+        setTables(tNames);
+        if (tNames.length > 0 && !selectedTable) setSelectedTable(tNames[0]);
+      } catch {
+        // Ignored
+      }
+    } finally {
+      setTablesLoading(false);
+    }
+  }, [database.id, selectedTable]);
+
+  useEffect(() => {
+    loadTables();
+  }, [loadTables]);
+
+  /* ──────────────── Browse Data Tab State ──────────────── */
+  const [browseRows, setBrowseRows] = useState<QueryResult | null>(null);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseError, setBrowseError] = useState("");
+  const [browsePage, setBrowsePage] = useState(0);
+  const [pageSize, setPageSize] = useState(25);
+  const [totalRows, setTotalRows] = useState<number | null>(null);
+  const [sortCol, setSortCol] = useState<string | null>(null);
+  const [sortDir, setSortDir] = useState<"ASC" | "DESC">("ASC");
+  const [whereClause, setWhereClause] = useState("");
+  const [showInsertModal, setShowInsertModal] = useState(false);
+  const [insertColValues, setInsertColValues] = useState<Record<string, string>>({});
+  const [inserting, setInserting] = useState(false);
+
+  const loadBrowseData = useCallback(async (tableToLoad?: string) => {
+    const tbl = tableToLoad || selectedTable;
+    if (!tbl) return;
+    setBrowseLoading(true);
+    setBrowseError("");
+    try {
+      let query = `SELECT * FROM ${q}${tbl}${q}`;
+      if (whereClause.trim()) {
+        query += ` WHERE ${whereClause.trim()}`;
+      }
+      if (sortCol) {
+        query += ` ORDER BY ${q}${sortCol}${q} ${sortDir}`;
+      }
+      query += ` LIMIT ${pageSize} OFFSET ${browsePage * pageSize}`;
+
+      const res = await api.post<QueryResult>(`/databases/${database.id}/query`, { sql: query });
+      setBrowseRows(res);
+
+      try {
+        const countSql = `SELECT COUNT(*) FROM ${q}${tbl}${q}${whereClause.trim() ? ` WHERE ${whereClause.trim()}` : ""}`;
+        const countRes = await api.post<QueryResult>(`/databases/${database.id}/query`, { sql: countSql });
+        if (countRes.rows?.[0]?.[0]) {
+          setTotalRows(parseInt(countRes.rows[0][0], 10));
+        }
+      } catch {
+        // Non-fatal
+      }
+    } catch (e) {
+      setBrowseError(e instanceof Error ? e.message : "Failed to load table data");
+    } finally {
+      setBrowseLoading(false);
+    }
+  }, [database.id, selectedTable, q, whereClause, sortCol, sortDir, pageSize, browsePage]);
+
+  useEffect(() => {
+    if (activeTab === "browse" && selectedTable) {
+      loadBrowseData();
+    }
+  }, [activeTab, selectedTable, browsePage, pageSize, sortCol, sortDir, loadBrowseData]);
+
+  const handleSort = (col: string) => {
+    if (sortCol === col) {
+      setSortDir((d) => (d === "ASC" ? "DESC" : "ASC"));
+    } else {
+      setSortCol(col);
+      setSortDir("ASC");
+    }
+    setBrowsePage(0);
+  };
+
+  const handleTruncateTable = (tbl: string) => {
+    setConfirmModal({
+      title: `Empty (Truncate) Table: ${tbl}`,
+      label: `Are you sure you want to erase all data in table "${tbl}"?`,
+      consequences: [
+        `All rows and data inside table "${tbl}" will be immediately deleted`,
+        "Auto-increment primary keys will be reset to 1",
+        "This action cannot be undone unless you have a recent database backup",
+      ],
+      confirmLabel: "Empty Table (Truncate)",
+      onConfirm: async () => {
+        try {
+          const sql = database.engine === "postgres" ? `TRUNCATE TABLE ${q}${tbl}${q} CASCADE` : `TRUNCATE TABLE ${q}${tbl}${q}`;
+          await api.post(`/databases/${database.id}/query`, { sql });
+          showGlobalNotification(`Table "${tbl}" emptied successfully`, "success");
+          loadBrowseData();
+          loadTables();
+        } catch (e) {
+          showGlobalNotification(e instanceof Error ? e.message : "Truncate failed", "error");
+        } finally {
+          setConfirmModal(null);
+        }
+      },
+    });
+  };
+
+  const handleDropTable = (tbl: string) => {
+    setConfirmModal({
+      title: `Drop Table: ${tbl}`,
+      label: `Are you sure you want to permanently DROP table "${tbl}"?`,
+      consequences: [
+        `The table definition and ALL data in "${tbl}" will be permanently destroyed`,
+        "All associated column indexes, constraints, and triggers will be dropped",
+        "Any application code or database foreign keys referencing this table will immediately fail",
+      ],
+      confirmLabel: "Permanently Drop Table",
+      onConfirm: async () => {
+        try {
+          const sql = database.engine === "postgres" ? `DROP TABLE ${q}${tbl}${q} CASCADE` : `DROP TABLE ${q}${tbl}${q}`;
+          await api.post(`/databases/${database.id}/query`, { sql });
+          showGlobalNotification(`Table "${tbl}" dropped successfully`, "success");
+          setSelectedTable(null);
+          loadTables();
+        } catch (e) {
+          showGlobalNotification(e instanceof Error ? e.message : "Drop table failed", "error");
+        } finally {
+          setConfirmModal(null);
+        }
+      },
+    });
+  };
+
+  const handleInsertRow = async () => {
+    if (!selectedTable) return;
+    const cols = Object.keys(insertColValues).filter((k) => insertColValues[k] !== "");
+    if (cols.length === 0) {
+      showGlobalNotification("Please provide at least one column value", "error");
+      return;
+    }
+    setInserting(true);
+    try {
+      const colList = cols.map((c) => `${q}${c}${q}`).join(", ");
+      const valList = cols.map((c) => {
+        const v = insertColValues[c];
+        return `'${v.replace(/'/g, "''")}'`;
+      }).join(", ");
+      const sql = `INSERT INTO ${q}${selectedTable}${q} (${colList}) VALUES (${valList})`;
+      await api.post(`/databases/${database.id}/query`, { sql });
+      showGlobalNotification("Row inserted successfully", "success");
+      setShowInsertModal(false);
+      setInsertColValues({});
+      loadBrowseData();
+      loadTables();
+    } catch (e) {
+      showGlobalNotification(e instanceof Error ? e.message : "Insert failed", "error");
+    } finally {
+      setInserting(false);
+    }
+  };
+
+  /* ──────────────── Structure Tab State ──────────────── */
+  const [structureCols, setStructureCols] = useState<QueryResult | null>(null);
+  const [structureIndexes, setStructureIndexes] = useState<QueryResult | null>(null);
+  const [structureLoading, setStructureLoading] = useState(false);
+  const [structureError, setStructureError] = useState("");
+  const [showAddColumnModal, setShowAddColumnModal] = useState(false);
+  const [newColName, setNewColName] = useState("");
+  const [newColType, setNewColType] = useState("VARCHAR(255)");
+  const [newColNullable, setNewColNullable] = useState(true);
+  const [newColDefault, setNewColDefault] = useState("");
+  const [showCreateTableModal, setShowCreateTableModal] = useState(false);
+  const [newTableName, setNewTableName] = useState("");
+
+  const loadStructure = useCallback(async () => {
+    if (!selectedTable) return;
+    setStructureLoading(true);
+    setStructureError("");
+    try {
+      const [cols, idxs] = await Promise.allSettled([
+        api.get<QueryResult>(`/databases/${database.id}/tables/${encodeURIComponent(selectedTable)}`),
+        api.get<QueryResult>(`/databases/${database.id}/indexes/${encodeURIComponent(selectedTable)}`),
+      ]);
+      if (cols.status === "fulfilled") setStructureCols(cols.value);
+      if (idxs.status === "fulfilled") setStructureIndexes(idxs.value);
+    } catch (e) {
+      setStructureError(e instanceof Error ? e.message : "Failed to load structure");
+    } finally {
+      setStructureLoading(false);
+    }
+  }, [database.id, selectedTable]);
+
+  useEffect(() => {
+    if (activeTab === "structure" && selectedTable) {
+      loadStructure();
+    }
+  }, [activeTab, selectedTable, loadStructure]);
+
+  const handleAddColumn = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!selectedTable || !newColName.trim()) return;
+    try {
+      let sql = `ALTER TABLE ${q}${selectedTable}${q} ADD COLUMN ${q}${newColName.trim()}${q} ${newColType}`;
+      if (!newColNullable) sql += " NOT NULL";
+      if (newColDefault.trim()) sql += ` DEFAULT '${newColDefault.trim().replace(/'/g, "''")}'`;
+      await api.post(`/databases/${database.id}/query`, { sql });
+      showGlobalNotification(`Column "${newColName}" added successfully`, "success");
+      setShowAddColumnModal(false);
+      setNewColName("");
+      setNewColDefault("");
+      loadStructure();
+    } catch (err) {
+      showGlobalNotification(err instanceof Error ? err.message : "Failed to add column", "error");
+    }
+  };
+
+  const handleDropColumn = (colName: string) => {
+    if (!selectedTable) return;
+    setConfirmModal({
+      title: `Drop Column: ${colName}`,
+      label: `Are you sure you want to drop column "${colName}" from table "${selectedTable}"?`,
+      consequences: [
+        `All data in column "${colName}" across all rows will be permanently erased`,
+        "Any queries or software depending on this column will fail",
+      ],
+      confirmLabel: "Drop Column",
+      onConfirm: async () => {
+        try {
+          const sql = `ALTER TABLE ${q}${selectedTable}${q} DROP COLUMN ${q}${colName}${q}`;
+          await api.post(`/databases/${database.id}/query`, { sql });
+          showGlobalNotification(`Column "${colName}" dropped successfully`, "success");
+          loadStructure();
+        } catch (err) {
+          showGlobalNotification(err instanceof Error ? err.message : "Failed to drop column", "error");
+        } finally {
+          setConfirmModal(null);
+        }
+      },
+    });
+  };
+
+  const handleCreateTable = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!newTableName.trim()) return;
+    try {
+      const sql =
+        database.engine === "postgres"
+          ? `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} SERIAL PRIMARY KEY, ${q}created_at${q} TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
+          : `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} INT AUTO_INCREMENT PRIMARY KEY, ${q}created_at${q} TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`;
+      await api.post(`/databases/${database.id}/query`, { sql });
+      showGlobalNotification(`Table "${newTableName}" created successfully`, "success");
+      setShowCreateTableModal(false);
+      const createdName = newTableName.trim();
+      setNewTableName("");
+      await loadTables();
+      setSelectedTable(createdName);
+    } catch (err) {
+      showGlobalNotification(err instanceof Error ? err.message : "Failed to create table", "error");
+    }
+  };
+
+  /* ──────────────── SQL Console Tab State ──────────────── */
+  const [sqlQuery, setSqlQuery] = useState("");
+  const [sqlResult, setSqlResult] = useState<QueryResult | null>(null);
+  const [sqlLoading, setSqlLoading] = useState(false);
+  const [sqlError, setSqlError] = useState("");
+  const [sqlHistory, setSqlHistory] = useState<string[]>([]);
+  const [sqlHistoryIdx, setSqlHistoryIdx] = useState(-1);
+  const sqlEditorRef = useRef<HTMLTextAreaElement>(null);
+
+  const executeSqlQuery = useCallback(
+    async (rawSql?: string) => {
+      const toRun = rawSql || sqlQuery;
+      if (!toRun.trim()) return;
+      setSqlLoading(true);
+      setSqlError("");
+      setSqlResult(null);
+      try {
+        const res = await api.post<QueryResult>(`/databases/${database.id}/query`, { sql: toRun });
+        setSqlResult(res);
+        setSqlHistory((prev) => [toRun, ...prev.filter((h) => h !== toRun)].slice(0, 50));
+        setSqlHistoryIdx(-1);
+      } catch (e) {
+        setSqlError(e instanceof Error ? e.message : "Query execution failed");
+      } finally {
+        setSqlLoading(false);
+      }
+    },
+    [database.id, sqlQuery]
+  );
+
+  const handleSqlKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      executeSqlQuery();
+    }
+    if (e.ctrlKey && e.key === "ArrowUp" && sqlHistory.length > 0) {
+      e.preventDefault();
+      const next = Math.min(sqlHistoryIdx + 1, sqlHistory.length - 1);
+      setSqlHistoryIdx(next);
+      setSqlQuery(sqlHistory[next]);
+    }
+    if (e.ctrlKey && e.key === "ArrowDown" && sqlHistoryIdx > 0) {
+      e.preventDefault();
+      const next = sqlHistoryIdx - 1;
+      setSqlHistoryIdx(next);
+      setSqlQuery(sqlHistory[next]);
+    }
+  };
+
+  /* ──────────────── Import & Upload Tab State ──────────────── */
   const [dumps, setDumps] = useState<DumpFile[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [done, setDone] = useState("");
-  const [confirmFile, setConfirmFile] = useState<string | null>(null);
-  const [importing, setImporting] = useState<string | null>(null);
+  const [dumpsLoading, setDumpsLoading] = useState(false);
+  const [dumpsError, setDumpsError] = useState("");
+  const [importingDump, setImportingDump] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadStatus, setUploadStatus] = useState("");
+  const [autoImportUpload, setAutoImportUpload] = useState(true);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const dir = `/var/backups/dockpanel/databases/${database.name}`;
-
-  const load = useCallback(async () => {
-    setLoading(true);
+  const loadDumps = useCallback(async () => {
+    setDumpsLoading(true);
+    setDumpsError("");
     try {
       const list = await api.get<DumpFile[]>(`/databases/${database.id}/dumps`);
       setDumps(Array.isArray(list) ? list : []);
-      setError("");
     } catch (e) {
-      // Binding and surfacing is the whole point: a listing that fails silently is
-      // indistinguishable from a directory with nothing in it, which is exactly the
-      // ambiguity this feature exists to remove.
-      setError(e instanceof Error ? e.message : "Could not read the dump directory");
+      setDumpsError(e instanceof Error ? e.message : "Failed to load dumps");
     } finally {
-      setLoading(false);
+      setDumpsLoading(false);
     }
   }, [database.id]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (activeTab === "import" || activeTab === "export") {
+      loadDumps();
+    }
+  }, [activeTab, loadDumps]);
 
-  const handleImport = async (filename: string) => {
-    if (confirmFile !== filename) {
-      setConfirmFile(filename);
+  const handleUploadDumpFile = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.endsWith(".sql") && !file.name.endsWith(".sql.gz") && !file.name.endsWith(".gz")) {
+      showGlobalNotification("Please select a valid .sql or .sql.gz dump file", "error");
       return;
     }
-    setConfirmFile(null);
-    setError("");
-    setNotice("");
-    setDone("");
-    setImporting(filename);
-    try {
-      await api.post(`/databases/${database.id}/import`, { filename });
-      setDone(`Imported ${filename} into ${database.name}.`);
-    } catch (e) {
-      // A 504 here is the panel giving up on WATCHING, not the import failing — the
-      // backend says so in as many words and the operator must not be told to retry, so
-      // it gets its own tone rather than the red banner that means "this did not happen".
-      if (e instanceof ApiError && (e.status === 504 || e.status === 524)) {
-        setNotice(
-          e.status === 524
-            ? `The import is still running on the server — it was NOT cancelled and must not be started again. The connection was cut by Cloudflare at 100 seconds, which is shorter than the panel's own limit. Browse the tables in a few minutes to see it finish.`
-            : e.message
-        );
-      } else {
-        setError(e instanceof Error ? e.message : "Import failed");
+
+    setUploadProgress(10);
+    setUploadStatus(`Reading ${file.name} (${formatBytes(file.size)})...`);
+
+    const reader = new FileReader();
+    reader.onprogress = (evt) => {
+      if (evt.lengthComputable) {
+        const pct = Math.round((evt.loaded / evt.total) * 40) + 10;
+        setUploadProgress(pct);
       }
+    };
+
+    reader.onload = async () => {
+      setUploadProgress(50);
+      setUploadStatus("Encoding and uploading dump to server...");
+      try {
+        const resultStr = reader.result as string;
+        const base64Index = resultStr.indexOf("base64,");
+        const base64Content = base64Index !== -1 ? resultStr.substring(base64Index + 7) : resultStr;
+
+        setUploadProgress(70);
+        setUploadStatus(autoImportUpload ? "Uploading and restoring into database container..." : "Saving dump on server...");
+
+        await api.post(`/databases/${database.id}/upload-dump`, {
+          filename: file.name,
+          content_base64: base64Content,
+          auto_import: autoImportUpload,
+        });
+
+        setUploadProgress(100);
+        setUploadStatus("Finished!");
+        showGlobalNotification(
+          autoImportUpload
+            ? `Successfully uploaded and restored "${file.name}" into ${database.name}!`
+            : `Dump "${file.name}" uploaded successfully!`,
+          "success"
+        );
+        loadDumps();
+        loadTables();
+      } catch (err) {
+        showGlobalNotification(err instanceof Error ? err.message : "Upload failed", "error");
+      } finally {
+        setTimeout(() => {
+          setUploadProgress(null);
+          setUploadStatus("");
+          if (fileInputRef.current) fileInputRef.current.value = "";
+        }, 2000);
+      }
+    };
+
+    reader.onerror = () => {
+      showGlobalNotification("Failed to read file from disk", "error");
+      setUploadProgress(null);
+      setUploadStatus("");
+    };
+
+    reader.readAsDataURL(file);
+  };
+
+  const handleImportDump = (filename: string) => {
+    setConfirmModal({
+      title: `Restore Database: ${database.name}`,
+      label: `Are you sure you want to restore dump "${filename}" into "${database.name}"?`,
+      consequences: [
+        `All existing tables and records in "${database.name}" will be completely replaced by the dump`,
+        "Any uncommitted or recent changes since the backup was made will be permanently lost",
+        "The database container will be temporarily locked while the dump is being imported",
+      ],
+      confirmLabel: "Restore Database",
+      onConfirm: async () => {
+        setImportingDump(filename);
+        try {
+          await api.post(`/databases/${database.id}/import`, { filename });
+          showGlobalNotification(`Dump "${filename}" restored into ${database.name} successfully`, "success");
+          loadTables();
+          loadBrowseData();
+        } catch (e) {
+          showGlobalNotification(e instanceof Error ? e.message : "Import failed", "error");
+        } finally {
+          setImportingDump(null);
+          setConfirmModal(null);
+        }
+      },
+    });
+  };
+
+  /* ──────────────── Export Tab State ──────────────── */
+  const [exporting, setExporting] = useState(false);
+
+  const handleCreateExport = async () => {
+    setExporting(true);
+    try {
+      const res = await api.post<{ ok: boolean; filename: string }>(`/databases/${database.id}/export`, {});
+      showGlobalNotification(`Export "${res.filename}" generated successfully!`, "success");
+      loadDumps();
+    } catch (e) {
+      showGlobalNotification(e instanceof Error ? e.message : "Export failed", "error");
     } finally {
-      setImporting(null);
+      setExporting(false);
     }
   };
 
-  const importable = dumps.filter((d) => !d.unsupported && !d.import_blocked);
-  const rejected = dumps.filter((d) => d.unsupported || d.import_blocked);
+  /* ──────────────── Find & Replace Tab State ──────────────── */
+  const [findTable, setFindTable] = useState<string>("");
+  const [findColumn, setFindColumn] = useState<string>("");
+  const [findText, setFindText] = useState("");
+  const [replaceText, setReplaceText] = useState("");
+  const [findColumnsList, setFindColumnsList] = useState<string[]>([]);
+  const [previewMatchesCount, setPreviewMatchesCount] = useState<number | null>(null);
+  const [findLoading, setFindLoading] = useState(false);
+
+  useEffect(() => {
+    if (findTable) {
+      (async () => {
+        try {
+          const res = await api.get<QueryResult>(`/databases/${database.id}/tables/${encodeURIComponent(findTable)}`);
+          if (res.rows) {
+            setFindColumnsList(res.rows.map((r) => r[0]));
+            if (res.rows.length > 0) setFindColumn(res.rows[0][0]);
+          }
+        } catch {
+          // Ignored
+        }
+      })();
+    }
+  }, [database.id, findTable]);
+
+  useEffect(() => {
+    if (tables.length > 0 && !findTable) {
+      setFindTable(tables[0]);
+    }
+  }, [tables, findTable]);
+
+  const handlePreviewFind = async () => {
+    if (!findTable || !findColumn || !findText) return;
+    setFindLoading(true);
+    setPreviewMatchesCount(null);
+    try {
+      const sql = `SELECT COUNT(*) FROM ${q}${findTable}${q} WHERE ${q}${findColumn}${q} LIKE '%${findText.replace(/'/g, "''")}%'`;
+      const res = await api.post<QueryResult>(`/databases/${database.id}/query`, { sql });
+      if (res.rows?.[0]?.[0]) {
+        setPreviewMatchesCount(parseInt(res.rows[0][0], 10));
+      }
+    } catch (e) {
+      showGlobalNotification(e instanceof Error ? e.message : "Preview count failed", "error");
+    } finally {
+      setFindLoading(false);
+    }
+  };
+
+  const handleExecuteReplace = () => {
+    if (!findTable || !findColumn || !findText) return;
+    setConfirmModal({
+      title: `Find & Replace in Table: ${findTable}`,
+      label: `Replace all occurrences of "${findText}" with "${replaceText}" in column "${findColumn}"?`,
+      consequences: [
+        `Directly modifies all matching rows in column "${findColumn}" of table "${findTable}"`,
+        "This update cannot be undone automatically — ensure you have an export if needed",
+      ],
+      confirmLabel: "Execute Replace",
+      onConfirm: async () => {
+        setFindLoading(true);
+        try {
+          const sql = `UPDATE ${q}${findTable}${q} SET ${q}${findColumn}${q} = REPLACE(${q}${findColumn}${q}, '${findText.replace(/'/g, "''")}', '${replaceText.replace(/'/g, "''")}') WHERE ${q}${findColumn}${q} LIKE '%${findText.replace(/'/g, "''")}%'`;
+          await api.post(`/databases/${database.id}/query`, { sql });
+          showGlobalNotification("Find & Replace completed successfully", "success");
+          setPreviewMatchesCount(null);
+          loadBrowseData();
+        } catch (e) {
+          showGlobalNotification(e instanceof Error ? e.message : "Replace failed", "error");
+        } finally {
+          setFindLoading(false);
+          setConfirmModal(null);
+        }
+      },
+    });
+  };
 
   return (
     <div className="animate-fade-up">
-      <div className="flex items-center gap-3 mb-5 pb-4 border-b border-dark-600">
-        <button onClick={onClose} className="px-3 py-1.5 text-sm text-dark-300 border border-dark-600 rounded-lg hover:text-dark-100 hover:border-dark-400 transition-colors">
-          &larr; Back
-        </button>
-        <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">Import</h1>
-        <span className="text-sm font-mono text-dark-50">{database.name}</span>
-        <span className="px-2 py-0.5 bg-dark-700 text-dark-200 rounded text-xs font-medium">{database.engine}</span>
-      </div>
-
-      <div className="bg-dark-800 border border-dark-600 rounded-lg p-4 mb-5">
-        <p className="text-sm text-dark-200">
-          Put the dump on the server yourself, then pick it here. The file manager is not the
-          route: an upload travels base64-encoded inside a JSON body and tops out around 1.5 MB,
-          which no real dump fits inside.
-        </p>
-        <p className="text-xs text-dark-400 mt-2">
-          Copy it into <code className="text-dark-200">{dir}</code> over SSH, as root:
-        </p>
-        <pre className="mt-2 px-3 py-2 bg-dark-900 border border-dark-600 rounded text-xs font-mono text-dark-200 overflow-x-auto">
-{`mkdir -p ${dir}
-scp dump.sql.gz root@server:${dir}/
-chmod 600 ${dir}/dump.sql.gz`}
-        </pre>
-        <p className="text-xs text-dark-400 mt-2">
-          The directory only exists once this database has been backed up at least once, so
-          create it if it is missing. It is root-owned and re-tightened to{" "}
-          <code className="text-dark-200">0700</code> every time the agent starts.{" "}
-          <code className="text-dark-200">/tmp/</code> will not work: the agent runs with a
-          private <code className="text-dark-200">/tmp</code> and cannot see the host's.
-        </p>
-      </div>
-
-      {error && <div className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20 mb-4">{error}</div>}
-      {notice && <div className="bg-warn-500/10 text-warn-400 text-sm px-4 py-3 rounded-lg border border-warn-500/20 mb-4">{notice}</div>}
-      {done && <div className="bg-accent-500/10 text-accent-400 text-sm px-4 py-3 rounded-lg border border-accent-500/20 mb-4">{done}</div>}
-
-      {loading && <p className="text-dark-400 text-sm">Reading {dir}...</p>}
-
-      {!loading && !error && importable.length === 0 && rejected.length === 0 && (
-        <div className="bg-dark-800 rounded-lg border border-dark-500 p-12 text-center">
-          <p className="text-dark-200 font-medium">Nothing here to import</p>
-          <p className="text-dark-300 text-sm mt-2 max-w-md mx-auto">
-            No <code className="text-dark-200">.sql.gz</code> or{" "}
-            <code className="text-dark-200">.archive.gz</code> file is in{" "}
-            <code className="text-dark-200">{dir}</code>. Copy one there with the commands above,
-            then refresh.
-          </p>
-          <button
-            onClick={load}
-            className="mt-4 px-3 py-1.5 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
-          >
-            Refresh
-          </button>
-        </div>
+      {/* Lethal Confirmation Dialog */}
+      {confirmModal && (
+        <ConfirmDialog
+          title={confirmModal.title}
+          label={confirmModal.label}
+          consequences={confirmModal.consequences}
+          confirmLabel={confirmModal.confirmLabel || "Confirm"}
+          tone="danger"
+          onConfirm={confirmModal.onConfirm}
+          onCancel={() => setConfirmModal(null)}
+        />
       )}
 
-      {!loading && importable.length > 0 && (
-        <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden">
-          <div className="px-5 py-3 border-b border-dark-600 flex items-center justify-between">
-            <span className="text-xs uppercase tracking-widest font-mono text-dark-400">Available dumps</span>
-            <button
-              onClick={load}
-              className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
-            >
-              Refresh
-            </button>
+      {/* Top Header Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-5 pb-4 border-b border-dark-600">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={onClose}
+            className="px-3 py-1.5 text-sm text-dark-300 border border-dark-600 rounded-lg hover:text-dark-100 hover:border-dark-400 transition-colors"
+          >
+            &larr; Back to Databases
+          </button>
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-base font-semibold text-dark-50 font-mono">{database.name}</h1>
+              <span className="px-2 py-0.5 bg-dark-700 text-dark-200 rounded text-xs font-medium">
+                {engineLabels[database.engine] || database.engine}
+              </span>
+              {database.port && (
+                <span className="text-xs text-dark-400 font-mono">Port {database.port}</span>
+              )}
+            </div>
+            <p className="text-xs text-dark-400 mt-0.5">phpMyAdmin-grade SQL Management Suite</p>
           </div>
-          {importable.map((d) => (
-            <div key={d.filename} className="px-5 py-3 border-b border-dark-700 last:border-0 flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-sm font-mono text-dark-50 truncate">{d.filename}</div>
-                <div className="text-xs text-dark-400 mt-0.5">
-                  {formatBytes(d.size_bytes)} &middot; {d.created_at}
+        </div>
+
+        {/* Tab Navigation */}
+        <div className="flex flex-wrap items-center gap-1 bg-dark-800 p-1 rounded-lg border border-dark-600">
+          {[
+            { id: "browse", label: "Browse Data", icon: "M3.375 19.5h17.25m-17.25 0a1.125 1.125 0 0 1-1.125-1.125M3.375 19.5h7.5c.621 0 1.125-.504 1.125-1.125m-9.75 0V5.625m0 12.75v-1.5c0-.621.504-1.125 1.125-1.125m18.375 2.625V5.625m0 12.75c0 .621-.504 1.125-1.125 1.125m1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125m0 3.75h-7.5A1.125 1.125 0 0 1 12 18.375m9.75-12.75c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125m19.5 0v1.5c0 .621-.504 1.125-1.125 1.125M2.25 5.625v1.5c0 .621.504 1.125 1.125 1.125m0 0h17.25m-17.25 0h7.5c.621 0 1.125.504 1.125 1.125M3.375 8.25c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125m17.25-3.75h-7.5c-.621 0-1.125.504-1.125 1.125m8.625-1.125c.621 0 1.125.504 1.125 1.125v1.5c0 .621-.504 1.125-1.125 1.125m-17.25 0h17.25m-17.25 0h7.5c.621 0 1.125.504 1.125 1.125M3.375 12c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125m17.25-3.75h-7.5c-.621 0-1.125.504-1.125 1.125m8.625-1.125c.621 0 1.125.504 1.125 1.125v1.5c0 .621-.504 1.125-1.125 1.125m-17.25 0h17.25" },
+            { id: "structure", label: "Structure", icon: "M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z" },
+            { id: "sql", label: "SQL Console", icon: "M6.75 7.5l3 2.25-3 2.25m4.5 0h3m-9 8.25h13.5A2.25 2.25 0 0 0 21 18V6a2.25 2.25 0 0 0-2.25-2.25H5.25A2.25 2.25 0 0 0 3 6v12a2.25 2.25 0 0 0 2.25 2.25Z" },
+            { id: "import", label: "Import & Upload", icon: "M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.5V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" },
+            { id: "export", label: "Export & Backups", icon: "M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.5V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" },
+            { id: "find_replace", label: "Find & Replace", icon: "M21 21l-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607ZM10.5 7.5v6m3-3h-6" },
+          ].map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setActiveTab(t.id as ManagerTab)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                activeTab === t.id
+                  ? "bg-rust-500 text-white shadow-sm"
+                  : "text-dark-300 hover:text-dark-100 hover:bg-dark-700/60"
+              }`}
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                <path strokeLinecap="round" strokeLinejoin="round" d={t.icon} />
+              </svg>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Main Container */}
+      <div className="flex gap-4" style={{ minHeight: "calc(100vh - 240px)" }}>
+        {/* Left Sidebar (Only for Browse & Structure) */}
+        {(activeTab === "browse" || activeTab === "structure") && (
+          <div className="w-60 shrink-0 bg-dark-800 rounded-lg border border-dark-600 overflow-hidden flex flex-col">
+            <div className="px-3.5 py-3 border-b border-dark-600 flex items-center justify-between">
+              <span className="text-xs font-semibold text-dark-300 uppercase font-mono tracking-wider">
+                Tables ({tables.length})
+              </span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => setShowCreateTableModal(true)}
+                  className="p-1 rounded hover:bg-dark-700 text-rust-400 hover:text-rust-300 transition-colors"
+                  title="Create new table"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                  </svg>
+                </button>
+                <button
+                  onClick={loadTables}
+                  className="p-1 rounded hover:bg-dark-700 text-dark-400 hover:text-dark-200 transition-colors"
+                  title="Refresh tables"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-y-auto flex-1 p-1 space-y-0.5">
+              {tablesLoading ? (
+                <div className="p-3 space-y-2">
+                  {[...Array(6)].map((_, i) => (
+                    <div key={i} className="h-6 bg-dark-700/60 rounded animate-pulse" />
+                  ))}
+                </div>
+              ) : tables.length === 0 ? (
+                <div className="text-center py-8 text-xs text-dark-400">
+                  No tables found.<br />
+                  <button
+                    onClick={() => setShowCreateTableModal(true)}
+                    className="mt-2 text-rust-400 hover:underline"
+                  >
+                    + Create table
+                  </button>
+                </div>
+              ) : (
+                tables.map((t) => {
+                  const detail = tableDetails[t];
+                  const isSelected = selectedTable === t;
+                  return (
+                    <button
+                      key={t}
+                      onClick={() => {
+                        setSelectedTable(t);
+                        setBrowsePage(0);
+                      }}
+                      className={`w-full text-left px-2.5 py-2 rounded text-xs font-mono transition-colors flex items-center justify-between ${
+                        isSelected
+                          ? "bg-rust-500/15 text-rust-400 font-semibold border border-rust-500/30"
+                          : "text-dark-200 hover:bg-dark-700 hover:text-dark-50"
+                      }`}
+                    >
+                      <span className="truncate">{t}</span>
+                      {detail && (
+                        <span className="text-[10px] text-dark-400 font-mono shrink-0 ml-1.5">
+                          {detail.rows}r
+                        </span>
+                      )}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Right Active Tab Content */}
+        <div className="flex-1 min-w-0">
+          {/* TAB 1: BROWSE DATA */}
+          {activeTab === "browse" && (
+            <div className="space-y-4">
+              {selectedTable ? (
+                <>
+                  {/* Action & Filter Bar */}
+                  <div className="bg-dark-800 rounded-lg border border-dark-600 p-3.5 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm font-semibold text-dark-100 font-mono">{selectedTable}</span>
+                      {totalRows !== null && (
+                        <span className="text-xs text-dark-400 font-mono">
+                          ({totalRows.toLocaleString()} total rows)
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          setInsertColValues({});
+                          setShowInsertModal(true);
+                        }}
+                        className="px-2.5 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 transition-colors flex items-center gap-1.5"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                        </svg>
+                        Insert Row
+                      </button>
+                      <button
+                        onClick={() => handleTruncateTable(selectedTable)}
+                        className="px-2.5 py-1.5 bg-warn-500/10 text-warn-400 hover:bg-warn-500/20 border border-warn-500/20 rounded text-xs font-medium transition-colors"
+                        title="Empty all rows"
+                      >
+                        Empty (Truncate)
+                      </button>
+                      <button
+                        onClick={() => handleDropTable(selectedTable)}
+                        className="px-2.5 py-1.5 bg-danger-500/10 text-danger-400 hover:bg-danger-500/20 border border-danger-500/20 rounded text-xs font-medium transition-colors"
+                        title="Permanently drop table"
+                      >
+                        Drop Table
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Filter WHERE Query */}
+                  <div className="bg-dark-800 rounded-lg border border-dark-600 p-3 flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-mono text-dark-400 uppercase font-semibold">WHERE</span>
+                    <input
+                      type="text"
+                      value={whereClause}
+                      onChange={(e) => setWhereClause(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          setBrowsePage(0);
+                          loadBrowseData();
+                        }
+                      }}
+                      placeholder="e.g. status = 'active' OR id > 100"
+                      className="flex-1 min-w-[200px] bg-dark-900 border border-dark-600 rounded px-2.5 py-1 text-xs font-mono text-dark-100 placeholder-dark-500 focus:outline-none focus:border-dark-400"
+                    />
+                    <button
+                      onClick={() => {
+                        setBrowsePage(0);
+                        loadBrowseData();
+                      }}
+                      className="px-3 py-1 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium transition-colors"
+                    >
+                      Filter
+                    </button>
+                    {whereClause && (
+                      <button
+                        onClick={() => {
+                          setWhereClause("");
+                          setBrowsePage(0);
+                        }}
+                        className="px-2 py-1 text-dark-400 hover:text-dark-200 text-xs"
+                      >
+                        Clear
+                      </button>
+                    )}
+
+                    <div className="h-4 w-px bg-dark-600 mx-1 hidden sm:block" />
+
+                    {/* Page Size Selector */}
+                    <div className="flex items-center gap-1.5 ml-auto text-xs text-dark-400 font-mono">
+                      <span>Show:</span>
+                      <select
+                        value={pageSize}
+                        onChange={(e) => {
+                          setPageSize(Number(e.target.value));
+                          setBrowsePage(0);
+                        }}
+                        className="bg-dark-900 border border-dark-600 rounded px-2 py-1 text-xs text-dark-200 focus:outline-none"
+                      >
+                        <option value={10}>10</option>
+                        <option value={25}>25</option>
+                        <option value={50}>50</option>
+                        <option value={100}>100</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Error banner */}
+                  {browseError && (
+                    <div className="bg-danger-500/10 text-danger-400 text-xs p-3 rounded-lg border border-danger-500/20">
+                      {browseError}
+                    </div>
+                  )}
+
+                  {/* Data Grid Table */}
+                  <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-x-auto">
+                    {browseLoading ? (
+                      <div className="p-8 text-center text-dark-400 text-xs flex items-center justify-center gap-2">
+                        <span className="w-4 h-4 border-2 border-rust-500 border-t-transparent rounded-full animate-spin" />
+                        Fetching table rows...
+                      </div>
+                    ) : !browseRows || browseRows.rows.length === 0 ? (
+                      <div className="p-12 text-center text-dark-400 text-xs">
+                        No rows found matching current query or table is empty.
+                      </div>
+                    ) : (
+                      <table className="w-full text-left">
+                        <thead>
+                          <tr className="border-b border-dark-600 bg-dark-900/80 sticky top-0">
+                            <th className="px-3 py-2 text-[10px] text-dark-400 uppercase font-mono w-10">#</th>
+                            {browseRows.columns.map((col) => (
+                              <th
+                                key={col}
+                                onClick={() => handleSort(col)}
+                                className="px-3 py-2 text-xs font-semibold text-dark-200 font-mono whitespace-nowrap cursor-pointer hover:text-rust-400 select-none"
+                              >
+                                <div className="flex items-center gap-1">
+                                  <span>{col}</span>
+                                  {sortCol === col && (
+                                    <span className="text-rust-400">{sortDir === "ASC" ? "▲" : "▼"}</span>
+                                  )}
+                                </div>
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-dark-700/60 font-mono text-xs">
+                          {browseRows.rows.map((row, rIdx) => (
+                            <tr key={rIdx} className="hover:bg-dark-700/30 transition-colors">
+                              <td className="px-3 py-2 text-[10px] text-dark-500 font-mono">
+                                {browsePage * pageSize + rIdx + 1}
+                              </td>
+                              {row.map((val, cIdx) => (
+                                <td
+                                  key={cIdx}
+                                  className="px-3 py-2 text-dark-200 whitespace-nowrap max-w-sm truncate"
+                                  title={val}
+                                >
+                                  {val === "" || val === "\N" ? (
+                                    <span className="text-dark-500 italic text-[10px]">NULL</span>
+                                  ) : (
+                                    val
+                                  )}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+
+                    {/* Pagination Bar */}
+                    {browseRows && (
+                      <div className="p-3 border-t border-dark-600 bg-dark-900/60 flex items-center justify-between text-xs text-dark-300 font-mono">
+                        <div>
+                          Showing {browseRows.rows.length} rows &middot; Page {browsePage + 1}
+                          {browseRows.execution_time_ms ? ` (${browseRows.execution_time_ms}ms)` : ""}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => setBrowsePage((p) => Math.max(0, p - 1))}
+                            disabled={browsePage === 0 || browseLoading}
+                            className="px-2.5 py-1 rounded bg-dark-700 text-dark-200 hover:bg-dark-600 disabled:opacity-40 transition-colors"
+                          >
+                            &larr; Prev
+                          </button>
+                          <button
+                            onClick={() => setBrowsePage((p) => p + 1)}
+                            disabled={browseRows.rows.length < pageSize || browseLoading}
+                            className="px-2.5 py-1 rounded bg-dark-700 text-dark-200 hover:bg-dark-600 disabled:opacity-40 transition-colors"
+                          >
+                            Next &rarr;
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <div className="bg-dark-800 rounded-lg border border-dark-600 p-12 text-center text-dark-400 text-sm">
+                  Select a table from the sidebar to browse its rows and records.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TAB 2: STRUCTURE */}
+          {activeTab === "structure" && (
+            <div className="space-y-4">
+              {selectedTable ? (
+                <>
+                  <div className="bg-dark-800 rounded-lg border border-dark-600 p-4 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h2 className="text-sm font-semibold text-dark-100 font-mono">{selectedTable} Schema</h2>
+                      <p className="text-xs text-dark-400 mt-0.5">Columns, indexes and relational foreign keys</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setShowAddColumnModal(true)}
+                        className="px-3 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 transition-colors flex items-center gap-1.5"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                        </svg>
+                        Add Column
+                      </button>
+                      <button
+                        onClick={loadStructure}
+                        className="px-2.5 py-1.5 bg-dark-700 text-dark-200 hover:bg-dark-600 rounded text-xs font-medium transition-colors"
+                      >
+                        Refresh
+                      </button>
+                    </div>
+                  </div>
+
+                  {structureError && (
+                    <div className="bg-danger-500/10 text-danger-400 text-xs p-3 rounded-lg border border-danger-500/20">
+                      {structureError}
+                    </div>
+                  )}
+
+                  {/* Columns Table */}
+                  <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden">
+                    <div className="px-4 py-2.5 border-b border-dark-600 bg-dark-900/60 flex items-center justify-between">
+                      <span className="text-xs uppercase font-mono tracking-wider text-dark-300 font-semibold">
+                        Columns ({structureCols?.rows?.length || 0})
+                      </span>
+                    </div>
+                    {structureLoading ? (
+                      <div className="p-6 text-center text-xs text-dark-400">Loading column schema...</div>
+                    ) : !structureCols || structureCols.rows.length === 0 ? (
+                      <div className="p-6 text-center text-xs text-dark-400">No columns found.</div>
+                    ) : (
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead>
+                          <tr className="border-b border-dark-600 bg-dark-700/40 text-dark-300">
+                            <th className="px-4 py-2 uppercase">Column</th>
+                            <th className="px-4 py-2 uppercase">Type</th>
+                            <th className="px-4 py-2 uppercase">Nullable</th>
+                            <th className="px-4 py-2 uppercase">Default</th>
+                            <th className="px-4 py-2 uppercase">Key</th>
+                            <th className="px-4 py-2 uppercase text-right">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-dark-700/60">
+                          {structureCols.rows.map((col, idx) => {
+                            const colName = col[0];
+                            const colType = col[1];
+                            const isNull = database.engine === "postgres" ? col[3] : col[2];
+                            const defVal = database.engine === "postgres" ? col[4] : col[3];
+                            const keyVal = database.engine === "postgres" ? "" : col[4];
+                            return (
+                              <tr key={idx} className="hover:bg-dark-700/30 transition-colors">
+                                <td className="px-4 py-2.5 font-semibold text-dark-100">{colName}</td>
+                                <td className="px-4 py-2.5 text-rust-400">{colType}</td>
+                                <td className="px-4 py-2.5 text-dark-300">{isNull === "YES" ? "Yes" : "No"}</td>
+                                <td className="px-4 py-2.5 text-dark-400">{defVal || "-"}</td>
+                                <td className="px-4 py-2.5 text-accent-400">{keyVal || "-"}</td>
+                                <td className="px-4 py-2.5 text-right">
+                                  <button
+                                    onClick={() => handleDropColumn(colName)}
+                                    className="text-danger-400 hover:text-danger-300 text-xs"
+                                    title="Drop Column"
+                                  >
+                                    Drop
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+
+                  {/* Indexes Table */}
+                  {structureIndexes && structureIndexes.rows.length > 0 && (
+                    <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden">
+                      <div className="px-4 py-2.5 border-b border-dark-600 bg-dark-900/60">
+                        <span className="text-xs uppercase font-mono tracking-wider text-dark-300 font-semibold">
+                          Indexes
+                        </span>
+                      </div>
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead>
+                          <tr className="border-b border-dark-600 bg-dark-700/40 text-dark-300">
+                            {structureIndexes.columns.map((c, i) => (
+                              <th key={i} className="px-4 py-2 uppercase">{c}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-dark-700/60">
+                          {structureIndexes.rows.map((row, i) => (
+                            <tr key={i} className="hover:bg-dark-700/30">
+                              {row.map((cell, j) => (
+                                <td key={j} className="px-4 py-2 text-dark-200">{cell}</td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* Foreign Keys / Relations */}
+                  {(() => {
+                    const srcTableIdx = fkColumns.indexOf("source_table");
+                    const srcColIdx = fkColumns.indexOf("source_column");
+                    const tgtTableIdx = fkColumns.indexOf("target_table");
+                    const tgtColIdx = fkColumns.indexOf("target_column");
+                    const related = foreignKeys.filter(
+                      (fk) => fk[srcTableIdx] === selectedTable || fk[tgtTableIdx] === selectedTable
+                    );
+                    if (related.length === 0) return null;
+                    return (
+                      <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden">
+                        <div className="px-4 py-2.5 border-b border-dark-600 bg-dark-900/60">
+                          <span className="text-xs uppercase font-mono tracking-wider text-dark-300 font-semibold">
+                            Foreign Key Relationships
+                          </span>
+                        </div>
+                        <div className="p-4 space-y-2">
+                          {related.map((fk, idx) => (
+                            <div key={idx} className="flex items-center gap-2 text-xs font-mono">
+                              <span className="text-dark-100 font-semibold">{fk[srcTableIdx]}</span>
+                              <span className="text-dark-400">.</span>
+                              <span className="text-rust-400">{fk[srcColIdx]}</span>
+                              <span className="text-dark-500">&rarr;</span>
+                              <span className="text-dark-100 font-semibold">{fk[tgtTableIdx]}</span>
+                              <span className="text-dark-400">.</span>
+                              <span className="text-rust-400">{fk[tgtColIdx]}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </>
+              ) : (
+                <div className="bg-dark-800 rounded-lg border border-dark-600 p-12 text-center text-dark-400 text-sm">
+                  Select a table from the sidebar to inspect its structure.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TAB 3: SQL CONSOLE */}
+          {activeTab === "sql" && (
+            <div className="space-y-4">
+              <div className="bg-dark-800 rounded-lg border border-dark-600 p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs uppercase font-mono tracking-wider text-dark-300 font-semibold">
+                      Query Editor
+                    </span>
+                    <span className="text-[10px] text-dark-500 font-mono">(Ctrl+Enter to Run)</span>
+                  </div>
+
+                  {/* Preset Query Snippets */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {[
+                      { label: "SELECT *", qStr: selectedTable ? `SELECT * FROM ${q}${selectedTable}${q} LIMIT 50;` : `SELECT * FROM ... LIMIT 50;` },
+                      { label: "SHOW TABLES", qStr: database.engine === "postgres" ? "SELECT tablename FROM pg_tables WHERE schemaname = 'public';" : "SHOW TABLES;" },
+                      { label: "PROCESSLIST", qStr: database.engine === "postgres" ? "SELECT * FROM pg_stat_activity;" : "SHOW PROCESSLIST;" },
+                      { label: "STATUS", qStr: database.engine === "postgres" ? "SELECT * FROM pg_stat_database;" : "SHOW TABLE STATUS;" },
+                    ].map((snip, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => setSqlQuery(snip.qStr)}
+                        className="px-2 py-0.5 rounded text-[11px] font-mono bg-dark-700 text-dark-300 hover:text-dark-100 hover:bg-dark-600 transition-colors"
+                      >
+                        {snip.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <textarea
+                  ref={sqlEditorRef}
+                  value={sqlQuery}
+                  onChange={(e) => setSqlQuery(e.target.value)}
+                  onKeyDown={handleSqlKeyDown}
+                  className="w-full h-36 bg-dark-900 border border-dark-600 rounded-lg p-3 text-xs font-mono text-dark-100 resize-y focus:outline-none focus:border-rust-500 placeholder-dark-600"
+                  placeholder="SELECT * FROM table WHERE ... ;"
+                  spellCheck={false}
+                />
+
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => executeSqlQuery()}
+                      disabled={sqlLoading || !sqlQuery.trim()}
+                      className="px-4 py-2 bg-rust-500 text-white rounded text-xs font-semibold hover:bg-rust-600 disabled:opacity-50 transition-colors flex items-center gap-2"
+                    >
+                      {sqlLoading && (
+                        <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      )}
+                      Execute Query
+                    </button>
+                    {sqlHistory.length > 0 && (
+                      <span className="text-[10px] text-dark-400 font-mono hidden sm:inline">
+                        Ctrl+Up/Down for history
+                      </span>
+                    )}
+                  </div>
+
+                  {sqlResult && (
+                    <span className="text-xs text-dark-400 font-mono">
+                      {sqlResult.execution_time_ms}ms &middot; {sqlResult.row_count} row{sqlResult.row_count !== 1 ? "s" : ""}
+                    </span>
+                  )}
                 </div>
               </div>
-              <div className="flex items-center gap-2 shrink-0">
-                {confirmFile === d.filename ? (
-                  <>
-                    <span className="text-xs text-danger-400">Replace data in {database.name}?</span>
-                    <button
-                      onClick={() => handleImport(d.filename)}
-                      disabled={importing !== null}
-                      className="px-2 py-1 bg-danger-600 text-white rounded text-xs hover:bg-danger-700 disabled:opacity-50"
-                    >
-                      {importing === d.filename ? "..." : "Yes"}
-                    </button>
-                    <button
-                      onClick={() => setConfirmFile(null)}
-                      className="px-2 py-1 bg-dark-600 text-dark-100 rounded text-xs hover:bg-dark-500"
-                    >
-                      No
-                    </button>
-                  </>
-                ) : (
+
+              {/* Error Output */}
+              {sqlError && (
+                <div className="bg-danger-500/10 text-danger-400 text-xs p-4 rounded-lg border border-danger-500/20 font-mono whitespace-pre-wrap">
+                  {sqlError}
+                </div>
+              )}
+
+              {/* Results Table */}
+              {sqlResult && sqlResult.columns.length > 0 && (
+                <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-x-auto">
+                  <table className="w-full text-left font-mono text-xs">
+                    <thead>
+                      <tr className="border-b border-dark-600 bg-dark-900/80 sticky top-0">
+                        <th className="px-3 py-2 text-[10px] text-dark-500 w-10">#</th>
+                        {sqlResult.columns.map((c, i) => (
+                          <th key={i} className="px-3 py-2 text-dark-200 font-semibold whitespace-nowrap">
+                            {c}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-dark-700/60">
+                      {sqlResult.rows.map((row, rIdx) => (
+                        <tr key={rIdx} className="hover:bg-dark-700/30">
+                          <td className="px-3 py-1.5 text-[10px] text-dark-500">{rIdx + 1}</td>
+                          {row.map((cell, cIdx) => (
+                            <td key={cIdx} className="px-3 py-1.5 text-dark-200 whitespace-nowrap max-w-sm truncate" title={cell}>
+                              {cell === "" || cell === "\N" ? (
+                                <span className="text-dark-500 italic text-[10px]">NULL</span>
+                              ) : (
+                                cell
+                              )}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* DDL/DML Success */}
+              {sqlResult && sqlResult.columns.length === 0 && !sqlError && (
+                <div className="bg-dark-800 rounded-lg border border-dark-600 p-8 text-center text-xs text-dark-300 font-mono">
+                  Query executed successfully in {sqlResult.execution_time_ms}ms (0 rows returned).
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TAB 4: IMPORT & UPLOAD */}
+          {activeTab === "import" && (
+            <div className="space-y-5">
+              {/* Direct Browser Upload Zone */}
+              <div className="bg-dark-800 rounded-lg border border-dashed border-dark-500 p-6 text-center hover:border-rust-500 transition-colors">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".sql,.sql.gz,.gz"
+                  onChange={handleUploadDumpFile}
+                  className="hidden"
+                  id="db-dump-file-picker"
+                />
+                <label htmlFor="db-dump-file-picker" className="cursor-pointer block">
+                  <div className="w-12 h-12 mx-auto rounded-full bg-rust-500/10 text-rust-400 flex items-center justify-center mb-3">
+                    <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.5V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+                    </svg>
+                  </div>
+                  <h3 className="text-sm font-semibold text-dark-100">Upload Database Dump (.sql or .sql.gz)</h3>
+                  <p className="text-xs text-dark-400 mt-1 max-w-md mx-auto">
+                    Select a dump file directly from your computer. No need to SSH or SCP into server folders!
+                  </p>
+                </label>
+
+                {/* Auto Import Checkbox */}
+                <div className="mt-4 flex items-center justify-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="auto-import-check"
+                    checked={autoImportUpload}
+                    onChange={(e) => setAutoImportUpload(e.target.checked)}
+                    className="rounded border-dark-600 text-rust-500 focus:ring-0 bg-dark-900"
+                  />
+                  <label htmlFor="auto-import-check" className="text-xs text-dark-200 cursor-pointer">
+                    Automatically restore into database immediately after upload
+                  </label>
+                </div>
+
+                {/* Live Upload Progress */}
+                {uploadProgress !== null && (
+                  <div className="mt-5 max-w-md mx-auto space-y-2">
+                    <div className="flex justify-between text-xs font-mono text-dark-300">
+                      <span>{uploadStatus}</span>
+                      <span>{uploadProgress}%</span>
+                    </div>
+                    <div className="w-full bg-dark-900 rounded-full h-2 overflow-hidden border border-dark-600">
+                      <div
+                        className="bg-rust-500 h-2 rounded-full transition-all duration-300"
+                        style={{ width: `${uploadProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Available Server Dumps */}
+              <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden">
+                <div className="px-5 py-3.5 border-b border-dark-600 flex items-center justify-between">
+                  <div>
+                    <h3 className="text-xs font-semibold uppercase font-mono tracking-wider text-dark-300">
+                      Available Server Backups & Dumps
+                    </h3>
+                    <p className="text-[11px] text-dark-400 mt-0.5">Stored in /var/backups/dockpanel/databases/{database.name}</p>
+                  </div>
                   <button
-                    onClick={() => handleImport(d.filename)}
-                    disabled={importing !== null}
-                    className="px-2 py-1 rounded text-xs font-medium bg-rust-500/15 text-rust-400 hover:bg-rust-500/25 disabled:opacity-50 transition-colors"
+                    onClick={loadDumps}
+                    className="px-2.5 py-1 text-xs rounded bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
                   >
-                    {importing === d.filename ? "Importing..." : "Import"}
+                    Refresh
                   </button>
+                </div>
+
+                {dumpsError && (
+                  <div className="p-4 text-xs text-danger-400 bg-danger-500/10 border-b border-danger-500/20">
+                    {dumpsError}
+                  </div>
+                )}
+
+                {dumpsLoading ? (
+                  <div className="p-8 text-center text-xs text-dark-400">Loading dumps from server...</div>
+                ) : dumps.length === 0 ? (
+                  <div className="p-10 text-center text-xs text-dark-400">
+                    No dump files found for this database. Use the upload box above or create an export to generate one.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-dark-700/60 font-mono text-xs">
+                    {dumps.map((d) => (
+                      <div key={d.filename} className="p-4 flex flex-wrap items-center justify-between gap-3 hover:bg-dark-700/20">
+                        <div>
+                          <div className="font-semibold text-dark-100">{d.filename}</div>
+                          <div className="text-[11px] text-dark-400 mt-0.5">
+                            {formatBytes(d.size_bytes)} &middot; {d.created_at}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => {
+                              window.open(`/api/databases/${database.id}/dumps/${encodeURIComponent(d.filename)}/download`, "_blank");
+                            }}
+                            className="px-2.5 py-1.5 rounded bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors text-xs font-sans font-medium"
+                          >
+                            Download
+                          </button>
+                          <button
+                            onClick={() => handleImportDump(d.filename)}
+                            disabled={importingDump === d.filename}
+                            className="px-3 py-1.5 rounded bg-rust-500 text-white hover:bg-rust-600 disabled:opacity-50 transition-colors text-xs font-sans font-medium"
+                          >
+                            {importingDump === d.filename ? "Restoring..." : "Restore"}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             </div>
-          ))}
-        </div>
-      )}
+          )}
 
-      {rejected.length > 0 && (
-        <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden mt-5">
-          <div className="px-5 py-3 border-b border-dark-600">
-            <span className="text-xs uppercase tracking-widest font-mono text-dark-400">
-              In the directory, but not importable
-            </span>
-          </div>
-          {rejected.map((d) => (
-            <div key={d.filename} className="px-5 py-3 border-b border-dark-700 last:border-0">
-              <div className="text-sm font-mono text-dark-300 truncate">{d.filename}</div>
-              <div className="text-xs text-warn-400 mt-1">{d.unsupported || d.import_blocked}</div>
+          {/* TAB 5: EXPORT & BACKUPS */}
+          {activeTab === "export" && (
+            <div className="space-y-5">
+              <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-dark-100 font-mono">Create Fresh Database Dump</h3>
+                  <p className="text-xs text-dark-400 mt-1 max-w-xl">
+                    Executes a live container dump via mysqldump / pg_dump and packages it as an optimized compressed <code>.sql.gz</code> file ready for 1-click download.
+                  </p>
+                </div>
+                <button
+                  onClick={handleCreateExport}
+                  disabled={exporting}
+                  className="px-4 py-2 bg-rust-500 text-white rounded-lg text-xs font-semibold hover:bg-rust-600 disabled:opacity-50 transition-colors flex items-center gap-2"
+                >
+                  {exporting && (
+                    <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  )}
+                  {exporting ? "Generating Export..." : "Create Fresh Export (.sql.gz)"}
+                </button>
+              </div>
+
+              {/* Ready for download list */}
+              <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-hidden">
+                <div className="px-5 py-3.5 border-b border-dark-600">
+                  <h3 className="text-xs font-semibold uppercase font-mono tracking-wider text-dark-300">
+                    Exported Dump Files Available for Download
+                  </h3>
+                </div>
+
+                {dumps.length === 0 ? (
+                  <div className="p-10 text-center text-xs text-dark-400">
+                    No exported backups yet. Click &quot;Create Fresh Export&quot; above to dump this database.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-dark-700/60 font-mono text-xs">
+                    {dumps.map((d) => (
+                      <div key={d.filename} className="p-4 flex items-center justify-between gap-3 hover:bg-dark-700/20">
+                        <div>
+                          <div className="font-semibold text-dark-100">{d.filename}</div>
+                          <div className="text-[11px] text-dark-400 mt-0.5">
+                            {formatBytes(d.size_bytes)} &middot; {d.created_at}
+                          </div>
+                        </div>
+
+                        <a
+                          href={`/api/databases/${database.id}/dumps/${encodeURIComponent(d.filename)}/download`}
+                          download={d.filename}
+                          className="px-3 py-1.5 rounded bg-rust-500/15 text-rust-400 hover:bg-rust-500/25 transition-colors text-xs font-sans font-medium flex items-center gap-1.5"
+                        >
+                          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.5V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                          </svg>
+                          Download (.sql.gz)
+                        </a>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
-          ))}
+          )}
+
+          {/* TAB 6: FIND & REPLACE */}
+          {activeTab === "find_replace" && (
+            <div className="space-y-4">
+              <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-dark-100 font-mono">Find & Replace Across Table Data</h3>
+                  <p className="text-xs text-dark-400 mt-1">
+                    Indispensable for CMS migrations (e.g. updating WordPress URLs, HTTP to HTTPS, or replacing strings in bulk).
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-dark-200 mb-1">Target Table</label>
+                    <select
+                      value={findTable}
+                      onChange={(e) => setFindTable(e.target.value)}
+                      className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-2 text-xs font-mono text-dark-100 focus:outline-none"
+                    >
+                      {tables.map((t) => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-dark-200 mb-1">Target Column</label>
+                    <select
+                      value={findColumn}
+                      onChange={(e) => setFindColumn(e.target.value)}
+                      className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-2 text-xs font-mono text-dark-100 focus:outline-none"
+                    >
+                      {findColumnsList.map((c) => (
+                        <option key={c} value={c}>{c}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-dark-200 mb-1">Find String</label>
+                    <input
+                      type="text"
+                      value={findText}
+                      onChange={(e) => setFindText(e.target.value)}
+                      placeholder="e.g. http://old-domain.com"
+                      className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-2 text-xs font-mono text-dark-100 focus:outline-none focus:border-rust-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-dark-200 mb-1">Replace With</label>
+                    <input
+                      type="text"
+                      value={replaceText}
+                      onChange={(e) => setReplaceText(e.target.value)}
+                      placeholder="e.g. https://new-domain.com"
+                      className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-2 text-xs font-mono text-dark-100 focus:outline-none focus:border-rust-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 pt-2">
+                  <button
+                    onClick={handlePreviewFind}
+                    disabled={findLoading || !findText || !findTable || !findColumn}
+                    className="px-4 py-2 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors"
+                  >
+                    Preview Matches Count
+                  </button>
+                  <button
+                    onClick={handleExecuteReplace}
+                    disabled={findLoading || !findText || !findTable || !findColumn}
+                    className="px-4 py-2 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors"
+                  >
+                    Execute Replace
+                  </button>
+
+                  {previewMatchesCount !== null && (
+                    <span className="text-xs font-mono text-accent-400">
+                      Found {previewMatchesCount} matching row{previewMatchesCount !== 1 ? "s" : ""} in &quot;{findTable}.{findColumn}&quot;
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Insert Row Modal */}
+      {showInsertModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-dark-800 rounded-xl border border-dark-600 p-6 w-full max-w-xl max-h-[85vh] overflow-y-auto space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-600 pb-3">
+              <h3 className="text-sm font-semibold text-dark-100 font-mono">Insert Row into {selectedTable}</h3>
+              <button onClick={() => setShowInsertModal(false)} className="text-dark-400 hover:text-dark-200 text-sm">
+                &times;
+              </button>
+            </div>
+            <div className="space-y-3">
+              {(browseRows?.columns || []).map((col) => (
+                <div key={col}>
+                  <label className="block text-xs font-mono text-dark-300 mb-1">{col}</label>
+                  <input
+                    type="text"
+                    value={insertColValues[col] || ""}
+                    onChange={(e) => setInsertColValues((v) => ({ ...v, [col]: e.target.value }))}
+                    placeholder="Leave empty for DEFAULT or auto-increment"
+                    className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-1.5 text-xs font-mono text-dark-100 focus:outline-none focus:border-rust-500"
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2 pt-3 border-t border-dark-600">
+              <button
+                type="button"
+                onClick={() => setShowInsertModal(false)}
+                className="px-3 py-1.5 text-xs text-dark-300 hover:text-dark-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleInsertRow}
+                disabled={inserting}
+                className="px-4 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50"
+              >
+                {inserting ? "Inserting..." : "Insert Record"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
-      {importing && (
-        <p className="text-xs text-dark-400 mt-4">
-          Importing streams the dump straight into the database container. Large dumps can take
-          several minutes — leave this page open.
-        </p>
+      {/* Add Column Modal */}
+      {showAddColumnModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-dark-800 rounded-xl border border-dark-600 p-6 w-full max-w-md space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-600 pb-3">
+              <h3 className="text-sm font-semibold text-dark-100 font-mono">Add Column to {selectedTable}</h3>
+              <button onClick={() => setShowAddColumnModal(false)} className="text-dark-400 hover:text-dark-200 text-sm">
+                &times;
+              </button>
+            </div>
+            <form onSubmit={handleAddColumn} className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">Column Name</label>
+                <input
+                  type="text"
+                  required
+                  value={newColName}
+                  onChange={(e) => setNewColName(e.target.value)}
+                  placeholder="e.g. status, bio, rating"
+                  className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-1.5 text-xs font-mono text-dark-100 focus:outline-none focus:border-rust-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">Data Type</label>
+                <input
+                  type="text"
+                  required
+                  value={newColType}
+                  onChange={(e) => setNewColType(e.target.value)}
+                  placeholder="VARCHAR(255), INT, TEXT, TIMESTAMP"
+                  className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-1.5 text-xs font-mono text-dark-100 focus:outline-none focus:border-rust-500"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="col-nullable-chk"
+                  checked={newColNullable}
+                  onChange={(e) => setNewColNullable(e.target.checked)}
+                  className="rounded border-dark-600 text-rust-500 focus:ring-0 bg-dark-900"
+                />
+                <label htmlFor="col-nullable-chk" className="text-xs text-dark-200 cursor-pointer">
+                  Nullable (Allow NULL)
+                </label>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">Default Value (Optional)</label>
+                <input
+                  type="text"
+                  value={newColDefault}
+                  onChange={(e) => setNewColDefault(e.target.value)}
+                  placeholder="Optional default value"
+                  className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-1.5 text-xs font-mono text-dark-100 focus:outline-none"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-3 border-t border-dark-600">
+                <button
+                  type="button"
+                  onClick={() => setShowAddColumnModal(false)}
+                  className="px-3 py-1.5 text-xs text-dark-300 hover:text-dark-100"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600"
+                >
+                  Add Column
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Create Table Modal */}
+      {showCreateTableModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-dark-800 rounded-xl border border-dark-600 p-6 w-full max-w-md space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-600 pb-3">
+              <h3 className="text-sm font-semibold text-dark-100 font-mono">Create New Table</h3>
+              <button onClick={() => setShowCreateTableModal(false)} className="text-dark-400 hover:text-dark-200 text-sm">
+                &times;
+              </button>
+            </div>
+            <form onSubmit={handleCreateTable} className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">Table Name</label>
+                <input
+                  type="text"
+                  required
+                  value={newTableName}
+                  onChange={(e) => setNewTableName(e.target.value)}
+                  placeholder="e.g. products, customers"
+                  pattern="[a-zA-Z0-9_]+"
+                  className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-1.5 text-xs font-mono text-dark-100 focus:outline-none focus:border-rust-500"
+                />
+                <p className="text-[10px] text-dark-400 mt-1">
+                  Will be initialized with standard <code>id</code> primary key and <code>created_at</code> timestamp.
+                </p>
+              </div>
+              <div className="flex justify-end gap-2 pt-3 border-t border-dark-600">
+                <button
+                  type="button"
+                  onClick={() => setShowCreateTableModal(false)}
+                  className="px-3 py-1.5 text-xs text-dark-300 hover:text-dark-100"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600"
+                >
+                  Create Table
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -923,18 +1767,12 @@ export default function Databases() {
   const [search, setSearch] = useState("");
   const [displayCount, setDisplayCount] = useState(25);
 
-  // SQL Browser state
-  const [browseDb, setBrowseDb] = useState<Database | null>(null);
-  const [schemaDb, setSchemaDb] = useState<Database | null>(null);
+  // Advanced Database Manager & Lethal Confirmation states
+  const [manageDb, setManageDb] = useState<{ db: Database; tab?: ManagerTab } | null>(null);
+  const [deleteTargetDb, setDeleteTargetDb] = useState<Database | null>(null);
 
-  // Import state. Admin-only, matching the server: the dump directory is keyed by
-  // database NAME and a name outlives the database that made it, so a tenant-reachable
-  // listing would expose a previous holder's leftover dumps. Putting a file there needs
-  // root anyway — there is no per-site SFTP — so no non-admin can use this door for its
-  // intended purpose in the first place.
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
-  const [importTargetDb, setImportTargetDb] = useState<Database | null>(null);
 
   // Password reset state
   const [resettingPw, setResettingPw] = useState<string | null>(null);
@@ -1073,32 +1911,15 @@ export default function Databases() {
   const getOwnerLabel = (db: Database) =>
     db.stack_id ? getStackName(db.stack_id) : getSiteDomain(db.site_id ?? "");
 
-  // Schema Browser mode
-  if (schemaDb) {
+  // Advanced Database Manager mode
+  if (manageDb) {
     return (
       <div className="p-6 lg:p-8">
-        <SchemaBrowser database={schemaDb} onClose={() => setSchemaDb(null)} />
-      </div>
-    );
-  }
-
-  // SQL Browser mode
-  if (browseDb) {
-    return (
-      <div className="p-6 lg:p-8">
-        <SqlBrowser database={browseDb} onClose={() => setBrowseDb(null)} />
-      </div>
-    );
-  }
-
-  // Import mode
-  if (importTargetDb) {
-    return (
-      <div className="p-6 lg:p-8">
-        <ImportDatabase
-          database={importTargetDb}
+        <AdvancedDatabaseManager
+          database={manageDb.db}
+          initialTab={manageDb.tab}
           onClose={() => {
-            setImportTargetDb(null);
+            setManageDb(null);
             fetchData();
           }}
         />
@@ -1382,26 +2203,30 @@ export default function Databases() {
                     <td className="px-5 py-4 text-right">
                       <div className="flex items-center justify-end gap-2">
                         <button
-                          onClick={() => setBrowseDb(db)}
+                          onClick={() => setManageDb({ db, tab: "browse" })}
                           className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
                         >
                           Browse
                         </button>
                         <button
-                          onClick={() => setSchemaDb(db)}
+                          onClick={() => setManageDb({ db, tab: "structure" })}
                           className="px-2 py-1 rounded text-xs font-medium bg-accent-500/10 text-accent-400 hover:bg-accent-500/15 transition-colors"
                         >
-                          Schema
+                          Structure
                         </button>
-                        {isAdmin && (
-                          <button
-                            onClick={() => setImportTargetDb(db)}
-                            className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
-                            title="Import a .sql.gz dump you placed on the server"
-                          >
-                            Import
-                          </button>
-                        )}
+                        <button
+                          onClick={() => setManageDb({ db, tab: "sql" })}
+                          className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
+                        >
+                          SQL
+                        </button>
+                        <button
+                          onClick={() => setManageDb({ db, tab: "import" })}
+                          className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
+                          title="Import, upload or export dumps"
+                        >
+                          Import/Export
+                        </button>
                         <button
                           onClick={async () => {
                             try {
@@ -1447,31 +2272,12 @@ export default function Databases() {
                         >
                           {credentialsId === db.id ? "Hide" : "Connect"}
                         </button>
-                        {confirmDeleteId === db.id ? (
-                          <>
-                            <span className="text-xs text-danger-400">Sure?</span>
-                            <button
-                              onClick={() => handleDelete(db.id)}
-                              disabled={deletingId === db.id}
-                              className="px-2 py-1 bg-danger-600 text-white rounded text-xs hover:bg-danger-700 disabled:opacity-50"
-                            >
-                              {deletingId === db.id ? "..." : "Yes"}
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteId(null)}
-                              className="px-2 py-1 bg-dark-600 text-dark-100 rounded text-xs hover:bg-dark-500"
-                            >
-                              No
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            onClick={() => handleDelete(db.id)}
-                            className="text-xs text-danger-500 hover:text-danger-500"
-                          >
-                            Delete
-                          </button>
-                        )}
+                        <button
+                          onClick={() => setDeleteTargetDb(db)}
+                          className="text-xs text-danger-400 hover:text-danger-300"
+                        >
+                          Delete
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -1611,6 +2417,27 @@ export default function Databases() {
           )}
         </div>
       ) : null}
+      {/* Database Deletion Consequence Dialog */}
+      {deleteTargetDb && (
+        <ConfirmDialog
+          title={`Delete Database: ${deleteTargetDb.name}`}
+          label={`Are you sure you want to permanently delete database "${deleteTargetDb.name}"?`}
+          consequences={[
+            `Permanently drops database "${deleteTargetDb.name}" and removes its underlying container`,
+            "All tables, schemas, stored records, and credentials will be irreversibly erased",
+            "Any websites, APIs, or Docker apps connected to this database will immediately experience connection errors",
+            "Saved backups in /var/backups will no longer be linked to an active database container"
+          ]}
+          confirmLabel="Permanently Delete Database"
+          tone="danger"
+          onConfirm={() => {
+            const id = deleteTargetDb.id;
+            setDeleteTargetDb(null);
+            handleDelete(id);
+          }}
+          onCancel={() => setDeleteTargetDb(null)}
+        />
+      )}
       </div>
     </div>
   );
