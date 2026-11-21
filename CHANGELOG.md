@@ -1,8 +1,54 @@
 # Changelog
 
-All notable changes to DockPanel will be documented in this file.
+All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
+
+## [2.243.0] - 2026-11-21
+
+### Major: Feature-Rich File Manager, 1GB Uploads, Multi-Site SSL & Git Deploy Resilience
+
+This release significantly upgrades the File Manager into a full-featured web-based file management suite, raises upload limits from ~1.5 MB to 1 GB+, resolves multi-domain SSL certificate collisions, eliminates Git Deploy incident deadlocks, and introduces automated server build and deployment pipelines.
+
+#### 1. File Manager Overhaul
+- **Collapsible Directory Tree Sidebar:** Added an interactive left-side navigation tree with lazy-loading subdirectories. Users can expand nested folders (`▶` / `▼`) on demand and jump directly to any directory in the site's hierarchy without losing context.
+- **Native Archive Extraction & Compression:**
+  - One-click extraction for `.zip`, `.tar.gz`, `.tgz`, `.tar`, and `.tar.bz2` directly in the panel.
+  - Multi-select archive compression to `.zip` or `.tar.gz`.
+  - Automatically restores and secures extracted and created files with `www-data:www-data` ownership (with `.git` securely reserved to `root:root`).
+- **Unix Permissions & Ownership Details:**
+  - File table now displays octal permissions (`0755`, `0644`, `0640`) and Unix ownership (`www-data:www-data`).
+  - Interactive **Chmod Modal** with presets for standard directories, files, protected config files (`0640`), and full access, with recursive (`-R`) support.
+  - Interactive **Chown Modal** with presets for `www-data:www-data` and `root:root`, with recursive (`-R`) support.
+- **Batch File Operations:**
+  - Multi-select checkboxes with a "Select All" table header.
+  - Floating action bar for batch Copy, Move, Compress, and Batch Delete.
+- **Enhanced In-Browser Code Editor:**
+  - Code/text editor with split-screen and fullscreen toggle modes.
+  - Keyboard shortcut `Ctrl+S` / `Cmd+S` for saving directly from the editor without loss of focus.
+  - Tab key indentation support (inserts spaces rather than losing focus).
+  - Status indicators for "Saved", "Saving...", and unsaved changes.
+- **File Upload & Creation Ownership Fix:**
+  - Resolved path joining when uploading to root (`.`).
+  - Guaranteed `www-data:www-data` ownership on all newly uploaded, created, or extracted files to prevent PHP-FPM and Nginx permission denied errors.
+
+#### 2. Large File Uploads & Real-Time Progress Bar
+- **1 GB File Upload Support:** Removed the restrictive ~1.5 MB body limit on both frontend-to-backend and backend-to-agent hops, raising `UPLOAD_MAX_FILE_BYTES` to 1 GB (`1_073_741_824` bytes) with matching 2 GB body limit layers.
+- **Real-Time Upload Progress:** Added an interactive progress bar showing current file index, percentage, uploaded MB vs total MB, and distinct phases (`reading` -> `uploading` -> `processing`).
+
+#### 3. Multi-Site SSL & SNI Routing Fix
+- Fixed `net::ERR_CERT_COMMON_NAME_INVALID` where Nginx fallback certificate collisions caused certificates from one domain (e.g. `hhhfacility.com`) to be served on unrelated domains (e.g. `3swift.com`, `drhinakhan.com`).
+- Ensured strict SNI virtual host matching and proper default catch-all certificates.
+
+#### 4. Git Deploy Incident Blocker Resolution & Private Repositories
+- **Incident Blocker Bypass:** Fixed the deadlock where active major/critical incidents blocked Git deploys indefinitely (`Deploy blocked: active critical/major incident in progress. Resolve the incident first`).
+- **Rich Incident Banner & Actions:** Replaced generic error with an interactive incident details card showing title, severity badge, description, and start time, accompanied by actionable controls: **"Force Deploy Anyway"**, **"Resolve & Deploy"**, and **"Delete Incident"**.
+- **Private Repository Deploy Support:** Added automatic `x-access-token` GitHub token injection into HTTPS clone URLs for private repository deploys.
+
+#### 5. Site Creation Rate Limit
+- Increased default site creation rate limit to 10 sites per hour (up from 3) for smoother setup of multi-domain environments.
+
+---
 
 ## [2.242.1]
 

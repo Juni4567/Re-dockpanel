@@ -2,11 +2,12 @@
   <img src=".github/screenshots/dp-dashboard.png" alt="DockPanel Dashboard" width="800">
 </p>
 
-<h1 align="center">DockPanel</h1>
+<h1 align="center">Re-dockpanel</h1>
 
 <p align="center">
-  <strong>The most feature-packed free server panel ever built.</strong><br>
-  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~49MB of RAM</strong>. 840 HTTP routes. 147 app templates. 4544 regression assertions. ~57MB binaries. Zero subscriptions.
+  <strong>Enhanced, Feature-Packed Fork of DockPanel by <a href="https://github.com/Juni4567">Junaid (@Juni4567)</a></strong><br>
+  Originally created by <a href="https://github.com/ovexro/dockpanel">@ovexro/dockpanel</a>.<br>
+  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~49MB of RAM</strong>. 840+ HTTP routes. 147 app templates. ~57MB binaries. Zero subscriptions.
 </p>
 
 <p align="center">
@@ -14,17 +15,63 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ovexro/dockpanel/releases"><img src="https://img.shields.io/github/v/release/ovexro/dockpanel" alt="Release"></a>
-  <a href="https://github.com/ovexro/dockpanel/actions"><img src="https://img.shields.io/github/actions/workflow/status/ovexro/dockpanel/ci.yml?label=CI" alt="CI"></a>
+  <a href="https://github.com/Juni4567/Re-dockpanel/releases"><img src="https://img.shields.io/github/v/release/Juni4567/Re-dockpanel" alt="Release"></a>
+  <a href="https://github.com/Juni4567/Re-dockpanel/actions"><img src="https://img.shields.io/github/actions/workflow/status/Juni4567/Re-dockpanel/ci.yml?label=CI" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL_v3-blue.svg" alt="License: AGPL v3"></a>
+  <a href="https://github.com/ovexro/dockpanel"><img src="https://img.shields.io/badge/Upstream-ovexro%2Fdockpanel-purple.svg" alt="Upstream: ovexro/dockpanel"></a>
 </p>
 
 <p align="center">
-  <a href="https://dockpanel.dev">Website</a> &bull;
-  <a href="https://docs.dockpanel.dev">Docs</a> &bull;
+  <a href="https://github.com/Juni4567/Re-dockpanel">Repository</a> &bull;
   <a href="CHANGELOG.md">Changelog</a> &bull;
-  <a href="https://github.com/ovexro/dockpanel/discussions">Discussions</a>
+  <a href="https://github.com/Juni4567/Re-dockpanel/releases">Releases</a> &bull;
+  <a href="https://github.com/ovexro/dockpanel">Original Upstream</a>
 </p>
+
+---
+
+## 🚀 What's Different from Upstream (`ovexro/dockpanel`)
+
+This fork (`Re-dockpanel`) includes key production improvements, bug fixes, and workflow enhancements:
+
+### 1. 🗂️ Major File Manager Upgrade
+- **Interactive Directory Tree Sidebar**: Collapsible left sidebar with real-time, lazy-loading subdirectories (`▶` / `▼`). Easily navigate deep WordPress or application trees (`public/`, `wp-content/`, `plugins/`, etc.) without losing your position.
+- **Archive Compression & Extraction**:
+  - Direct 1-click in-panel extraction for `.zip`, `.tar.gz`, `.tgz`, `.tar`, and `.tar.bz2` files.
+  - Multi-select archive compression to `.zip` or `.tar.gz` with custom naming.
+  - Automatic recursive ownership setting to `www-data:www-data` upon extraction (preserving `.git` security).
+- **File Permissions & Ownership Details**:
+  - Displays Unix octal permissions (e.g., `0755`, `0644`, `0640`) and ownership (`www-data:www-data`).
+  - Interactive **Chmod Modal** with presets (`0755 Dir`, `0644 File`, `0640 Protected Config`, `0777 Full`) and recursive `-R` toggle.
+  - Interactive **Chown Modal** with presets (`www-data:www-data`, `root:root`) and recursive `-R` toggle.
+- **Batch Operations**: Multi-select checkboxes with a "Select All" header, plus a floating action bar for batch Copy, Move, Compress, and Delete.
+- **Enhanced Code & Text Editor**: In-browser code editor with fullscreen toggle, keyboard shortcut `Ctrl+S` / `Cmd+S` for quick saving, tab-key indentation, and live save status indicators.
+- **Permission & Ownership Hygiene**: All newly uploaded, created, or extracted files automatically receive `www-data:www-data` ownership so PHP-FPM and Nginx never encounter `Permission Denied` errors.
+
+### 2. ⚡ 1 GB+ Large File Uploads & Progress Bar
+- **Expanded Limits**: Raised the former ~1.5 MB body limit on both panel-to-backend and backend-to-agent hops to **1 GB minimum** (`1_073_741_824` bytes), supported by 2 GB body limit layers.
+- **Real-Time Progress UI**: Live upload progress bar showing transfer percentage, transferred vs total MB, and distinct processing states (`reading` -> `uploading` -> `processing`).
+
+### 3. 🔒 Multi-Domain SSL / SNI Isolation Fix
+- Resolves `net::ERR_CERT_COMMON_NAME_INVALID` where Nginx fallback certificate collisions caused certificates from one domain (e.g. `hhhfacility.com`) to be served on unrelated domains (e.g. `3swift.com`, `drhinakhan.com`).
+- Enforces strict SNI virtual host matching and independent SSL certificate resolution.
+
+### 4. 🛠️ Git Deploy Incident Blocker Resolution & Private Repositories
+- **Incident Deadlock Fix**: Solved the issue where active incidents (`Deploy blocked: active critical/major incident in progress`) halted git deploys indefinitely.
+- **Actionable Incident Banner**: Displays full incident details (title, severity badge, description, start timestamp) with 1-click **"Force Deploy Anyway"**, **"Resolve & Deploy"**, and **"Delete Incident"** controls.
+- **Private Repository Support**: Automatically injects GitHub access tokens (`x-access-token`) into HTTPS clone URLs for private repo deployments.
+
+### 5. 🌐 Rate Limit Tuning
+- Site creation rate limit increased to **10 sites/hour** (up from 3) for smoother setup of multi-domain hosting environments.
+
+### 6. 🔄 Automated Build & Deploy Pipeline
+- Automated `./deploy.sh all` script that pulls from `Juni4567/Re-dockpanel`, builds Vite frontend assets, compiles Rust release binaries (`dockpanel-api` and `dockpanel-agent`), and performs rolling service restarts.
+
+---
+
+## Upstream Attribution
+
+`Re-dockpanel` is a fork of [**DockPanel**](https://github.com/ovexro/dockpanel), originally created and maintained by [@ovexro](https://github.com/ovexro). We deeply appreciate the incredible architecture and foundation provided by the upstream project.
 
 ---
 
