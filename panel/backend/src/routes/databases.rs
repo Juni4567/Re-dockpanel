@@ -1541,17 +1541,48 @@ pub async fn upload_dump(
     }
 
     let is_gzipped = decoded_bytes.starts_with(&[0x1f, 0x8b]);
-    let target_filename = if is_gzipped {
+    let is_zip = decoded_bytes.starts_with(&[0x50, 0x4b, 0x03, 0x04]);
+
+    // If a ZIP archive was uploaded, extract the internal .sql dump
+    let effective_bytes = if is_zip {
+        let temp_zip_path = format!("/tmp/dockpanel_dump_upload_{}.zip", uuid::Uuid::new_v4());
+        tokio::fs::write(&temp_zip_path, &decoded_bytes)
+            .await
+            .map_err(|e| internal_error("write temp zip", e))?;
+
+        let unzip_output = tokio::process::Command::new("unzip")
+            .args(["-p", &temp_zip_path, "*.sql"])
+            .output()
+            .await;
+
+        let _ = tokio::fs::remove_file(&temp_zip_path).await;
+
+        match unzip_output {
+            Ok(output) if output.status.success() && !output.stdout.is_empty() => output.stdout,
+            _ => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "ZIP archive does not contain a .sql database dump file. Ensure your .zip contains a database dump.",
+                ));
+            }
+        }
+    } else {
+        decoded_bytes
+    };
+
+    let is_effective_gzipped = effective_bytes.starts_with(&[0x1f, 0x8b]);
+    let target_filename = if is_effective_gzipped {
         if sanitized_filename.ends_with(".gz") {
             sanitized_filename
         } else {
             format!("{sanitized_filename}.gz")
         }
     } else {
-        if sanitized_filename.ends_with(".sql") {
-            sanitized_filename
+        let base_name = sanitized_filename.trim_end_matches(".zip");
+        if base_name.ends_with(".sql") {
+            base_name.to_string()
         } else {
-            format!("{sanitized_filename}.sql")
+            format!("{base_name}.sql")
         }
     };
 
@@ -1561,12 +1592,12 @@ pub async fn upload_dump(
         .map_err(|e| internal_error("create dump directory", e))?;
 
     let target_path = format!("{target_dir}/{target_filename}");
-    tokio::fs::write(&target_path, &decoded_bytes)
+    tokio::fs::write(&target_path, &effective_bytes)
         .await
         .map_err(|e| internal_error("write dump file", e))?;
 
     // If file is plain SQL and not gzipped, compress it with gzip and delete plain file
-    let final_filename = if !is_gzipped && target_filename.ends_with(".sql") {
+    let final_filename = if !is_effective_gzipped && target_filename.ends_with(".sql") {
         let gz_path = format!("{target_path}.gz");
         let gz_status = tokio::process::Command::new("gzip")
             .arg("-c")

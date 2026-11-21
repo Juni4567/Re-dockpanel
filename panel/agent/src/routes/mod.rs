@@ -104,7 +104,7 @@ pub fn is_valid_name(name: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphanumeric())
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 /// Validate a Docker container ID (hex string, 1–64 chars).

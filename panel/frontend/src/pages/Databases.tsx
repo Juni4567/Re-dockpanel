@@ -559,8 +559,8 @@ function AdvancedDatabaseManager({
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (!file.name.endsWith(".sql") && !file.name.endsWith(".sql.gz") && !file.name.endsWith(".gz")) {
-      showGlobalNotification("error", "Please select a valid .sql or .sql.gz dump file");
+    if (!file.name.endsWith(".sql") && !file.name.endsWith(".sql.gz") && !file.name.endsWith(".gz") && !file.name.endsWith(".zip")) {
+      showGlobalNotification("error", "Please select a valid .sql, .sql.gz, or .zip dump file");
       return;
     }
 
@@ -1496,7 +1496,7 @@ function AdvancedDatabaseManager({
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".sql,.sql.gz,.gz"
+                  accept=".sql,.sql.gz,.gz,.zip"
                   onChange={handleUploadDumpFile}
                   className="hidden"
                   id="db-dump-file-picker"

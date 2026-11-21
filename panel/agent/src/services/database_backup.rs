@@ -11,7 +11,7 @@ fn is_safe_filename(name: &str) -> bool {
     !name.is_empty()
         && !name.contains('/')
         && !name.contains("..")
-        && (name.ends_with(".sql.gz") || name.ends_with(".archive.gz") || name.ends_with(".sql.gz.enc") || name.ends_with(".archive.gz.enc"))
+        && (name.ends_with(".sql") || name.ends_with(".sql.gz") || name.ends_with(".archive.gz") || name.ends_with(".sql.enc") || name.ends_with(".sql.gz.enc") || name.ends_with(".archive.gz.enc"))
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
@@ -510,16 +510,16 @@ pub async fn restore_mysql(
         return Err("Invalid username".into());
     }
 
-    // gunzip → pipe to docker exec mysql
-    let mut gunzip_child = safe_command("gunzip")
-        .args(["-c", filepath])
+    // gzip -dc -f transparently decompresses .sql.gz AND passes through uncompressed .sql
+    let mut gunzip_child = safe_command("gzip")
+        .args(["-dc", "-f", filepath])
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("Failed to spawn gunzip: {e}"))?;
+        .map_err(|e| format!("Failed to spawn gzip decompressor: {e}"))?;
 
     let gunzip_stdout = gunzip_child.stdout.take()
-        .ok_or("Failed to capture gunzip stdout")?;
+        .ok_or("Failed to capture gzip stdout")?;
 
     let env_file = DockerEnvFile::new(&[("MYSQL_PWD", password)])
         .map_err(|e| format!("Failed to prepare credentials: {e}"))?;
@@ -530,12 +530,12 @@ pub async fn restore_mysql(
             container_name,
             // `mariadb`, NOT `mysql`: the panel provisions `mariadb:11`, and
             // MariaDB 11 dropped the mysql-named client symlinks, so `mysql`
-            // does not exist in the container at all. Every sibling call site
-            // (database.rs, backup_drill.rs, backup_verify.rs) already invokes
-            // `mariadb`; this one did not, so restoring a MySQL/MariaDB dump
-            // failed on every install with "executable file not found" while
-            // the DUMP half — which correctly calls `mariadb-dump` — worked.
-            "mariadb", "-u", user, db_name,
+            // does not exist in the container at all.
+            // Flags:
+            //   --binary-mode: preserves binary blobs, ASCII 0, \r\n (crucial for WordPress serialized objects)
+            //   -o / --one-database: ignores USE <other_db> statements in dumps
+            //   --max_allowed_packet=1024M: allows large table rows/blobs to import cleanly
+            "mariadb", "-u", user, "--binary-mode", "-o", "--max_allowed_packet=1024M", db_name,
         ])
         .stdin(gunzip_stdout.into_owned_fd().map_err(|_| "Failed to get fd")?)
         .stdout(std::process::Stdio::piped())
@@ -601,12 +601,13 @@ pub async fn restore_postgres(
         return Err("Invalid username".into());
     }
 
-    let mut gunzip_child = safe_command("gunzip")
-        .args(["-c", filepath])
+    // gzip -dc -f transparently decompresses .sql.gz AND passes through uncompressed .sql
+    let mut gunzip_child = safe_command("gzip")
+        .args(["-dc", "-f", filepath])
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("Failed to spawn gunzip: {e}"))?;
+        .map_err(|e| format!("Failed to spawn gzip decompressor: {e}"))?;
 
     let gunzip_stdout = gunzip_child.stdout.take()
         .ok_or("Failed to capture gunzip stdout")?;
@@ -801,8 +802,10 @@ pub fn list_db_backups(db_name: &str) -> Result<Vec<BackupInfo>, String> {
 /// is answered by the panel, which knows both.
 fn unusable_reason(db_name: &str, name: &str) -> String {
     let full = format!("{BACKUP_DIR}/{db_name}/{name}");
-    let ext_ok = name.ends_with(".sql.gz")
+    let ext_ok = name.ends_with(".sql")
+        || name.ends_with(".sql.gz")
         || name.ends_with(".archive.gz")
+        || name.ends_with(".sql.enc")
         || name.ends_with(".sql.gz.enc")
         || name.ends_with(".archive.gz.enc");
 
@@ -813,9 +816,9 @@ fn unusable_reason(db_name: &str, name: &str) -> String {
              Rename it with: mv '{full}' {BACKUP_DIR}/{db_name}/{}",
             sanitise_suggestion(name)
         )
-    } else if name.ends_with(".sql") || name.ends_with(".archive") || name.ends_with(".dump") {
+    } else if name.ends_with(".archive") || name.ends_with(".dump") {
         format!(
-            "Not compressed. Backups are read as .sql.gz — compress it in place with: gzip {full}"
+            "Not compressed. Backups are read as .sql.gz or .sql — compress it in place with: gzip {full}"
         )
     } else if name.ends_with(".zip") {
         format!(
