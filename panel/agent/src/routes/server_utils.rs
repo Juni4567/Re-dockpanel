@@ -120,7 +120,7 @@ async fn file_upload(
                 return Err(err(StatusCode::BAD_REQUEST, "Invalid filename"));
             }
             let dir = body.path.trim_matches('/');
-            if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") }
+            if dir.is_empty() || dir == "." { name.clone() } else { format!("{dir}/{name}") }
         }
         _ => body.path.clone(),
     };
@@ -141,6 +141,12 @@ async fn file_upload(
 
     tokio::fs::write(&full_path, &bytes).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write file: {e}")))?;
+
+    // Ensure uploaded file is owned by www-data:www-data
+    let _ = crate::safe_cmd::safe_command("chown")
+        .args(["www-data:www-data", &full_path.to_string_lossy()])
+        .output()
+        .await;
 
     let path_str = full_path.to_string_lossy().to_string();
     tracing::info!("File uploaded: {} ({} bytes)", path_str, bytes.len());

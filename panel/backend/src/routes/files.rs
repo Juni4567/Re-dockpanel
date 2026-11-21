@@ -118,6 +118,56 @@ pub struct RenameBody {
     pub to: String,
 }
 
+#[derive(serde::Deserialize)]
+pub struct ExtractBody {
+    pub archive: String,
+    pub destination: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct CompressBody {
+    pub sources: Vec<String>,
+    pub destination: String,
+    pub format: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct CopyBody {
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+    #[serde(default)]
+    pub destination_dir: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct MoveBody {
+    pub sources: Vec<String>,
+    pub destination_dir: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct ChmodBody {
+    pub path: String,
+    pub mode: String,
+    pub recursive: Option<bool>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct ChownBody {
+    pub path: String,
+    pub owner: String,
+    pub recursive: Option<bool>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct DeleteBatchBody {
+    pub paths: Vec<String>,
+}
+
 
 /// GET /api/sites/{id}/files?path=
 pub async fn list_dir(
@@ -285,6 +335,250 @@ pub async fn delete_entry(
         .delete(&agent_path)
         .await
         .map_err(|e| agent_error("File manager", e))?;
+
+    Ok(Json(result))
+}
+
+/// GET /api/sites/{id}/files/tree?path=
+pub async fn get_tree(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let rel_path = q.path.as_deref().unwrap_or(".");
+
+    if rel_path != "." && !is_safe_relative_path(rel_path) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid path"));
+    }
+
+    let agent_path = format!(
+        "/files/{}/tree?path={}",
+        domain,
+        urlencoding::encode(rel_path)
+    );
+    let result = agent
+        .get(&agent_path)
+        .await
+        .map_err(|e| agent_error("File tree", e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/files/extract — Extract an archive (.zip, .tar.gz, etc.)
+pub async fn extract_archive(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ExtractBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !is_safe_relative_path(&body.archive) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid archive path"));
+    }
+    if let Some(dest) = &body.destination {
+        if dest != "." && !is_safe_relative_path(dest) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid destination path"));
+        }
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_path = format!("/files/{}/extract", domain);
+    let result = agent
+        .post_long(
+            &agent_path,
+            Some(serde_json::json!({
+                "archive": body.archive,
+                "destination": body.destination,
+            })),
+            300,
+        )
+        .await
+        .map_err(|e| agent_error("File manager extract", e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/files/compress — Compress files/folders into zip or tar.gz
+pub async fn compress_entries(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CompressBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !is_safe_relative_path(&body.destination) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid destination path"));
+    }
+    for src in &body.sources {
+        if !is_safe_relative_path(src) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid source path"));
+        }
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_path = format!("/files/{}/compress", domain);
+    let result = agent
+        .post_long(
+            &agent_path,
+            Some(serde_json::json!({
+                "sources": body.sources,
+                "destination": body.destination,
+                "format": body.format,
+            })),
+            300,
+        )
+        .await
+        .map_err(|e| agent_error("File manager compress", e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/files/copy — Copy single or batch entries
+pub async fn copy_entry(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CopyBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let (Some(f), Some(t)) = (&body.from, &body.to) {
+        if !is_safe_relative_path(f) || !is_safe_relative_path(t) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid path"));
+        }
+    }
+    if let (Some(sources), Some(dest)) = (&body.sources, &body.destination_dir) {
+        if dest != "." && !is_safe_relative_path(dest) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid destination path"));
+        }
+        for s in sources {
+            if !is_safe_relative_path(s) {
+                return Err(err(StatusCode::BAD_REQUEST, "Invalid source path"));
+            }
+        }
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_path = format!("/files/{}/copy", domain);
+    let result = agent
+        .post(
+            &agent_path,
+            Some(serde_json::to_value(&body).unwrap_or_default()),
+        )
+        .await
+        .map_err(|e| agent_error("File manager copy", e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/files/move — Batch move entries to destination folder
+pub async fn move_entries(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<MoveBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.destination_dir != "." && !is_safe_relative_path(&body.destination_dir) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid destination path"));
+    }
+    for s in &body.sources {
+        if !is_safe_relative_path(s) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid source path"));
+        }
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_path = format!("/files/{}/move", domain);
+    let result = agent
+        .post(
+            &agent_path,
+            Some(serde_json::json!({
+                "sources": body.sources,
+                "destination_dir": body.destination_dir,
+            })),
+        )
+        .await
+        .map_err(|e| agent_error("File manager move", e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/files/chmod — Set permissions (e.g. 0755, 0644)
+pub async fn chmod_entry(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ChmodBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !is_safe_relative_path(&body.path) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid path"));
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_path = format!("/files/{}/chmod", domain);
+    let result = agent
+        .post(
+            &agent_path,
+            Some(serde_json::json!({
+                "path": body.path,
+                "mode": body.mode,
+                "recursive": body.recursive,
+            })),
+        )
+        .await
+        .map_err(|e| agent_error("File manager chmod", e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/files/chown — Set ownership (e.g. www-data:www-data)
+pub async fn chown_entry(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ChownBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !is_safe_relative_path(&body.path) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid path"));
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_path = format!("/files/{}/chown", domain);
+    let result = agent
+        .post(
+            &agent_path,
+            Some(serde_json::json!({
+                "path": body.path,
+                "owner": body.owner,
+                "recursive": body.recursive,
+            })),
+        )
+        .await
+        .map_err(|e| agent_error("File manager chown", e))?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/files/delete-batch — Batch delete entries
+pub async fn delete_batch(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<DeleteBatchBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    for p in &body.paths {
+        if !is_safe_relative_path(p) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid path"));
+        }
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_path = format!("/files/{}/delete-batch", domain);
+    let result = agent
+        .post(
+            &agent_path,
+            Some(serde_json::json!({ "paths": body.paths })),
+        )
+        .await
+        .map_err(|e| agent_error("File manager delete batch", e))?;
 
     Ok(Json(result))
 }

@@ -3,13 +3,22 @@ use tokio::fs;
 
 const WEBROOT: &str = "/var/www";
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct FileEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
     pub modified: String,
+    pub permissions: String,
+    pub owner: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct DirItem {
+    pub name: String,
+    pub path: String,
+    pub has_subdirs: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -126,6 +135,46 @@ pub(crate) fn resolve_within(base: &Path, relative_path: &str) -> Result<PathBuf
 // error. Note it also means a site whose document root was pointed somewhere other than
 // `/var/www/<domain>` now reports that plainly instead of showing an empty invented folder.
 
+#[cfg(unix)]
+fn get_user_group(uid: u32, gid: u32) -> String {
+    let user = unsafe {
+        let pwd = libc::getpwuid(uid);
+        if !pwd.is_null() && !(*pwd).pw_name.is_null() {
+            std::ffi::CStr::from_ptr((*pwd).pw_name)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            uid.to_string()
+        }
+    };
+    let group = unsafe {
+        let grp = libc::getgrgid(gid);
+        if !grp.is_null() && !(*grp).gr_name.is_null() {
+            std::ffi::CStr::from_ptr((*grp).gr_name)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            gid.to_string()
+        }
+    };
+    format!("{user}:{group}")
+}
+
+#[cfg(not(unix))]
+fn get_user_group(_uid: u32, _gid: u32) -> String {
+    "www-data:www-data".to_string()
+}
+
+#[cfg(unix)]
+fn get_permissions(mode: u32) -> String {
+    format!("{:04o}", mode & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn get_permissions(_mode: u32) -> String {
+    "0644".to_string()
+}
+
 /// List directory contents.
 /// The `site_root` parameter is used to strip absolute paths to relative paths in the response.
 /// If `None`, paths are returned relative to the listed directory.
@@ -152,6 +201,21 @@ pub async fn list_directory(path: &Path, site_root: Option<&Path>) -> Result<Vec
             })
             .unwrap_or_default();
 
+        let (permissions, owner) = if let Some(m) = meta.as_ref() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                (get_permissions(m.mode()), get_user_group(m.uid(), m.gid()))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = m;
+                (get_permissions(0o644), get_user_group(0, 0))
+            }
+        } else {
+            (get_permissions(0o644), get_user_group(0, 0))
+        };
+
         let name = entry.file_name().to_string_lossy().to_string();
         let abs_path = format!("{}/{}", path.display(), &name);
 
@@ -175,6 +239,8 @@ pub async fn list_directory(path: &Path, site_root: Option<&Path>) -> Result<Vec
             is_dir,
             size,
             modified,
+            permissions,
+            owner,
         });
     }
 
@@ -242,6 +308,11 @@ pub async fn write_file(path: &Path, content: &str) -> Result<(), String> {
         let _ = fs::remove_file(&tmp).await;
         return Err(format!("Failed to finalize write: {e}"));
     }
+    // Ensure written files are owned by www-data:www-data
+    let _ = crate::safe_cmd::safe_command("chown")
+        .args(["www-data:www-data", &path.to_string_lossy()])
+        .output()
+        .await;
     Ok(())
 }
 
@@ -263,6 +334,10 @@ pub async fn create_entry(path: &Path, is_dir: bool) -> Result<(), String> {
             .await
             .map_err(|e| format!("Failed to create file: {e}"))?;
     }
+    let _ = crate::safe_cmd::safe_command("chown")
+        .args(["-R", "www-data:www-data", &path.to_string_lossy()])
+        .output()
+        .await;
     Ok(())
 }
 
@@ -294,6 +369,280 @@ pub async fn delete_entry(path: &Path) -> Result<(), String> {
             .await
             .map_err(|e| format!("Failed to delete file: {e}"))?;
     }
+    Ok(())
+}
+
+/// Get direct subdirectories of a path, indicating whether each child has subdirectories of its own.
+pub async fn get_subdirectories(path: &Path, site_root: Option<&Path>) -> Result<Vec<DirItem>, String> {
+    let mut items = Vec::new();
+    let mut reader = fs::read_dir(path)
+        .await
+        .map_err(|e| format!("Cannot read directory: {e}"))?;
+
+    while let Some(entry) = reader
+        .next_entry()
+        .await
+        .map_err(|e| format!("Read entry error: {e}"))?
+    {
+        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // Skip hidden dirs like .git in directory tree navigation
+        }
+
+        let abs_path = format!("{}/{}", path.display(), &name);
+        let relative_path = if let Some(root) = site_root {
+            let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            match std::path::Path::new(&abs_path).strip_prefix(&canon_root) {
+                Ok(rel) => rel.to_string_lossy().to_string(),
+                Err(_) => name.clone(),
+            }
+        } else {
+            name.clone()
+        };
+
+        // Check if child has any subdirectories
+        let mut has_subdirs = false;
+        if let Ok(mut sub_reader) = fs::read_dir(entry.path()).await {
+            while let Ok(Some(sub_entry)) = sub_reader.next_entry().await {
+                if let Ok(ft) = sub_entry.file_type().await {
+                    if ft.is_dir() && !sub_entry.file_name().to_string_lossy().starts_with('.') {
+                        has_subdirs = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        items.push(DirItem {
+            name,
+            path: relative_path,
+            has_subdirs,
+        });
+    }
+
+    items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(items)
+}
+
+/// Extract an archive (.zip, .tar.gz, .tgz, .tar, .tar.bz2) into dest_dir.
+pub async fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<String, String> {
+    if !archive_path.exists() {
+        return Err("Archive file does not exist".into());
+    }
+    if !dest_dir.exists() {
+        fs::create_dir_all(dest_dir)
+            .await
+            .map_err(|e| format!("Failed to create destination directory: {e}"))?;
+    }
+
+    let archive_str = archive_path.to_string_lossy().to_string();
+    let dest_str = dest_dir.to_string_lossy().to_string();
+    let lower = archive_str.to_lowercase();
+
+    let output = if lower.ends_with(".zip") {
+        crate::safe_cmd::safe_command("unzip")
+            .args(["-o", "-q", &archive_str, "-d", &dest_str])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute unzip: {e}"))?
+    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        crate::safe_cmd::safe_command("tar")
+            .args(["-xzf", &archive_str, "-C", &dest_str])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute tar: {e}"))?
+    } else if lower.ends_with(".tar.bz2") {
+        crate::safe_cmd::safe_command("tar")
+            .args(["-xjf", &archive_str, "-C", &dest_str])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute tar: {e}"))?
+    } else if lower.ends_with(".tar") {
+        crate::safe_cmd::safe_command("tar")
+            .args(["-xf", &archive_str, "-C", &dest_str])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute tar: {e}"))?
+    } else {
+        return Err("Unsupported archive format. Supported: .zip, .tar.gz, .tgz, .tar, .tar.bz2".into());
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Extraction failed: {stderr}"));
+    }
+
+    // Set ownership of extracted files to www-data:www-data
+    let _ = crate::safe_cmd::safe_command("chown")
+        .args(["-R", "www-data:www-data", &dest_str])
+        .output()
+        .await;
+
+    // Secure .git if it exists in dest_str
+    let git_dir = format!("{dest_str}/.git");
+    if std::path::Path::new(&git_dir).exists() {
+        let _ = crate::safe_cmd::safe_command("chown").args(["-R", "root:root", &git_dir]).output().await;
+        let _ = crate::safe_cmd::safe_command("chmod").args(["-R", "go-rwx", &git_dir]).output().await;
+    }
+
+    Ok("Extraction completed successfully".into())
+}
+
+/// Compress sources into an archive.
+pub async fn compress_entries(
+    source_paths: &[PathBuf],
+    archive_path: &Path,
+    format: &str,
+) -> Result<u64, String> {
+    if source_paths.is_empty() {
+        return Err("No source files or directories provided".into());
+    }
+    if let Some(parent) = archive_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create destination directory: {e}"))?;
+        }
+    }
+
+    let archive_str = archive_path.to_string_lossy().to_string();
+    let lower_format = format.to_lowercase();
+    let is_tar = lower_format == "tar.gz" || lower_format == "tgz" || archive_str.ends_with(".tar.gz") || archive_str.ends_with(".tgz");
+
+    let output = if is_tar {
+        let mut cmd = crate::safe_cmd::safe_command("tar");
+        cmd.arg("-czf").arg(&archive_str);
+        for p in source_paths {
+            cmd.arg(p.to_string_lossy().as_ref());
+        }
+        cmd.output()
+            .await
+            .map_err(|e| format!("Failed to execute tar: {e}"))?
+    } else {
+        // Default to zip
+        let mut cmd = crate::safe_cmd::safe_command("zip");
+        cmd.args(["-r", "-q", &archive_str]);
+        for p in source_paths {
+            cmd.arg(p.to_string_lossy().as_ref());
+        }
+        cmd.output()
+            .await
+            .map_err(|e| format!("Failed to execute zip: {e}"))?
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Compression failed: {stderr}"));
+    }
+
+    // Set ownership to www-data:www-data
+    let _ = crate::safe_cmd::safe_command("chown")
+        .args(["www-data:www-data", &archive_str])
+        .output()
+        .await;
+
+    let len = fs::metadata(archive_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    Ok(len)
+}
+
+/// Copy a file or directory.
+pub async fn copy_entry(from: &Path, to: &Path) -> Result<(), String> {
+    if !from.exists() {
+        return Err("Source does not exist".into());
+    }
+    if to.exists() {
+        return Err("Destination already exists".into());
+    }
+    if let Some(parent) = to.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create parent directory: {e}"))?;
+        }
+    }
+
+    if from.is_dir() {
+        let output = crate::safe_cmd::safe_command("cp")
+            .args(["-a", &from.to_string_lossy(), &to.to_string_lossy()])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to copy directory: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Copy failed: {stderr}"));
+        }
+    } else {
+        fs::copy(from, to)
+            .await
+            .map_err(|e| format!("Failed to copy file: {e}"))?;
+    }
+
+    let _ = crate::safe_cmd::safe_command("chown")
+        .args(["-R", "www-data:www-data", &to.to_string_lossy()])
+        .output()
+        .await;
+
+    Ok(())
+}
+
+/// Change permissions of a file or directory.
+pub async fn chmod_entry(path: &Path, mode_str: &str, recursive: bool) -> Result<(), String> {
+    if !path.exists() {
+        return Err("Target path does not exist".into());
+    }
+
+    let trimmed = mode_str.trim();
+    if !trimmed.chars().all(|c| ('0'..='7').contains(&c)) || trimmed.len() < 3 || trimmed.len() > 4 {
+        return Err("Invalid permissions mode format (must be 3 or 4 octal digits, e.g. 0755, 0644)".into());
+    }
+
+    let mut cmd = crate::safe_cmd::safe_command("chmod");
+    if recursive && path.is_dir() {
+        cmd.arg("-R");
+    }
+    cmd.arg(trimmed).arg(path.to_string_lossy().as_ref());
+
+    let output = cmd.output().await.map_err(|e| format!("Failed to run chmod: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("chmod failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
+/// Change ownership of a file or directory.
+pub async fn chown_entry(path: &Path, owner: &str, recursive: bool) -> Result<(), String> {
+    if !path.exists() {
+        return Err("Target path does not exist".into());
+    }
+
+    let trimmed = owner.trim();
+    if !trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':') {
+        return Err("Invalid owner format".into());
+    }
+
+    let mut cmd = crate::safe_cmd::safe_command("chown");
+    if recursive && path.is_dir() {
+        cmd.arg("-R");
+    }
+    cmd.arg(trimmed).arg(path.to_string_lossy().as_ref());
+
+    let output = cmd.output().await.map_err(|e| format!("Failed to run chown: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("chown failed: {stderr}"));
+    }
+
     Ok(())
 }
 

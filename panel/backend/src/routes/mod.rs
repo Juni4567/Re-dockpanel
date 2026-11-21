@@ -1160,6 +1160,7 @@ pub fn router() -> Router<AppState> {
         )
         // File Manager
         .route("/api/sites/{id}/files", get(files::list_dir).delete(files::delete_entry))
+        .route("/api/sites/{id}/files/tree", get(files::get_tree))
         .route("/api/sites/{id}/files/read", get(files::read_file))
         .route("/api/sites/{id}/files/download", get(files::download_file))
         .route("/api/sites/{id}/files/write", put(files::write_file))
@@ -1169,6 +1170,13 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/sites/{id}/files/create", post(files::create_entry))
         .route("/api/sites/{id}/files/rename", post(files::rename_entry))
+        .route("/api/sites/{id}/files/extract", post(files::extract_archive))
+        .route("/api/sites/{id}/files/compress", post(files::compress_entries))
+        .route("/api/sites/{id}/files/copy", post(files::copy_entry))
+        .route("/api/sites/{id}/files/move", post(files::move_entries))
+        .route("/api/sites/{id}/files/chmod", post(files::chmod_entry))
+        .route("/api/sites/{id}/files/chown", post(files::chown_entry))
+        .route("/api/sites/{id}/files/delete-batch", post(files::delete_batch))
         // Backups
         .route("/api/sites/{id}/backups", get(backups::list).post(backups::create))
         .route("/api/sites/{id}/backups/{backup_id}/restore", post(backups::restore))

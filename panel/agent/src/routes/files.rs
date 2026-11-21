@@ -33,6 +33,52 @@ struct WriteBody {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct CompressRequest {
+    sources: Vec<String>,
+    destination: String,
+    format: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExtractRequest {
+    archive: String,
+    destination: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CopyRequest {
+    from: Option<String>,
+    to: Option<String>,
+    sources: Option<Vec<String>>,
+    destination_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MoveRequest {
+    sources: Vec<String>,
+    destination_dir: String,
+}
+
+#[derive(Deserialize)]
+struct ChmodRequest {
+    path: String,
+    mode: String,
+    recursive: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ChownRequest {
+    path: String,
+    owner: String,
+    recursive: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct DeleteBatchRequest {
+    paths: Vec<String>,
+}
+
 type ApiErr = (StatusCode, Json<serde_json::Value>);
 
 fn err(status: StatusCode, msg: &str) -> ApiErr {
@@ -245,13 +291,208 @@ async fn download_file(
     ))
 }
 
+/// GET /files/{domain}/tree?path=
+async fn get_tree(
+    Path(domain): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<Vec<files::DirItem>>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let rel = q.path.as_deref().unwrap_or("/");
+    let safe = files::resolve_safe_path(&domain, rel)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+
+    if !safe.is_dir() {
+        return Err(err(StatusCode::BAD_REQUEST, "Not a directory"));
+    }
+
+    let site_root = std::path::PathBuf::from(format!("/var/www/{domain}"));
+    let items = files::get_subdirectories(&safe, Some(&site_root))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(items))
+}
+
+/// POST /files/{domain}/extract
+async fn extract_archive(
+    Path(domain): Path<String>,
+    Json(body): Json<ExtractRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let archive_safe = files::resolve_safe_path(&domain, &body.archive)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+
+    let dest_rel = body.destination.as_deref().unwrap_or(".");
+    let dest_safe = files::resolve_safe_path(&domain, dest_rel)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+
+    let msg = files::extract_archive(&archive_safe, &dest_safe)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+
+    Ok(Json(serde_json::json!({ "success": true, "message": msg })))
+}
+
+/// POST /files/{domain}/compress
+async fn compress_entries(
+    Path(domain): Path<String>,
+    Json(body): Json<CompressRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let dest_safe = files::resolve_safe_path(&domain, &body.destination)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+
+    let mut source_paths = Vec::new();
+    for src in &body.sources {
+        let p = files::resolve_safe_child(&domain, src)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+        source_paths.push(p);
+    }
+
+    let format = body.format.as_deref().unwrap_or("zip");
+    let size = files::compress_entries(&source_paths, &dest_safe, format)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+
+    Ok(Json(serde_json::json!({ "success": true, "size": size })))
+}
+
+/// POST /files/{domain}/copy
+async fn copy_entry(
+    Path(domain): Path<String>,
+    Json(body): Json<CopyRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    if let (Some(from), Some(to)) = (&body.from, &body.to) {
+        let safe_from = files::resolve_safe_child(&domain, from)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+        let safe_to = files::resolve_safe_path(&domain, to)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+        files::copy_entry(&safe_from, &safe_to)
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    } else if let (Some(sources), Some(dest_dir)) = (&body.sources, &body.destination_dir) {
+        let safe_dest_dir = files::resolve_safe_path(&domain, dest_dir)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+        for src in sources {
+            let safe_from = files::resolve_safe_child(&domain, src)
+                .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+            let filename = safe_from.file_name().ok_or_else(|| err(StatusCode::BAD_REQUEST, "Invalid filename"))?;
+            let safe_to = safe_dest_dir.join(filename);
+            files::copy_entry(&safe_from, &safe_to)
+                .await
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+        }
+    } else {
+        return Err(err(StatusCode::BAD_REQUEST, "Missing source or destination"));
+    }
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// POST /files/{domain}/move
+async fn move_entries(
+    Path(domain): Path<String>,
+    Json(body): Json<MoveRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let safe_dest_dir = files::resolve_safe_path(&domain, &body.destination_dir)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+
+    for src in &body.sources {
+        let safe_from = files::resolve_safe_child(&domain, src)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+        let filename = safe_from.file_name().ok_or_else(|| err(StatusCode::BAD_REQUEST, "Invalid filename"))?;
+        let safe_to = safe_dest_dir.join(filename);
+        files::rename_entry(&safe_from, &safe_to)
+            .await
+            .map_err(file_status)?;
+    }
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// POST /files/{domain}/chmod
+async fn chmod_entry(
+    Path(domain): Path<String>,
+    Json(body): Json<ChmodRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let safe_path = files::resolve_safe_child(&domain, &body.path)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+
+    let recursive = body.recursive.unwrap_or(false);
+    files::chmod_entry(&safe_path, &body.mode, recursive)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// POST /files/{domain}/chown
+async fn chown_entry(
+    Path(domain): Path<String>,
+    Json(body): Json<ChownRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    let safe_path = files::resolve_safe_child(&domain, &body.path)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+
+    let recursive = body.recursive.unwrap_or(false);
+    files::chown_entry(&safe_path, &body.owner, recursive)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// POST /files/{domain}/delete-batch
+async fn delete_batch(
+    Path(domain): Path<String>,
+    Json(body): Json<DeleteBatchRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+    for p in &body.paths {
+        let safe = files::resolve_safe_child(&domain, p)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+        files::delete_entry(&safe)
+            .await
+            .map_err(file_status)?;
+    }
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/files/{domain}/list", get(list_dir))
+        .route("/files/{domain}/tree", get(get_tree))
         .route("/files/{domain}/read", get(read_file))
         .route("/files/{domain}/download", get(download_file))
         .route("/files/{domain}/write", put(write_file))
         .route("/files/{domain}/create", post(create_entry))
         .route("/files/{domain}/rename", post(rename_entry))
         .route("/files/{domain}/delete", delete(delete_entry))
+        .route("/files/{domain}/delete-batch", post(delete_batch))
+        .route("/files/{domain}/extract", post(extract_archive))
+        .route("/files/{domain}/compress", post(compress_entries))
+        .route("/files/{domain}/copy", post(copy_entry))
+        .route("/files/{domain}/move", post(move_entries))
+        .route("/files/{domain}/chmod", post(chmod_entry))
+        .route("/files/{domain}/chown", post(chown_entry))
 }
