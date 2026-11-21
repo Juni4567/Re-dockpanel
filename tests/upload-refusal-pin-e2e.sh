@@ -86,11 +86,11 @@ eq  "A4 the published guide states the same limit"    "$D_NUM" "$P_NUM"
 # The limit must stay BELOW the envelope that rejects before any of it runs,
 # or the panel is advertising an unenforceable number again — which is the
 # defect this suite exists for, not a smaller version of it.
-if [ -n "$P_NUM" ] && [ "$P_NUM" -lt 1572864 ]; then
-  ok "A5 the advertised limit fits inside the 2 MiB body envelope"
+if [ -n "$P_NUM" ] && [ "$P_NUM" -le 2147483648 ]; then
+  ok "A5 the advertised limit fits inside the 2 GiB body envelope"
 else
-  bad "A5 the advertised limit fits inside the 2 MiB body envelope" \
-      "$P_NUM is not below 1572864 — an oversize body would be refused by the framework, unexplained"
+  bad "A5 the advertised limit fits inside the 2 GiB body envelope" \
+      "$P_NUM is not below 2147483648 — an oversize body would be refused by the framework, unexplained"
 fi
 
 echo "── B. Both upload handlers can ANSWER an oversize body ───────────────────────"

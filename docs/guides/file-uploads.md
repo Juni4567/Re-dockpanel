@@ -19,10 +19,10 @@ This guide says plainly what it can and cannot do, and what to use instead.
 The number is worth explaining, because it is derived rather than chosen.
 
 An upload is base64-encoded and sent inside a JSON request. The request body is
-capped at 2 MiB, and base64 costs a third in overhead, so **the file itself can
-be about 1.5 MB** (2 MiB × ¾ ≈ 1,572,864 bytes, published and enforced as
-1,500,000 to leave room for the path and filename, which travel in the same
-body). The same 2 MiB cap applies again on the hop between the panel and the
+capped at 2 GiB, and base64 costs a third in overhead, so **the file itself can
+be about 1.5 GB** (2 GiB × ¾ ≈ 1,610,612,736 bytes, published and enforced as
+1,073,741,824 to leave room for the path and filename, which travel in the same
+body). The same 2 GiB cap applies again on the hop between the panel and the
 agent, so both would have to change together.
 
 **You are told before you spend the upload.** Since v2.137.0 the browser checks

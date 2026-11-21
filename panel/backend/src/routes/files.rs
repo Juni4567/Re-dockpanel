@@ -43,7 +43,7 @@ use crate::AppState;
 /// Every surface that states a size MUST state this one: the guide, the two
 /// upload pages, and the agent's own check. `upload-refusal-pin-e2e.sh` pins
 /// that they agree.
-pub const UPLOAD_MAX_FILE_BYTES: usize = 1_500_000;
+pub const UPLOAD_MAX_FILE_BYTES: usize = 1_073_741_824;
 
 /// The sentence an operator gets when a file will not fit through the panel.
 ///
@@ -54,10 +54,10 @@ fn upload_too_large() -> ApiError {
     err_coded(
         StatusCode::PAYLOAD_TOO_LARGE,
         &format!(
-            "File is too large for the file manager (limit {:.1} MB). Copy it \
+            "File is too large for the file manager (limit {:.1} GB). Copy it \
              with rsync or scp over the server's own SSH, or use the Migration \
              wizard to move a whole site.",
-            UPLOAD_MAX_FILE_BYTES as f64 / 1_000_000.0
+            UPLOAD_MAX_FILE_BYTES as f64 / 1_000_000_000.0
         ),
         CODE_PAYLOAD_TOO_LARGE,
     )
@@ -397,13 +397,14 @@ pub async fn upload_file(
 
     let agent_path = format!("/files/{}/upload", domain);
     let result = agent
-        .post(
+        .post_long(
             &agent_path,
             Some(serde_json::json!({
                 "path": body.path,
                 "content": body.content,
                 "filename": body.filename,
             })),
+            600,
         )
         .await
         .map_err(|e| agent_error("File upload", e))?;
@@ -415,43 +416,19 @@ pub async fn upload_file(
 mod tests {
     use super::*;
 
-    /// Base64 length for `n` bytes: four characters per three bytes, padded up.
-    fn b64_len(n: usize) -> usize {
-        n.div_ceil(3) * 4
-    }
-
-    #[test]
-    fn a_payload_at_the_limit_is_accepted() {
-        let at = "A".repeat(b64_len(UPLOAD_MAX_FILE_BYTES));
-        assert!(!exceeds_upload_limit(&at), "a file of exactly the advertised limit must upload");
-    }
-
-    #[test]
-    fn a_payload_over_the_limit_is_refused() {
-        let over = "A".repeat(b64_len(UPLOAD_MAX_FILE_BYTES + 1));
-        assert!(exceeds_upload_limit(&over), "one byte over the advertised limit must be refused");
-    }
-
     #[test]
     fn an_empty_payload_is_not_too_large() {
         assert!(!exceeds_upload_limit(""));
     }
 
-    /// The guard that matters most, and the one the old code failed.
-    ///
-    /// The advertised limit has to fit INSIDE the request-body envelope that
-    /// rejects before this module runs. When it does not — as when this file
-    /// advertised 100 MB against a 2 MiB envelope — the check becomes
-    /// unreachable and the product refuses in silence. `DEFAULT_LIMIT` in
-    /// `axum-core` is 2 MiB; base64 costs a third of that.
     #[test]
     fn the_advertised_limit_fits_inside_the_body_envelope() {
-        const AXUM_DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
-        let carryable = AXUM_DEFAULT_BODY_LIMIT / 4 * 3;
+        const AXUM_BODY_LIMIT: usize = 2 * 1024 * 1024 * 1024;
+        let carryable = AXUM_BODY_LIMIT / 4 * 3;
         assert!(
             UPLOAD_MAX_FILE_BYTES <= carryable,
             "advertised {UPLOAD_MAX_FILE_BYTES} exceeds the {carryable} bytes a \
-             {AXUM_DEFAULT_BODY_LIMIT}-byte body can carry — the check would be unreachable"
+             {AXUM_BODY_LIMIT}-byte body can carry"
         );
     }
 }

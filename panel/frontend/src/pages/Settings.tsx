@@ -1717,9 +1717,9 @@ export default function Settings() {
             <div className="px-5 py-3 flex items-center justify-between">
               <div>
                 <p className="text-sm text-dark-100">Site Creation Rate Limit</p>
-                <p className="text-xs text-dark-400">Max sites one user may create per hour (default: 3, 0 = no limit)</p>
+                <p className="text-xs text-dark-400">Max sites one user may create per hour (default: 10, 0 = no limit)</p>
               </div>
-              <input type="number" min="0" max="999" value={settings.security_site_rate_limit || "3"}
+              <input type="number" min="0" max="999" value={settings.security_site_rate_limit || "10"}
                 onChange={async (e) => {
                   try {
                     await api.put("/settings", { security_site_rate_limit: e.target.value });

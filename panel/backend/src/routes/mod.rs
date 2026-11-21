@@ -1163,7 +1163,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/files/read", get(files::read_file))
         .route("/api/sites/{id}/files/download", get(files::download_file))
         .route("/api/sites/{id}/files/write", put(files::write_file))
-        .route("/api/sites/{id}/files/upload", post(files::upload_file))
+        .route(
+            "/api/sites/{id}/files/upload",
+            post(files::upload_file).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+        )
         .route("/api/sites/{id}/files/create", post(files::create_entry))
         .route("/api/sites/{id}/files/rename", post(files::rename_entry))
         // Backups

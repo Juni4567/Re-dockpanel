@@ -31,7 +31,7 @@ fn ok(msg: &str) -> Json<serde_json::Value> {
 /// is a second axum service with the same 2 MiB default request-body limit, so
 /// an oversize upload was refused by the framework, in plain text, before this
 /// handler ran. Two services, two unreachable numbers, one silent failure.
-const UPLOAD_MAX_FILE_BYTES: usize = 1_500_000;
+const UPLOAD_MAX_FILE_BYTES: usize = 1_073_741_824;
 
 /// The refusal, worded as the panel words it — an agent 4xx is passed through
 /// to the operator verbatim by `error.rs::agent_error`, so this sentence is
@@ -40,10 +40,10 @@ fn upload_too_large() -> ApiErr {
     err(
         StatusCode::PAYLOAD_TOO_LARGE,
         &format!(
-            "File is too large for the file manager (limit {:.1} MB). Copy it \
+            "File is too large for the file manager (limit {:.1} GB). Copy it \
              with rsync or scp over the server's own SSH, or use the Migration \
              wizard to move a whole site.",
-            UPLOAD_MAX_FILE_BYTES as f64 / 1_000_000.0
+            UPLOAD_MAX_FILE_BYTES as f64 / 1_000_000_000.0
         ),
     )
 }
@@ -51,7 +51,10 @@ fn upload_too_large() -> ApiErr {
 pub fn router() -> Router<AppState> {
     Router::new()
         // File upload (binary)
-        .route("/files/{domain}/upload", post(file_upload))
+        .route(
+            "/files/{domain}/upload",
+            post(file_upload).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+        )
         // SSH keys
         .route("/ssh-keys", get(list_ssh_keys).post(add_ssh_key))
         .route("/ssh-keys/{fingerprint}", delete(remove_ssh_key))

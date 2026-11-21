@@ -11,13 +11,14 @@
  * and again on the hop to the agent. Checking it here is what turns a long
  * upload ending in "1 failed" into an immediate sentence naming the limit.
  */
-export const UPLOAD_MAX_FILE_BYTES = 1_500_000;
+export const UPLOAD_MAX_FILE_BYTES = 1_073_741_824;
 
 /** The refusal, worded the way the server words it. */
 export function uploadTooLargeMessage(fileName: string, size: number): string {
+  const sizeMB = (size / 1_000_000).toFixed(1);
   return (
-    `${fileName} is ${(size / 1_000_000).toFixed(1)} MB — too large for the file ` +
-    `manager (limit ${(UPLOAD_MAX_FILE_BYTES / 1_000_000).toFixed(1)} MB). Copy it ` +
+    `${fileName} is ${sizeMB} MB — too large for the file ` +
+    `manager (limit 1.0 GB). Copy it ` +
     `with rsync or scp over the server's own SSH, or use the Migration wizard ` +
     `to move a whole site.`
   );
