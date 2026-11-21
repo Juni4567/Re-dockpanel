@@ -95,6 +95,12 @@ function AdvancedDatabaseManager({
   const [fkColumns, setFkColumns] = useState<string[]>([]);
   const [tablesLoading, setTablesLoading] = useState(true);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
+  const [selectedTables, setSelectedTables] = useState<string[]>([]);
+  const [tableSearch, setTableSearch] = useState("");
+
+  const filteredTables = tables.filter((t) =>
+    t.toLowerCase().includes(tableSearch.toLowerCase())
+  );
 
   // Common quote char for identifiers: Postgres uses double-quotes, MySQL/MariaDB backticks
   const q = database.engine === "postgres" ? '"' : "`";
@@ -264,6 +270,78 @@ function AdvancedDatabaseManager({
           loadTables();
         } catch (e) {
           showGlobalNotification("error", e instanceof Error ? e.message : "Drop table failed");
+        } finally {
+          setConfirmModal(null);
+        }
+      },
+    });
+  };
+
+  const handleBulkDropTables = () => {
+    if (selectedTables.length === 0) return;
+    const count = selectedTables.length;
+    const tablePreview = selectedTables.slice(0, 8).join(", ") + (count > 8 ? ` and ${count - 8} more` : "");
+    setConfirmModal({
+      title: `Drop ${count} Tables?`,
+      label: `Are you sure you want to permanently DROP ${count} selected tables from "${database.name}"?`,
+      consequences: [
+        `Permanently deletes the following ${count} tables: ${tablePreview}`,
+        "All table definitions, stored rows, schemas, column indexes, and constraints will be completely erased",
+        "Any applications, APIs, or foreign key constraints referencing these tables will immediately fail",
+        "This action is completely IRREVERSIBLE without a recent database backup",
+      ],
+      confirmLabel: `Permanently Drop ${count} Tables`,
+      onConfirm: async () => {
+        try {
+          const tableList = selectedTables.map((t) => `${q}${t}${q}`).join(", ");
+          const sql = database.engine === "postgres"
+            ? `DROP TABLE IF EXISTS ${tableList} CASCADE`
+            : `DROP TABLE IF EXISTS ${tableList}`;
+          await api.post(`/databases/${database.id}/query`, { sql });
+          showGlobalNotification("success", `Successfully dropped ${count} tables`);
+          if (selectedTable && selectedTables.includes(selectedTable)) {
+            setSelectedTable(null);
+          }
+          setSelectedTables([]);
+          await loadTables();
+        } catch (e) {
+          showGlobalNotification("error", e instanceof Error ? e.message : "Drop tables failed");
+        } finally {
+          setConfirmModal(null);
+        }
+      },
+    });
+  };
+
+  const handleBulkTruncateTables = () => {
+    if (selectedTables.length === 0) return;
+    const count = selectedTables.length;
+    const tablePreview = selectedTables.slice(0, 8).join(", ") + (count > 8 ? ` and ${count - 8} more` : "");
+    setConfirmModal({
+      title: `Truncate ${count} Tables?`,
+      label: `Are you sure you want to empty (truncate) ${count} selected tables?`,
+      consequences: [
+        `Erases ALL data rows inside the following ${count} tables: ${tablePreview}`,
+        "Auto-increment primary keys will be reset to 1",
+        "Cannot be undone unless you have a recent database backup",
+      ],
+      confirmLabel: `Truncate ${count} Tables`,
+      onConfirm: async () => {
+        try {
+          if (database.engine === "postgres") {
+            const tableList = selectedTables.map((t) => `${q}${t}${q}`).join(", ");
+            await api.post(`/databases/${database.id}/query`, { sql: `TRUNCATE TABLE ${tableList} CASCADE` });
+          } else {
+            for (const t of selectedTables) {
+              await api.post(`/databases/${database.id}/query`, { sql: `TRUNCATE TABLE ${q}${t}${q}` });
+            }
+          }
+          showGlobalNotification("success", `Successfully truncated ${count} tables`);
+          loadBrowseData();
+          await loadTables();
+          setSelectedTables([]);
+        } catch (e) {
+          showGlobalNotification("error", e instanceof Error ? e.message : "Truncate tables failed");
         } finally {
           setConfirmModal(null);
         }
@@ -733,31 +811,89 @@ function AdvancedDatabaseManager({
       <div className="flex gap-4" style={{ minHeight: "calc(100vh - 240px)" }}>
         {/* Left Sidebar (Only for Browse & Structure) */}
         {(activeTab === "browse" || activeTab === "structure") && (
-          <div className="w-60 shrink-0 bg-dark-800 rounded-lg border border-dark-600 overflow-hidden flex flex-col">
-            <div className="px-3.5 py-3 border-b border-dark-600 flex items-center justify-between">
-              <span className="text-xs font-semibold text-dark-300 uppercase font-mono tracking-wider">
-                Tables ({tables.length})
-              </span>
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => setShowCreateTableModal(true)}
-                  className="p-1 rounded hover:bg-dark-700 text-rust-400 hover:text-rust-300 transition-colors"
-                  title="Create new table"
-                >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-                  </svg>
-                </button>
-                <button
-                  onClick={loadTables}
-                  className="p-1 rounded hover:bg-dark-700 text-dark-400 hover:text-dark-200 transition-colors"
-                  title="Refresh tables"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182" />
-                  </svg>
-                </button>
+          <div className="w-64 shrink-0 bg-dark-800 rounded-lg border border-dark-600 overflow-hidden flex flex-col">
+            <div className="px-3.5 py-3 border-b border-dark-600 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-dark-300 uppercase font-mono tracking-wider">
+                  Tables ({filteredTables.length}{tables.length !== filteredTables.length ? ` / ${tables.length}` : ""})
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => setShowCreateTableModal(true)}
+                    className="p-1 rounded hover:bg-dark-700 text-rust-400 hover:text-rust-300 transition-colors"
+                    title="Create new table"
+                  >
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={loadTables}
+                    className="p-1 rounded hover:bg-dark-700 text-dark-400 hover:text-dark-200 transition-colors"
+                    title="Refresh tables"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182" />
+                    </svg>
+                  </button>
+                </div>
               </div>
+
+              {/* Table search filter */}
+              {tables.length > 5 && (
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={tableSearch}
+                    onChange={(e) => setTableSearch(e.target.value)}
+                    placeholder="Filter tables..."
+                    className="w-full bg-dark-900 border border-dark-600 rounded px-2.5 py-1 text-xs font-mono text-dark-100 placeholder-dark-500 focus:outline-none focus:border-rust-500"
+                  />
+                  {tableSearch && (
+                    <button
+                      onClick={() => setTableSearch("")}
+                      className="absolute right-2 top-1 text-dark-400 hover:text-dark-200 text-xs"
+                    >
+                      &times;
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Select All Checkbox */}
+              {filteredTables.length > 0 && (
+                <div className="flex items-center justify-between pt-1 border-t border-dark-700/60 text-xs text-dark-400">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={
+                        filteredTables.length > 0 &&
+                        filteredTables.every((t) => selectedTables.includes(t))
+                      }
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          const allFiltered = Array.from(new Set([...selectedTables, ...filteredTables]));
+                          setSelectedTables(allFiltered);
+                        } else {
+                          setSelectedTables((prev) => prev.filter((t) => !filteredTables.includes(t)));
+                        }
+                      }}
+                      className="rounded border-dark-600 text-rust-500 focus:ring-0 bg-dark-900 cursor-pointer"
+                    />
+                    <span className="text-[11px] font-mono">
+                      {selectedTables.length > 0 ? `${selectedTables.length} selected` : "Select All"}
+                    </span>
+                  </label>
+                  {selectedTables.length > 0 && (
+                    <button
+                      onClick={() => setSelectedTables([])}
+                      className="text-[11px] text-dark-400 hover:text-dark-200"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="overflow-y-auto flex-1 p-1 space-y-0.5">
@@ -767,44 +903,101 @@ function AdvancedDatabaseManager({
                     <div key={i} className="h-6 bg-dark-700/60 rounded animate-pulse" />
                   ))}
                 </div>
-              ) : tables.length === 0 ? (
+              ) : filteredTables.length === 0 ? (
                 <div className="text-center py-8 text-xs text-dark-400">
-                  No tables found.<br />
-                  <button
-                    onClick={() => setShowCreateTableModal(true)}
-                    className="mt-2 text-rust-400 hover:underline"
-                  >
-                    + Create table
-                  </button>
+                  {tables.length === 0 ? (
+                    <>
+                      No tables found.<br />
+                      <button
+                        onClick={() => setShowCreateTableModal(true)}
+                        className="mt-2 text-rust-400 hover:underline"
+                      >
+                        + Create table
+                      </button>
+                    </>
+                  ) : (
+                    <>No tables matching &quot;{tableSearch}&quot;</>
+                  )}
                 </div>
               ) : (
-                tables.map((t) => {
+                filteredTables.map((t) => {
                   const detail = tableDetails[t];
                   const isSelected = selectedTable === t;
+                  const isChecked = selectedTables.includes(t);
                   return (
-                    <button
+                    <div
                       key={t}
-                      onClick={() => {
-                        setSelectedTable(t);
-                        setBrowsePage(0);
-                      }}
-                      className={`w-full text-left px-2.5 py-2 rounded text-xs font-mono transition-colors flex items-center justify-between ${
+                      className={`group flex items-center gap-2 px-2 py-1.5 rounded text-xs font-mono transition-colors ${
                         isSelected
                           ? "bg-rust-500/15 text-rust-400 font-semibold border border-rust-500/30"
                           : "text-dark-200 hover:bg-dark-700 hover:text-dark-50"
                       }`}
                     >
-                      <span className="truncate">{t}</span>
-                      {detail && (
-                        <span className="text-[10px] text-dark-400 font-mono shrink-0 ml-1.5">
-                          {detail.rows}r
-                        </span>
-                      )}
-                    </button>
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={(e) => {
+                          e.stopPropagation();
+                          if (e.target.checked) {
+                            setSelectedTables((prev) => [...prev, t]);
+                          } else {
+                            setSelectedTables((prev) => prev.filter((item) => item !== t));
+                          }
+                        }}
+                        className="rounded border-dark-600 text-rust-500 focus:ring-0 bg-dark-900 shrink-0 cursor-pointer"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedTable(t);
+                          setBrowsePage(0);
+                        }}
+                        className="flex-1 min-w-0 text-left flex items-center justify-between"
+                      >
+                        <span className="truncate">{t}</span>
+                        {detail && (
+                          <span className="text-[10px] text-dark-400 font-mono shrink-0 ml-1.5">
+                            {detail.rows}r
+                          </span>
+                        )}
+                      </button>
+                    </div>
                   );
                 })
               )}
             </div>
+
+            {/* Bulk Action Footer */}
+            {selectedTables.length > 0 && (
+              <div className="p-2.5 border-t border-dark-600 bg-dark-900/90 space-y-2">
+                <div className="text-[11px] font-mono text-dark-200 font-semibold flex items-center justify-between">
+                  <span>Selected: {selectedTables.length} table{selectedTables.length !== 1 ? "s" : ""}</span>
+                  <button
+                    onClick={() => setSelectedTables([])}
+                    className="text-[10px] text-dark-400 hover:text-dark-200"
+                  >
+                    Deselect
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    onClick={handleBulkTruncateTables}
+                    className="px-2 py-1 text-[11px] rounded bg-warn-500/15 text-warn-400 hover:bg-warn-500/25 border border-warn-500/30 font-medium transition-colors"
+                  >
+                    Truncate
+                  </button>
+                  <button
+                    onClick={handleBulkDropTables}
+                    className="px-2 py-1 text-[11px] rounded bg-danger-500/20 text-danger-400 hover:bg-danger-500/30 border border-danger-500/40 font-medium transition-colors flex items-center justify-center gap-1"
+                  >
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
+                    </svg>
+                    Drop ({selectedTables.length})
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
