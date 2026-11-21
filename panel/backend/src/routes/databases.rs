@@ -1422,7 +1422,7 @@ pub async fn import(
                 "Database import agent error: {e:?}"
             );
             agent_error("Database import", e)
-        })?,,
+        })?,
         Err(_elapsed) => {
             tracing::warn!(
                 database = %name, filename = %filename,
