@@ -9,7 +9,11 @@ pub struct SiteInfo {
 
 pub fn list_nginx_sites() -> Vec<SiteInfo> {
     let mut sites = Vec::new();
-    let sites_dir = std::path::Path::new("/etc/nginx/sites-enabled");
+    let sites_dir = if std::path::Path::new("/etc/nginx/sites-enabled").is_dir() {
+        std::path::Path::new("/etc/nginx/sites-enabled")
+    } else {
+        std::path::Path::new("/etc/nginx/conf.d")
+    };
 
     let dir = match std::fs::read_dir(sites_dir) {
         Ok(d) => d,
@@ -45,7 +49,15 @@ pub fn list_nginx_sites() -> Vec<SiteInfo> {
                 continue;
             }
 
-            let ssl = content.contains("ssl_certificate");
+            let mut ssl = content.contains("ssl_certificate");
+            if !ssl {
+                let cert_path = format!("/etc/dockpanel/ssl/{domain}/fullchain.pem");
+                let key_path = format!("/etc/dockpanel/ssl/{domain}/privkey.pem");
+                if std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists() {
+                    ssl = true;
+                }
+            }
+
             let runtime = if content.contains("proxy_pass") {
                 "proxy"
             } else if content.contains("fastcgi_pass") || content.contains("php") {

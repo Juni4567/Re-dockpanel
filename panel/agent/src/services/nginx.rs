@@ -788,7 +788,12 @@ pub fn render_site_config(
     // Bot protection
     ctx.insert("bot_protection", &config.bot_protection.as_deref().unwrap_or("off"));
 
-    let ssl = config.ssl.unwrap_or(false);
+    let cert_path = format!("/etc/dockpanel/ssl/{domain}/fullchain.pem");
+    let key_path = format!("/etc/dockpanel/ssl/{domain}/privkey.pem");
+    let certs_exist = std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists();
+
+    // If ssl option is omitted (None), preserve SSL if valid certificates exist on disk
+    let ssl = config.ssl.unwrap_or(certs_exist);
     ctx.insert("ssl", &ssl);
 
     if ssl {
@@ -797,14 +802,14 @@ pub fn render_site_config(
             config
                 .ssl_cert
                 .as_deref()
-                .unwrap_or(&format!("/etc/dockpanel/ssl/{domain}/fullchain.pem")),
+                .unwrap_or(&cert_path),
         );
         ctx.insert(
             "ssl_key",
             config
                 .ssl_key
                 .as_deref()
-                .unwrap_or(&format!("/etc/dockpanel/ssl/{domain}/privkey.pem")),
+                .unwrap_or(&key_path),
         );
     }
 
