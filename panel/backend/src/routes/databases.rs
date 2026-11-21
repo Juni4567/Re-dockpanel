@@ -1337,6 +1337,7 @@ fn import_blocked_reason(filename: &str, engine: &str) -> Option<String> {
 
 #[derive(serde::Deserialize)]
 pub struct ImportDbRequest {
+    #[serde(alias = "file_name", alias = "file", alias = "dump")]
     pub filename: String,
 }
 
@@ -1468,8 +1469,11 @@ pub async fn import(
 
 #[derive(serde::Deserialize)]
 pub struct UploadDumpRequest {
+    #[serde(alias = "file_name", alias = "name")]
     pub filename: String,
+    #[serde(alias = "content_base64", alias = "base64", alias = "data")]
     pub content: String,
+    #[serde(default, alias = "autoImport")]
     pub auto_import: Option<bool>,
 }
 
@@ -1517,9 +1521,14 @@ pub async fn upload_dump(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid filename"));
     }
 
+    let trimmed_content = body.content.trim().replace(['\r', '\n', ' '], "");
     let decoded_bytes = base64::engine::general_purpose::STANDARD
-        .decode(body.content.trim())
-        .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid base64 encoding"))?;
+        .decode(&trimmed_content)
+        .or_else(|_| {
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(&trimmed_content)
+        })
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("Invalid base64 encoding: {e}")))?;
 
     if decoded_bytes.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "File is empty"));
@@ -1550,7 +1559,7 @@ pub async fn upload_dump(
         .await
         .map_err(|e| internal_error("write dump file", e))?;
 
-    // If file is plain SQL and not gzipped, compress it with gzip
+    // If file is plain SQL and not gzipped, compress it with gzip and delete plain file
     let final_filename = if !is_gzipped && target_filename.ends_with(".sql") {
         let gz_path = format!("{target_path}.gz");
         let gz_status = tokio::process::Command::new("gzip")
@@ -1561,6 +1570,7 @@ pub async fn upload_dump(
         match gz_status {
             Ok(output) if output.status.success() && !output.stdout.is_empty() => {
                 let _ = tokio::fs::write(&gz_path, &output.stdout).await;
+                let _ = tokio::fs::remove_file(&target_path).await;
                 format!("{target_filename}.gz")
             }
             _ => target_filename,

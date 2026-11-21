@@ -588,6 +588,7 @@ function AdvancedDatabaseManager({
 
         await api.post(`/databases/${database.id}/upload-dump`, {
           filename: file.name,
+          content: base64Content,
           content_base64: base64Content,
           auto_import: autoImportUpload,
         });
@@ -603,7 +604,8 @@ function AdvancedDatabaseManager({
         loadDumps();
         loadTables();
       } catch (err) {
-        showGlobalNotification("error", err instanceof Error ? err.message : "Upload failed");
+        const msg = err instanceof ApiError ? err.message : err instanceof Error ? err.message : "Upload failed";
+        showGlobalNotification("error", msg);
       } finally {
         setTimeout(() => {
           setUploadProgress(null);
@@ -640,7 +642,8 @@ function AdvancedDatabaseManager({
           loadTables();
           loadBrowseData();
         } catch (e) {
-          showGlobalNotification("error", e instanceof Error ? e.message : "Import failed");
+          const msg = e instanceof ApiError ? e.message : e instanceof Error ? e.message : "Import failed";
+          showGlobalNotification("error", msg);
         } finally {
           setImportingDump(null);
           setConfirmModal(null);
