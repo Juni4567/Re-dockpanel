@@ -454,8 +454,23 @@ pub async fn provision_cert(
     }
 
     // Create order with optional profile + ARI replaces hint
-    let identifier = Identifier::Dns(domain.to_string());
-    let identifiers = [identifier];
+    let mut identifiers = vec![Identifier::Dns(domain.to_string())];
+    let counterpart = if domain.starts_with("www.") {
+        Some(domain.trim_start_matches("www.").to_string())
+    } else if domain.split('.').count() == 2 {
+        Some(format!("www.{domain}"))
+    } else {
+        None
+    };
+
+    if let Some(ref cp) = counterpart {
+        if let Ok(addrs) = tokio::net::lookup_host(format!("{cp}:80")).await {
+            let server_ip = crate::services::nginx::detect_bind_ip();
+            if addrs.into_iter().any(|sa| sa.ip().to_string() == server_ip) {
+                identifiers.push(Identifier::Dns(cp.clone()));
+            }
+        }
+    }
     let mut new_order = NewOrder::new(&identifiers);
     if let Some(o) = opts {
         if let Some(p) = o.profile {

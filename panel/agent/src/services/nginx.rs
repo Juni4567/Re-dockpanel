@@ -499,7 +499,7 @@ pub async fn retrofit_static_denies() {
 
 /// Detect the server's primary (non-loopback, non-docker) interface IP for nginx listen directives.
 /// Returns empty string if detection fails (templates fall back to wildcard listen).
-fn detect_bind_ip() -> String {
+pub fn detect_bind_ip() -> String {
     use std::net::UdpSocket;
     // Connect to a public IP (doesn't actually send data) to find the outbound interface
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
@@ -744,6 +744,14 @@ pub fn render_site_config(
 
     let mut ctx = Context::new();
     ctx.insert("domain", domain);
+    let counterpart = if domain.starts_with("www.") {
+        Some(domain.trim_start_matches("www.").to_string())
+    } else if domain.split('.').count() == 2 {
+        Some(format!("www.{domain}"))
+    } else {
+        None
+    };
+    ctx.insert("counterpart", &counterpart);
     ctx.insert("root", config.root.as_deref().unwrap_or("/var/www"));
     ctx.insert("bind_ip", &detect_bind_ip());
     ctx.insert("runtime", &config.runtime);
