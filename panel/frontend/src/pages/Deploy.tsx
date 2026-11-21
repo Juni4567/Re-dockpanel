@@ -1,9 +1,18 @@
 import { useState, useEffect } from "react";
 import { useParams, Link } from "react-router-dom";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import ProvisionLog from "../components/ProvisionLog";
 import ConfirmDialog from "../components/ConfirmDialog";
+
+interface ActiveIncidentInfo {
+  id: string;
+  title: string;
+  status: string;
+  severity: string;
+  description: string | null;
+  started_at: string;
+}
 
 interface DeployConfig {
   id: string;
@@ -51,6 +60,10 @@ export default function Deploy() {
   const [saving, setSaving] = useState(false);
   const [deploying, setDeploying] = useState(false);
   const [deployId, setDeployId] = useState<string | null>(null);
+  const [activeIncidentBlock, setActiveIncidentBlock] = useState<{
+    incidents: ActiveIncidentInfo[];
+    message: string;
+  } | null>(null);
   const [generatingKey, setGeneratingKey] = useState(false);
   const [rollingBack, setRollingBack] = useState<string | null>(null);
   const [message, setMessage] = useState({ text: "", type: "" });
@@ -144,20 +157,30 @@ export default function Deploy() {
     }
   };
 
-  const handleDeploy = async () => {
+  const handleDeploy = async (force = false) => {
     setDeploying(true);
     setMessage({ text: "", type: "" });
     try {
-      const result = await api.post<{ deploy_id?: string }>(`/sites/${id}/deploy/trigger`);
+      const url = force ? `/sites/${id}/deploy/trigger?force=true` : `/sites/${id}/deploy/trigger`;
+      const result = await api.post<{ deploy_id?: string }>(url);
       if (result.deploy_id) {
         setDeployId(result.deploy_id);
+        setActiveIncidentBlock(null);
       } else {
         setMessage({ text: "Deployment completed.", type: "success" });
         setDeploying(false);
+        setActiveIncidentBlock(null);
         await load();
       }
     } catch (err) {
-      setMessage({ text: err instanceof Error ? err.message : "Deploy failed", type: "error" });
+      if (err instanceof ApiError && err.code === "active_incidents" && Array.isArray((err.body as any)?.incidents)) {
+        setActiveIncidentBlock({
+          incidents: (err.body as any).incidents as ActiveIncidentInfo[],
+          message: err.message,
+        });
+      } else {
+        setMessage({ text: err instanceof Error ? err.message : "Deploy failed", type: "error" });
+      }
       setDeploying(false);
     }
   };
@@ -271,6 +294,104 @@ export default function Deploy() {
           </div>
         )}
       </div>
+
+      {/* Active Incident Blocker Panel */}
+      {activeIncidentBlock && (
+        <div className="p-4 rounded-lg border border-danger-500/30 bg-danger-500/10 space-y-3" role="alert">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded text-xs font-mono font-medium bg-danger-500/20 text-danger-400 uppercase">
+                  Deploy Blocked by Incident
+                </span>
+                <span className="text-xs text-dark-300">
+                  {activeIncidentBlock.incidents.length} active incident(s) in progress
+                </span>
+              </div>
+              <p className="text-sm text-dark-100 mt-2 font-medium">
+                Deploys are normally paused during active outages. You can review the incident details below, resolve or dismiss the incident, or force the deployment to proceed immediately.
+              </p>
+            </div>
+            <button
+              onClick={() => setActiveIncidentBlock(null)}
+              className="text-xs text-dark-400 hover:text-dark-200"
+              aria-label="Dismiss"
+            >
+              &times;
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {activeIncidentBlock.incidents.map((inc) => (
+              <div key={inc.id} className="p-3 bg-dark-900/80 rounded border border-dark-600 text-xs space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-dark-50">{inc.title}</span>
+                  <div className="flex items-center gap-2">
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono uppercase ${
+                      inc.severity === "critical" ? "bg-danger-500/20 text-danger-400" : "bg-warn-500/20 text-warn-400"
+                    }`}>
+                      {inc.severity}
+                    </span>
+                    <span className="text-dark-300 capitalize">Status: {inc.status}</span>
+                  </div>
+                </div>
+                {inc.description && (
+                  <p className="text-dark-300 font-mono text-[11px] break-all bg-dark-950/60 p-2 rounded border border-dark-700/40">
+                    {inc.description}
+                  </p>
+                )}
+                <div className="flex items-center justify-between pt-1 border-t border-dark-700/50 mt-1">
+                  <span className="text-dark-400 text-[10px]">Started: {new Date(inc.started_at).toLocaleString()}</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await api.put(`/incidents/${inc.id}`, { status: "resolved" });
+                          setMessage({ text: `Incident "${inc.title}" resolved. Triggering deploy...`, type: "success" });
+                          setActiveIncidentBlock(null);
+                          handleDeploy(true);
+                        } catch (e) {
+                          setMessage({ text: e instanceof Error ? e.message : "Failed to resolve incident", type: "error" });
+                        }
+                      }}
+                      className="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs transition-colors"
+                    >
+                      Resolve & Deploy
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          await api.delete(`/incidents/${inc.id}`);
+                          setMessage({ text: `Incident "${inc.title}" deleted. Triggering deploy...`, type: "success" });
+                          setActiveIncidentBlock(null);
+                          handleDeploy(true);
+                        } catch (e) {
+                          setMessage({ text: e instanceof Error ? e.message : "Failed to delete incident", type: "error" });
+                        }
+                      }}
+                      className="px-2.5 py-1 bg-danger-500/20 hover:bg-danger-500/30 text-danger-300 rounded text-xs transition-colors"
+                    >
+                      Delete Incident
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex items-center justify-end gap-3 pt-1">
+            <button
+              type="button"
+              onClick={() => handleDeploy(true)}
+              className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-sm font-medium transition-colors"
+            >
+              Force Deploy Anyway
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Message */}
       {message.text && (

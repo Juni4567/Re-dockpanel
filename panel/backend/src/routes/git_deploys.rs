@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     Json,
@@ -33,6 +33,36 @@ use crate::AppState;
 /// panel side. Refused up front via `require_agent_at_least`, mirroring
 /// `PROVIDED_TLS_MIN_AGENT` — same reasoning, same failure shape.
 pub(crate) const PRE_BUILD_SPLICE_MIN_AGENT: &str = "2.182.0";
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct DeployTriggerQuery {
+    pub force: Option<bool>,
+}
+
+impl DeployTriggerQuery {
+    pub fn is_forced(&self) -> bool {
+        self.force.unwrap_or(false)
+    }
+}
+
+/// Injects GitHub access token into HTTPS repository URLs if configured, allowing
+/// seamless authentication for private GitHub repositories during clone.
+pub(crate) fn authenticated_repo_url(repo_url: &str, github_token: Option<&str>) -> String {
+    if let Some(token) = github_token {
+        if !token.is_empty() {
+            let decrypted = crate::services::secrets_crypto::decrypt_credential_from_env(token);
+            if (repo_url.starts_with("https://github.com/") || repo_url.starts_with("http://github.com/"))
+                && !repo_url.contains('@')
+            {
+                return repo_url.replace(
+                    "https://github.com/",
+                    &format!("https://x-access-token:{}@github.com/", decrypted),
+                );
+            }
+        }
+    }
+    repo_url.to_string()
+}
 
 /// The row plus the alias of the certificate it references, if any — mirrors
 /// `stacks::STACK_SELECT`: a LEFT JOIN because most deploys reference none,
@@ -1377,19 +1407,51 @@ pub async fn deploy(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
+    Query(query): Query<DeployTriggerQuery>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     require_admin(&claims.role)?;
 
-    // Check for active critical/major incidents — block deploy during outage
-    let active_incidents: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM managed_incidents \
-         WHERE status NOT IN ('resolved', 'postmortem') \
-         AND severity IN ('critical', 'major')"
-    ).fetch_one(&state.db).await.unwrap_or((0,));
+    // Check for active critical/major incidents unless forced by user
+    if !query.is_forced() {
+        #[derive(sqlx::FromRow, serde::Serialize)]
+        struct ActiveIncident {
+            id: Uuid,
+            title: String,
+            status: String,
+            severity: String,
+            description: Option<String>,
+            started_at: chrono::DateTime<chrono::Utc>,
+        }
 
-    if active_incidents.0 > 0 {
-        return Err(err(StatusCode::CONFLICT,
-            "Deploy blocked: active critical/major incident in progress. Resolve the incident first."));
+        let active_incidents: Vec<ActiveIncident> = sqlx::query_as(
+            "SELECT id, title, status, severity, description, started_at \
+             FROM managed_incidents \
+             WHERE status NOT IN ('resolved', 'postmortem') \
+             AND severity IN ('critical', 'major') \
+             ORDER BY started_at DESC LIMIT 5"
+        ).fetch_all(&state.db).await.unwrap_or_default();
+
+        if !active_incidents.is_empty() {
+            let details: Vec<String> = active_incidents.iter().map(|i| {
+                let d = i.description.as_deref().unwrap_or("No details");
+                let snippet = if d.len() > 120 { format!("{}...", &d[..120]) } else { d.to_string() };
+                format!("• [{}] \"{}\" ({}) — {}", i.severity.to_uppercase(), i.title, i.status, snippet)
+            }).collect();
+            let err_msg = format!(
+                "Deploy blocked: active critical/major incident in progress:\n{}\n\nResolve or dismiss the incident, or force the deployment to proceed.",
+                details.join("\n")
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": err_msg,
+                    "code": "active_incidents",
+                    "incidents": active_incidents,
+                }))
+            ));
+        }
+    } else {
+        tracing::info!("Git deploy proceeding despite active incidents: forced by user");
     }
 
     let config: GitDeploy = sqlx::query_as(
@@ -2469,9 +2531,10 @@ fn spawn_deploy_task(
         }
 
         // Build clone body
+        let clone_repo_url = authenticated_repo_url(&config.repo_url, config.github_token.as_deref());
         let mut clone_body = serde_json::json!({
             "name": config.name,
-            "repo_url": config.repo_url,
+            "repo_url": clone_repo_url,
             "branch": config.branch,
         });
         if let Some(ref key_path) = config.deploy_key_path {
@@ -3630,8 +3693,9 @@ pub async fn trigger_deploy_task(
     }
 
     // Clone
+    let clone_repo_url = authenticated_repo_url(&config.repo_url, config.github_token.as_deref());
     let mut clone_body = serde_json::json!({
-        "name": config.name, "repo_url": config.repo_url, "branch": config.branch,
+        "name": config.name, "repo_url": clone_repo_url, "branch": config.branch,
     });
     if let Some(ref key_path) = config.deploy_key_path {
         clone_body["key_path"] = serde_json::json!(key_path);
@@ -4209,9 +4273,10 @@ async fn handle_preview_deploy(
         }
 
         // Clone at preview branch
+        let clone_repo_url = authenticated_repo_url(&repo_url, github_token.as_deref());
         let mut clone_body = serde_json::json!({
             "name": format!("{name}-pr-{branch_slug}"),
-            "repo_url": repo_url,
+            "repo_url": clone_repo_url,
             "branch": branch,
             "scope": "preview",
         });

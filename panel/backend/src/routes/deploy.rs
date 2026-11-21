@@ -194,22 +194,65 @@ pub async fn remove_config(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct DeployTriggerQuery {
+    pub force: Option<bool>,
+}
+
+impl DeployTriggerQuery {
+    pub fn is_forced(&self) -> bool {
+        self.force.unwrap_or(false)
+    }
+}
+
 /// POST /api/sites/{id}/deploy/trigger — Trigger a deployment (async with SSE).
 pub async fn trigger(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
+    Query(query): Query<DeployTriggerQuery>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Check for active critical/major incidents — block deploy during outage
-    let active_incidents: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM managed_incidents \
-         WHERE status NOT IN ('resolved', 'postmortem') \
-         AND severity IN ('critical', 'major')"
-    ).fetch_one(&state.db).await.unwrap_or((0,));
+    // Check for active critical/major incidents unless forced by user
+    if !query.is_forced() {
+        #[derive(sqlx::FromRow, serde::Serialize)]
+        struct ActiveIncident {
+            id: Uuid,
+            title: String,
+            status: String,
+            severity: String,
+            description: Option<String>,
+            started_at: chrono::DateTime<chrono::Utc>,
+        }
 
-    if active_incidents.0 > 0 {
-        return Err(err(StatusCode::CONFLICT,
-            "Deploy blocked: active critical/major incident in progress. Resolve the incident first."));
+        let active_incidents: Vec<ActiveIncident> = sqlx::query_as(
+            "SELECT id, title, status, severity, description, started_at \
+             FROM managed_incidents \
+             WHERE status NOT IN ('resolved', 'postmortem') \
+             AND severity IN ('critical', 'major') \
+             ORDER BY started_at DESC LIMIT 5"
+        ).fetch_all(&state.db).await.unwrap_or_default();
+
+        if !active_incidents.is_empty() {
+            let details: Vec<String> = active_incidents.iter().map(|i| {
+                let d = i.description.as_deref().unwrap_or("No details");
+                let snippet = if d.len() > 120 { format!("{}...", &d[..120]) } else { d.to_string() };
+                format!("• [{}] \"{}\" ({}) — {}", i.severity.to_uppercase(), i.title, i.status, snippet)
+            }).collect();
+            let err_msg = format!(
+                "Deploy blocked: active critical/major incident in progress:\n{}\n\nResolve or dismiss the incident, or force the deployment to proceed.",
+                details.join("\n")
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": err_msg,
+                    "code": "active_incidents",
+                    "incidents": active_incidents,
+                }))
+            ));
+        }
+    } else {
+        tracing::info!("Site deploy proceeding despite active incidents: forced by user");
     }
 
     // The same rule the webhook path below already follows: this clones a repository into
