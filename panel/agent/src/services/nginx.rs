@@ -960,6 +960,14 @@ pub async fn test_config() -> Result<CmdOutput, std::io::Error> {
 
 /// Reload nginx gracefully.
 pub async fn reload() -> Result<(), String> {
+    // Try systemctl reload nginx first (recycles workers cleanly under systemd)
+    if let Ok(out) = safe_command("systemctl").args(["reload", "nginx"]).output().await {
+        if out.status.success() {
+            tracing::info!("Nginx reloaded successfully via systemctl");
+            return Ok(());
+        }
+    }
+
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         safe_command("nginx").args(["-s", "reload"]).output(),

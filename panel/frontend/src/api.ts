@@ -117,6 +117,77 @@ async function request<T = unknown>(
   return data as T;
 }
 
+function uploadWithProgress<T = unknown>(
+  path: string,
+  body: unknown,
+  onProgress?: (loaded: number, total: number) => void
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE}${path}`, true);
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.setRequestHeader("X-Requested-With", "DockPanel");
+
+    const serverId = localStorage.getItem("dp-active-server");
+    if (serverId) xhr.setRequestHeader("X-Server-Id", serverId);
+
+    xhr.withCredentials = true;
+
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          onProgress(event.loaded, event.total);
+        }
+      };
+    }
+
+    xhr.onload = () => {
+      let data: any = {};
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {}
+
+      if (xhr.status === 401) {
+        if (
+          data.code === CODE_SESSION_INVALID &&
+          !PUBLIC_PATHS.has(window.location.pathname)
+        ) {
+          window.location.href = "/login";
+        }
+        reject(
+          new ApiError(
+            401,
+            data.error || "Unauthorized",
+            data.code,
+            data
+          )
+        );
+        return;
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data as T);
+      } else {
+        let message = data.error || `Request failed (${xhr.status})`;
+        if (data.code === "agent_unreachable") {
+          message = "Agent offline — the DockPanel agent is not responding.";
+        }
+        reject(new ApiError(xhr.status, message, data.code, data));
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new ApiError(0, "Network error during upload"));
+    };
+
+    xhr.ontimeout = () => {
+      reject(new ApiError(408, "Upload timed out"));
+    };
+
+    xhr.send(JSON.stringify(body));
+  });
+}
+
 export const api = {
   get: <T = unknown>(path: string) => request<T>(path),
   post: <T = unknown>(path: string, body?: unknown) =>
@@ -131,4 +202,9 @@ export const api = {
     }),
   delete: <T = unknown>(path: string) =>
     request<T>(path, { method: "DELETE" }),
+  upload: <T = unknown>(
+    path: string,
+    body: unknown,
+    onProgress?: (loaded: number, total: number) => void
+  ) => uploadWithProgress<T>(path, body, onProgress),
 };

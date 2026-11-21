@@ -228,6 +228,7 @@ export default function Terminal() {
   const recordingRef = useRef(false);
   const recordingData = useRef<{ time: number; data: string; type: "o" | "i" }[]>([]);
   const recordingStart = useRef<number>(0);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   // Keep statusRef in sync with status state
   useEffect(() => {
@@ -747,11 +748,12 @@ export default function Terminal() {
 
             {/* File upload (site terminals only) */}
             {selectedSite && (
-              <label className="py-1.5 bg-dark-700 text-dark-200 rounded text-xs font-mono cursor-pointer hover:bg-dark-600 active:bg-dark-500 touch-manipulation text-center">
-                Upload
+              <label className={`py-1.5 bg-dark-700 text-dark-200 rounded text-xs font-mono cursor-pointer hover:bg-dark-600 active:bg-dark-500 touch-manipulation text-center ${uploadProgress !== null ? "opacity-60 pointer-events-none" : ""}`}>
+                {uploadProgress !== null ? `Uploading ${uploadProgress}%` : "Upload"}
                 <input
                   type="file"
                   className="hidden"
+                  disabled={uploadProgress !== null}
                   onChange={async (e) => {
                     const file = e.target.files?.[0];
                     if (!file || !selectedSite) return;
@@ -760,15 +762,27 @@ export default function Terminal() {
                       e.target.value = "";
                       return;
                     }
+                    setUploadProgress(0);
+                    setStatus(`Reading ${file.name}...`);
                     const reader = new FileReader();
                     reader.onload = async () => {
                       const base64 = (reader.result as string).split(",")[1];
                       try {
-                        await api.post(`/sites/${selectedSite}/files/upload`, {
-                          path: "",
-                          filename: file.name,
-                          content: base64,
-                        });
+                        setStatus(`Uploading ${file.name} (0%)...`);
+                        await api.upload(
+                          `/sites/${selectedSite}/files/upload`,
+                          {
+                            path: "",
+                            filename: file.name,
+                            content: base64,
+                          },
+                          (loaded, total) => {
+                            const pct = Math.min(100, Math.round((loaded / total) * 100));
+                            setUploadProgress(pct);
+                            setStatus(pct >= 100 ? `Saving to server: ${file.name}...` : `Uploading ${file.name} (${pct}%)...`);
+                          }
+                        );
+                        setUploadProgress(null);
                         setError("");
                         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                           const safeName = file.name.replace(/[^a-zA-Z0-9._\- ]/g, '_');
@@ -782,8 +796,13 @@ export default function Terminal() {
                         setStatus(`Uploaded: ${file.name}`);
                         setTimeout(() => setStatus(""), 3000);
                       } catch (err) {
+                        setUploadProgress(null);
                         setError(err instanceof Error ? err.message : `Upload failed: ${file.name}`);
                       }
+                    };
+                    reader.onerror = () => {
+                      setUploadProgress(null);
+                      setError(`Failed to read file: ${file.name}`);
                     };
                     reader.readAsDataURL(file);
                     e.target.value = "";

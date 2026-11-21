@@ -55,6 +55,15 @@ export default function Files() {
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   // Upload
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{
+    fileIndex: number;
+    totalFiles: number;
+    fileName: string;
+    fileSize: number;
+    loadedBytes: number;
+    percent: number;
+    phase: "reading" | "uploading" | "processing";
+  } | null>(null);
   const [uploadMessage, setUploadMessage] = useState("");
 
   useEffect(() => {
@@ -205,7 +214,7 @@ export default function Files() {
         </div>
         <div className="flex items-center gap-2">
           <label className={`px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 cursor-pointer transition-colors ${uploading ? "opacity-50 pointer-events-none" : ""}`}>
-            {uploading ? "Uploading..." : "Upload"}
+            {uploading ? (uploadProgress ? `Uploading ${uploadProgress.percent}%` : "Uploading...") : "Upload"}
             <input
               type="file"
               className="hidden"
@@ -214,12 +223,14 @@ export default function Files() {
               onChange={async (e) => {
                 const files = e.target.files;
                 if (!files || files.length === 0) return;
+                const fileList = Array.from(files);
                 setUploading(true);
                 setUploadMessage("");
                 let success = 0;
                 let failed = 0;
                 let firstError = "";
-                for (const file of Array.from(files)) {
+                for (let i = 0; i < fileList.length; i++) {
+                  const file = fileList[i];
                   // Refuse an oversize file HERE, before spending the upload.
                   // The server refuses it too, but only after the whole body
                   // has travelled — and its refusal used to be discarded by the
@@ -230,18 +241,66 @@ export default function Files() {
                     if (!firstError) firstError = uploadTooLargeMessage(file.name, file.size);
                     continue;
                   }
+                  setUploadProgress({
+                    fileIndex: i + 1,
+                    totalFiles: fileList.length,
+                    fileName: file.name,
+                    fileSize: file.size,
+                    loadedBytes: 0,
+                    percent: 0,
+                    phase: "reading",
+                  });
                   try {
                     const base64 = await new Promise<string>((resolve, reject) => {
                       const reader = new FileReader();
+                      reader.onprogress = (event) => {
+                        if (event.lengthComputable) {
+                          const pct = Math.min(100, Math.round((event.loaded / event.total) * 100));
+                          setUploadProgress({
+                            fileIndex: i + 1,
+                            totalFiles: fileList.length,
+                            fileName: file.name,
+                            fileSize: file.size,
+                            loadedBytes: event.loaded,
+                            percent: pct,
+                            phase: "reading",
+                          });
+                        }
+                      };
                       reader.onload = () => resolve((reader.result as string).split(",")[1]);
-                      reader.onerror = reject;
+                      reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
                       reader.readAsDataURL(file);
                     });
-                    await api.post(`/sites/${id}/files/upload`, {
-                      path: currentPath,
-                      filename: file.name,
-                      content: base64,
+                    setUploadProgress({
+                      fileIndex: i + 1,
+                      totalFiles: fileList.length,
+                      fileName: file.name,
+                      fileSize: file.size,
+                      loadedBytes: 0,
+                      percent: 0,
+                      phase: "uploading",
                     });
+                    await api.upload(
+                      `/sites/${id}/files/upload`,
+                      {
+                        path: currentPath,
+                        filename: file.name,
+                        content: base64,
+                      },
+                      (loaded, total) => {
+                        const pct = Math.min(100, Math.round((loaded / total) * 100));
+                        const estimatedLoaded = Math.min(file.size, Math.round((loaded / total) * file.size));
+                        setUploadProgress({
+                          fileIndex: i + 1,
+                          totalFiles: fileList.length,
+                          fileName: file.name,
+                          fileSize: file.size,
+                          loadedBytes: estimatedLoaded,
+                          percent: pct,
+                          phase: pct >= 100 ? "processing" : "uploading",
+                        });
+                      }
+                    );
                     success++;
                   } catch (err) {
                     failed++;
@@ -250,6 +309,7 @@ export default function Files() {
                     }
                   }
                 }
+                setUploadProgress(null);
                 setUploading(false);
                 if (failed > 0) {
                   // A count is not a reason. Carry the first failure's sentence
@@ -258,13 +318,13 @@ export default function Files() {
                     success > 0 ? `${success} uploaded, ${failed} failed — ${firstError}` : firstError
                   );
                 } else {
-                  setUploadMessage(`${success} file(s) uploaded`);
+                  setUploadMessage(`${success} file(s) uploaded successfully`);
                 }
                 loadDir(currentPath);
                 e.target.value = "";
                 // Success may erase itself; a failure must not. Three seconds
                 // is not reading time for a sentence the operator has to act on.
-                if (failed === 0) setTimeout(() => setUploadMessage(""), 3000);
+                if (failed === 0) setTimeout(() => setUploadMessage(""), 4000);
               }}
             />
           </label>
@@ -303,6 +363,50 @@ export default function Files() {
           </span>
         ))}
       </div>
+
+      {uploadProgress && (
+        <div className="mb-4 bg-dark-800 border border-dark-600 rounded-lg p-4 shadow-sm animate-fade-in">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2 overflow-hidden">
+              <div className="w-4 h-4 border-2 border-dark-500 border-t-rust-500 rounded-full animate-spin shrink-0" />
+              <span className="text-sm font-medium text-dark-100 truncate">
+                {uploadProgress.totalFiles > 1 ? `[${uploadProgress.fileIndex}/${uploadProgress.totalFiles}] ` : ""}
+                {uploadProgress.fileName}
+              </span>
+              <span className="text-xs text-dark-400 font-mono shrink-0">
+                ({formatSize(uploadProgress.fileSize)})
+              </span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="text-xs font-mono text-rust-400 font-medium">
+                {uploadProgress.phase === "reading"
+                  ? `Preparing... ${uploadProgress.percent}%`
+                  : uploadProgress.phase === "processing"
+                  ? "Saving to server..."
+                  : `${uploadProgress.percent}%`}
+              </span>
+            </div>
+          </div>
+          <div className="w-full h-2 bg-dark-700 rounded-full overflow-hidden">
+            <div
+              className={`h-full bg-rust-500 rounded-full transition-all duration-150 ${
+                uploadProgress.phase === "processing" ? "animate-pulse" : ""
+              }`}
+              style={{ width: `${uploadProgress.percent}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between mt-2 text-xs text-dark-300 font-mono">
+            <span>
+              {uploadProgress.phase === "reading"
+                ? "Reading file into browser memory..."
+                : uploadProgress.phase === "processing"
+                ? "Upload complete! Finalizing write on server..."
+                : `${formatSize(uploadProgress.loadedBytes)} / ${formatSize(uploadProgress.fileSize)}`}
+            </span>
+            <span>{uploadProgress.percent}%</span>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="mb-4 px-4 py-3 bg-danger-500/10 text-danger-400 rounded-lg border border-danger-500/20 text-sm">
