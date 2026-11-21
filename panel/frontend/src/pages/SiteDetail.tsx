@@ -82,7 +82,7 @@ export default function SiteDetail() {
   const [appActionLoading, setAppActionLoading] = useState<string | null>(null);
   const [appLogs, setAppLogs] = useState<string>("");
   const [showAppLogs, setShowAppLogs] = useState(false);
-  const [logsLoading, setLogsLoading] = useState(false);
+  const [appLogsLoading, setAppLogsLoading] = useState(false);
   const [autoRefreshLogs, setAutoRefreshLogs] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
   const [sslMessage, setSslMessage] = useState("");
@@ -389,14 +389,14 @@ export default function SiteDetail() {
   }, [id]);
 
   const loadAppLogs = useCallback(async () => {
-    setLogsLoading(true);
+    setAppLogsLoading(true);
     try {
       const res = await api.get<{ logs: string }>(`/sites/${id}/app/logs?lines=100`);
       setAppLogs(res.logs || "No logs recorded for this service.");
     } catch (e) {
       setAppLogs(e instanceof Error ? `Failed to load logs: ${e.message}` : "Failed to load logs");
     } finally {
-      setLogsLoading(false);
+      setAppLogsLoading(false);
     }
   }, [id]);
 
@@ -1617,10 +1617,10 @@ export default function SiteDetail() {
                     <button
                       type="button"
                       onClick={loadAppLogs}
-                      disabled={logsLoading}
+                      disabled={appLogsLoading}
                       className="text-xs text-dark-300 hover:text-dark-100 font-mono underline"
                     >
-                      {logsLoading ? "Refreshing..." : "Refresh"}
+                      {appLogsLoading ? "Refreshing..." : "Refresh"}
                     </button>
                   </div>
                 )}
@@ -1629,7 +1629,7 @@ export default function SiteDetail() {
               {showAppLogs && (
                 <div className="mt-3 bg-dark-950 border border-dark-700 rounded-lg p-3 overflow-hidden shadow-inner">
                   <pre className="text-xs font-mono text-dark-200 max-h-64 overflow-y-auto whitespace-pre-wrap break-words leading-relaxed select-text">
-                    {appLogs || (logsLoading ? "Fetching logs from journalctl..." : "No logs available.")}
+                    {appLogs || (appLogsLoading ? "Fetching logs from journalctl..." : "No logs available.")}
                   </pre>
                 </div>
               )}
