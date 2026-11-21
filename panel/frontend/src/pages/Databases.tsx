@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, FormEvent } from "react";
+import { useState, useEffect, useRef, useCallback, FormEvent, ChangeEvent } from "react";
 import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import { useAuth } from "../context/AuthContext";
@@ -233,11 +233,11 @@ function AdvancedDatabaseManager({
         try {
           const sql = database.engine === "postgres" ? `TRUNCATE TABLE ${q}${tbl}${q} CASCADE` : `TRUNCATE TABLE ${q}${tbl}${q}`;
           await api.post(`/databases/${database.id}/query`, { sql });
-          showGlobalNotification(`Table "${tbl}" emptied successfully`, "success");
+          showGlobalNotification("success", `Table "${tbl}" emptied successfully`);
           loadBrowseData();
           loadTables();
         } catch (e) {
-          showGlobalNotification(e instanceof Error ? e.message : "Truncate failed", "error");
+          showGlobalNotification("error", e instanceof Error ? e.message : "Truncate failed");
         } finally {
           setConfirmModal(null);
         }
@@ -259,11 +259,11 @@ function AdvancedDatabaseManager({
         try {
           const sql = database.engine === "postgres" ? `DROP TABLE ${q}${tbl}${q} CASCADE` : `DROP TABLE ${q}${tbl}${q}`;
           await api.post(`/databases/${database.id}/query`, { sql });
-          showGlobalNotification(`Table "${tbl}" dropped successfully`, "success");
+          showGlobalNotification("success", `Table "${tbl}" dropped successfully`);
           setSelectedTable(null);
           loadTables();
         } catch (e) {
-          showGlobalNotification(e instanceof Error ? e.message : "Drop table failed", "error");
+          showGlobalNotification("error", e instanceof Error ? e.message : "Drop table failed");
         } finally {
           setConfirmModal(null);
         }
@@ -275,7 +275,7 @@ function AdvancedDatabaseManager({
     if (!selectedTable) return;
     const cols = Object.keys(insertColValues).filter((k) => insertColValues[k] !== "");
     if (cols.length === 0) {
-      showGlobalNotification("Please provide at least one column value", "error");
+      showGlobalNotification("error", "Please provide at least one column value");
       return;
     }
     setInserting(true);
@@ -287,13 +287,13 @@ function AdvancedDatabaseManager({
       }).join(", ");
       const sql = `INSERT INTO ${q}${selectedTable}${q} (${colList}) VALUES (${valList})`;
       await api.post(`/databases/${database.id}/query`, { sql });
-      showGlobalNotification("Row inserted successfully", "success");
+      showGlobalNotification("success", "Row inserted successfully");
       setShowInsertModal(false);
       setInsertColValues({});
       loadBrowseData();
       loadTables();
     } catch (e) {
-      showGlobalNotification(e instanceof Error ? e.message : "Insert failed", "error");
+      showGlobalNotification("error", e instanceof Error ? e.message : "Insert failed");
     } finally {
       setInserting(false);
     }
@@ -344,13 +344,13 @@ function AdvancedDatabaseManager({
       if (!newColNullable) sql += " NOT NULL";
       if (newColDefault.trim()) sql += ` DEFAULT '${newColDefault.trim().replace(/'/g, "''")}'`;
       await api.post(`/databases/${database.id}/query`, { sql });
-      showGlobalNotification(`Column "${newColName}" added successfully`, "success");
+      showGlobalNotification("success", `Column "${newColName}" added successfully`);
       setShowAddColumnModal(false);
       setNewColName("");
       setNewColDefault("");
       loadStructure();
     } catch (err) {
-      showGlobalNotification(err instanceof Error ? err.message : "Failed to add column", "error");
+      showGlobalNotification("error", err instanceof Error ? err.message : "Failed to add column");
     }
   };
 
@@ -368,10 +368,10 @@ function AdvancedDatabaseManager({
         try {
           const sql = `ALTER TABLE ${q}${selectedTable}${q} DROP COLUMN ${q}${colName}${q}`;
           await api.post(`/databases/${database.id}/query`, { sql });
-          showGlobalNotification(`Column "${colName}" dropped successfully`, "success");
+          showGlobalNotification("success", `Column "${colName}" dropped successfully`);
           loadStructure();
         } catch (err) {
-          showGlobalNotification(err instanceof Error ? err.message : "Failed to drop column", "error");
+          showGlobalNotification("error", err instanceof Error ? err.message : "Failed to drop column");
         } finally {
           setConfirmModal(null);
         }
@@ -388,14 +388,14 @@ function AdvancedDatabaseManager({
           ? `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} SERIAL PRIMARY KEY, ${q}created_at${q} TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
           : `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} INT AUTO_INCREMENT PRIMARY KEY, ${q}created_at${q} TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`;
       await api.post(`/databases/${database.id}/query`, { sql });
-      showGlobalNotification(`Table "${newTableName}" created successfully`, "success");
+      showGlobalNotification("success", `Table "${newTableName}" created successfully`);
       setShowCreateTableModal(false);
       const createdName = newTableName.trim();
       setNewTableName("");
       await loadTables();
       setSelectedTable(createdName);
     } catch (err) {
-      showGlobalNotification(err instanceof Error ? err.message : "Failed to create table", "error");
+      showGlobalNotification("error", err instanceof Error ? err.message : "Failed to create table");
     }
   };
 
@@ -482,7 +482,7 @@ function AdvancedDatabaseManager({
     if (!file) return;
 
     if (!file.name.endsWith(".sql") && !file.name.endsWith(".sql.gz") && !file.name.endsWith(".gz")) {
-      showGlobalNotification("Please select a valid .sql or .sql.gz dump file", "error");
+      showGlobalNotification("error", "Please select a valid .sql or .sql.gz dump file");
       return;
     }
 
@@ -517,15 +517,15 @@ function AdvancedDatabaseManager({
         setUploadProgress(100);
         setUploadStatus("Finished!");
         showGlobalNotification(
+          "success",
           autoImportUpload
             ? `Successfully uploaded and restored "${file.name}" into ${database.name}!`
-            : `Dump "${file.name}" uploaded successfully!`,
-          "success"
+            : `Dump "${file.name}" uploaded successfully!`
         );
         loadDumps();
         loadTables();
       } catch (err) {
-        showGlobalNotification(err instanceof Error ? err.message : "Upload failed", "error");
+        showGlobalNotification("error", err instanceof Error ? err.message : "Upload failed");
       } finally {
         setTimeout(() => {
           setUploadProgress(null);
@@ -536,7 +536,7 @@ function AdvancedDatabaseManager({
     };
 
     reader.onerror = () => {
-      showGlobalNotification("Failed to read file from disk", "error");
+      showGlobalNotification("error", "Failed to read file from disk");
       setUploadProgress(null);
       setUploadStatus("");
     };
@@ -558,11 +558,11 @@ function AdvancedDatabaseManager({
         setImportingDump(filename);
         try {
           await api.post(`/databases/${database.id}/import`, { filename });
-          showGlobalNotification(`Dump "${filename}" restored into ${database.name} successfully`, "success");
+          showGlobalNotification("success", `Dump "${filename}" restored into ${database.name} successfully`);
           loadTables();
           loadBrowseData();
         } catch (e) {
-          showGlobalNotification(e instanceof Error ? e.message : "Import failed", "error");
+          showGlobalNotification("error", e instanceof Error ? e.message : "Import failed");
         } finally {
           setImportingDump(null);
           setConfirmModal(null);
@@ -578,10 +578,10 @@ function AdvancedDatabaseManager({
     setExporting(true);
     try {
       const res = await api.post<{ ok: boolean; filename: string }>(`/databases/${database.id}/export`, {});
-      showGlobalNotification(`Export "${res.filename}" generated successfully!`, "success");
+      showGlobalNotification("success", `Export "${res.filename}" generated successfully!`);
       loadDumps();
     } catch (e) {
-      showGlobalNotification(e instanceof Error ? e.message : "Export failed", "error");
+      showGlobalNotification("error", e instanceof Error ? e.message : "Export failed");
     } finally {
       setExporting(false);
     }
@@ -629,7 +629,7 @@ function AdvancedDatabaseManager({
         setPreviewMatchesCount(parseInt(res.rows[0][0], 10));
       }
     } catch (e) {
-      showGlobalNotification(e instanceof Error ? e.message : "Preview count failed", "error");
+      showGlobalNotification("error", e instanceof Error ? e.message : "Preview count failed");
     } finally {
       setFindLoading(false);
     }
@@ -650,11 +650,11 @@ function AdvancedDatabaseManager({
         try {
           const sql = `UPDATE ${q}${findTable}${q} SET ${q}${findColumn}${q} = REPLACE(${q}${findColumn}${q}, '${findText.replace(/'/g, "''")}', '${replaceText.replace(/'/g, "''")}') WHERE ${q}${findColumn}${q} LIKE '%${findText.replace(/'/g, "''")}%'`;
           await api.post(`/databases/${database.id}/query`, { sql });
-          showGlobalNotification("Find & Replace completed successfully", "success");
+          showGlobalNotification("success", "Find & Replace completed successfully");
           setPreviewMatchesCount(null);
           loadBrowseData();
         } catch (e) {
-          showGlobalNotification(e instanceof Error ? e.message : "Replace failed", "error");
+          showGlobalNotification("error", e instanceof Error ? e.message : "Replace failed");
         } finally {
           setFindLoading(false);
           setConfirmModal(null);
