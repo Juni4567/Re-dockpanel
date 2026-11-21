@@ -413,12 +413,23 @@ pub async fn all_wp_sites(
         .unwrap_or(Err(crate::services::agent::AgentError::Request(
             "timeout".into(),
         ))) {
-            // It's a WP site
+            // Filter out non-WordPress sites: agent returns `{"installed": false}` for them
+            let installed = info.get("installed").and_then(|v| v.as_bool()).unwrap_or(true);
+            if !installed {
+                continue;
+            }
+
+            // It's a WP site — version must look like a real version string
             let version = info
                 .get("version")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
+
+            // Skip sites that returned a non-WP placeholder (empty or "unknown" version with no other WP fields)
+            if version == "unknown" && info.get("update_available").is_none() {
+                continue;
+            }
             let update_available = info
                 .get("update_available")
                 .and_then(|v| v.as_bool())
@@ -675,6 +686,150 @@ pub async fn wp_harden(
     .await;
 
     Ok(Json(result))
+}
+
+/// POST /api/sites/{id}/wordpress/maintenance — Enable or disable WP maintenance mode.
+pub async fn maintenance_mode(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Use wp-cli to toggle maintenance mode via the agent shell
+    let cmd = if enabled {
+        format!("wp maintenance-mode activate --path=/var/www/{domain}/wordpress --allow-root 2>&1 || touch /var/www/{domain}/wordpress/.maintenance")
+    } else {
+        format!("wp maintenance-mode deactivate --path=/var/www/{domain}/wordpress --allow-root 2>&1 || rm -f /var/www/{domain}/wordpress/.maintenance")
+    };
+    let agent_body = serde_json::json!({ "command": cmd });
+    let _ = agent
+        .post(&format!("/wordpress/{domain}/shell-exec"), Some(agent_body))
+        .await;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        if enabled { "wordpress.maintenance.enable" } else { "wordpress.maintenance.disable" },
+        Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(serde_json::json!({ "ok": true, "enabled": enabled })))
+}
+
+/// POST /api/sites/{id}/wordpress/clear-cache — Clear WP object cache and transients.
+pub async fn clear_cache(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/clear-cache"), None::<serde_json::Value>)
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "ok": true, "message": "Cache cleared" }));
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        "wordpress.clear_cache", Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
+}
+
+/// POST /api/sites/{id}/wordpress/optimize-db — Optimize WP database tables.
+pub async fn optimize_db(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let resp: serde_json::Value = agent
+        .post_long(&format!("/wordpress/{domain}/optimize-db"), None::<serde_json::Value>, 120)
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "ok": true, "message": "Database optimized" }));
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        "wordpress.optimize_db", Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SearchReplaceRequest {
+    pub search: String,
+    pub replace: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// POST /api/sites/{id}/wordpress/search-replace — WP database search & replace.
+pub async fn search_replace(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SearchReplaceRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.search.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Search string cannot be empty"));
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_body = serde_json::json!({
+        "search": body.search,
+        "replace": body.replace,
+        "dry_run": body.dry_run,
+    });
+
+    let resp: serde_json::Value = agent
+        .post_long(&format!("/wordpress/{domain}/search-replace"), Some(agent_body), 60)
+        .await
+        .map_err(|e| agent_error("WordPress search-replace", e))?;
+
+    if !body.dry_run {
+        activity::log_activity(
+            &state.db, claims.sub, &claims.email,
+            "wordpress.search_replace", Some("site"), Some(&domain), None, None, claims.key_id,
+        ).await;
+    }
+
+    Ok(Json(resp))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ResetPasswordRequest {
+    pub new_password: String,
+}
+
+/// POST /api/sites/{id}/wordpress/reset-admin-password — Reset the WP admin password.
+pub async fn reset_admin_password(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ResetPasswordRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.new_password.len() < 8 {
+        return Err(err(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
+    }
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    let agent_body = serde_json::json!({ "new_password": body.new_password });
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/reset-admin-password"), Some(agent_body))
+        .await
+        .map_err(|e| agent_error("WordPress reset-admin-password", e))?;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        "wordpress.reset_admin_password", Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
 }
 
 /// POST /api/sites/{id}/wordpress/update-safe — Update WP with snapshot + auto-rollback.

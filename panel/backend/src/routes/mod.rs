@@ -1432,6 +1432,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/wordpress/theme/{action}", post(wordpress::theme_action))
         .route("/api/sites/{id}/wordpress/auto-update", post(wordpress::set_auto_update))
         .route("/api/sites/{id}/wordpress/update-safe", post(wordpress::update_safe))
+        .route("/api/sites/{id}/wordpress/maintenance", post(wordpress::maintenance_mode))
+        .route("/api/sites/{id}/wordpress/clear-cache", post(wordpress::clear_cache))
+        .route("/api/sites/{id}/wordpress/optimize-db", post(wordpress::optimize_db))
+        .route("/api/sites/{id}/wordpress/search-replace", post(wordpress::search_replace))
+        .route("/api/sites/{id}/wordpress/reset-admin-password", post(wordpress::reset_admin_password))
         // Git Deploy
         .route("/api/sites/{id}/deploy", get(deploy::get_config).put(deploy::set_config).delete(deploy::remove_config))
         .route("/api/sites/{id}/deploy/trigger", post(deploy::trigger))

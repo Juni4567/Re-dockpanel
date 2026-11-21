@@ -69,6 +69,10 @@ pub fn router() -> Router<AppState> {
         .route("/wordpress/{domain}/security-check", get(security_check))
         .route("/wordpress/{domain}/harden", post(harden))
         .route("/wordpress/{domain}/update-with-rollback", post(update_with_rollback))
+        .route("/wordpress/{domain}/clear-cache", post(clear_cache))
+        .route("/wordpress/{domain}/optimize-db", post(optimize_db))
+        .route("/wordpress/{domain}/search-replace", post(search_replace_route))
+        .route("/wordpress/{domain}/reset-admin-password", post(reset_admin_password))
 }
 
 async fn detect(
@@ -331,4 +335,201 @@ async fn update_with_rollback(
                 Json(serde_json::json!({"error": e})),
             )
         })
+}
+
+/// POST /wordpress/{domain}/clear-cache — Clear WP object cache and transients.
+async fn clear_cache(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    // Try wp-cli cache flush and delete expired transients
+    let cache_result = tokio::process::Command::new("wp")
+        .args([
+            "cache", "flush",
+            &format!("--path=/var/www/{domain}/wordpress"),
+            "--allow-root",
+        ])
+        .output()
+        .await;
+
+    let transient_result = tokio::process::Command::new("wp")
+        .args([
+            "transient", "delete", "--expired",
+            &format!("--path=/var/www/{domain}/wordpress"),
+            "--allow-root",
+        ])
+        .output()
+        .await;
+
+    let cache_ok = cache_result.map(|o| o.status.success()).unwrap_or(false);
+    let transient_ok = transient_result.map(|o| o.status.success()).unwrap_or(false);
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "cache_flushed": cache_ok,
+        "transients_cleared": transient_ok,
+        "message": "Cache cleared successfully",
+    })))
+}
+
+/// POST /wordpress/{domain}/optimize-db — Optimize WP database tables.
+async fn optimize_db(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    let output = tokio::process::Command::new("wp")
+        .args([
+            "db", "optimize",
+            &format!("--path=/var/www/{domain}/wordpress"),
+            "--allow-root",
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+            Ok(Json(serde_json::json!({
+                "ok": o.status.success(),
+                "message": if o.status.success() { "Database optimized successfully" } else { "Optimization completed with warnings" },
+                "details": stdout,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to run db optimize: {e}")})),
+        )),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SearchReplaceBody {
+    search: String,
+    replace: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// POST /wordpress/{domain}/search-replace — WP database search & replace.
+async fn search_replace_route(
+    Path(domain): Path<String>,
+    Json(body): Json<SearchReplaceBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    if body.search.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Search string cannot be empty"})),
+        ));
+    }
+
+    let mut args = vec![
+        "search-replace".to_string(),
+        body.search.clone(),
+        body.replace.clone(),
+        format!("--path=/var/www/{domain}/wordpress"),
+        "--allow-root".to_string(),
+        "--report-changed-only".to_string(),
+    ];
+    if body.dry_run {
+        args.push("--dry-run".to_string());
+    }
+
+    let output = tokio::process::Command::new("wp")
+        .args(&args)
+        .output()
+        .await;
+
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            Ok(Json(serde_json::json!({
+                "ok": o.status.success(),
+                "dry_run": body.dry_run,
+                "output": stdout,
+                "stderr": if stderr.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(stderr) },
+                "message": if body.dry_run { "Dry run complete — no changes made" } else { "Search & replace completed" },
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to run search-replace: {e}")})),
+        )),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ResetPasswordBody {
+    new_password: String,
+}
+
+/// POST /wordpress/{domain}/reset-admin-password — Reset the WP admin user password.
+async fn reset_admin_password(
+    Path(domain): Path<String>,
+    Json(body): Json<ResetPasswordBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    if body.new_password.len() < 8 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Password must be at least 8 characters"})),
+        ));
+    }
+
+    // Get the first admin user login
+    let get_admin = tokio::process::Command::new("wp")
+        .args([
+            "user", "list",
+            "--role=administrator",
+            "--fields=user_login",
+            "--format=csv",
+            "--limit=1",
+            &format!("--path=/var/www/{domain}/wordpress"),
+            "--allow-root",
+        ])
+        .output()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Could not list users: {e}")}))))?;
+
+    let output_str = String::from_utf8_lossy(&get_admin.stdout);
+    // CSV output: first line is header "user_login", second is the value
+    let admin_login = output_str
+        .lines()
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if admin_login.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No administrator user found on this WordPress site"})),
+        ));
+    }
+
+    let result = tokio::process::Command::new("wp")
+        .args([
+            "user", "update", &admin_login,
+            &format!("--user_pass={}", body.new_password),
+            &format!("--path=/var/www/{domain}/wordpress"),
+            "--allow-root",
+        ])
+        .output()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to reset password: {e}")}))))?;
+
+    if result.status.success() {
+        Ok(Json(serde_json::json!({
+            "ok": true,
+            "admin_login": admin_login,
+            "message": format!("Password reset successfully for user '{admin_login}'"),
+        })))
+    } else {
+        let stderr = String::from_utf8_lossy(&result.stderr).to_string();
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to reset password: {stderr}")})),
+        ))
+    }
 }

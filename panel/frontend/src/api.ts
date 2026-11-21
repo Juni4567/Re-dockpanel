@@ -97,7 +97,15 @@ async function request<T = unknown>(
   }
 
   if (!res.ok) {
-    let message = (data as { error?: string }).error || `Request failed (${res.status})`;
+    const d = data as { error?: string; message?: string; detail?: string };
+    let message = d.error || d.message || d.detail || `Request failed (${res.status})`;
+    // Provide a helpful suffix for 422 (Unprocessable Entity) which is the
+    // status the agent returns for caller-fixable errors like corrupt dumps,
+    // wrong SQL file format, or restore failures — tell the user it is their
+    // file/input, not an internal server error.
+    if (res.status === 422 && !d.error && !d.message && !d.detail) {
+      message = `The server could not process this request (422). Check the file format and try again.`;
+    }
     // Only the backend can tell "the agent never answered" apart from "the
     // agent answered and something failed inside it" — both arrive as 502.
     // Keying this off the bare status is what reported a working agent as

@@ -4,7 +4,33 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [2.244.0] - 2026-11-22
+## [2.245.0] - 2026-11-22
+
+### Major: Plesk-Like WordPress Toolkit, Screenshot Thumbnails Fix, DB Import Error Improvements
+
+#### 1. WordPress Toolkit — Plesk-Like Feature Expansion
+- **Plugins Tab:** Full plugin management per WordPress site — list all plugins with active/inactive status, version, latest version, description and author. Toggle activate/deactivate, one-click update (with warn badge when update available), delete with confirmation. Bulk "Update All Plugins" button at the top.
+- **Themes Tab:** Full theme management — list all themes with active badge (the currently active theme is highlighted), version, update available indicator. Activate, update, and delete actions (with guard preventing deletion of the active theme). Bulk "Update All Themes" button.
+- **Tools Tab:** Five utility tool cards per WordPress site:
+  - **Maintenance Mode** — toggle on/off with colored status badge and descriptive hint
+  - **Clear Cache** — flush WP object cache and expired transients via wp-cli with result feedback
+  - **Optimize Database** — run `wp db optimize` on all WP tables via wp-cli with details output
+  - **Search & Replace** — form with search string, replace string, dry-run checkbox, and output display showing what changed
+  - **Reset Admin Password** — password input with show/hide toggle, strength indicator, and confirmation dialog before execution
+- **Non-WP Site Filter Fixed:** Backend `all_wp_sites` now checks the `installed` field returned by the agent's `/wordpress/{domain}/info` route and skips any site where `installed: false`. Previously, all site types including Node/Python/static appeared in the toolkit.
+- **New Backend Routes:** `POST /api/sites/{id}/wordpress/maintenance`, `/clear-cache`, `/optimize-db`, `/search-replace`, `/reset-admin-password` — all backed by agent wp-cli execution.
+
+#### 2. Website Screenshot Thumbnails — Working Implementation
+- **Replaced mshots with thum.io:** The previous `s0.wp.com/mshots` service returned placeholder images for most domains. Switched to `image.thum.io` which works without an API key and returns actual screenshots.
+- **Progressive Fallback Chain:** Screenshot → Google Favicon → Globe icon placeholder. If the screenshot fails to load, falls back to the domain's favicon from Google's favicon service. If that too fails, shows a minimal globe icon.
+- **Stage-Based React State:** `SiteThumbnail.tsx` now uses a `stage` state ("screenshot" | "favicon" | "placeholder") instead of a simple error boolean, cleanly handling each fallback level.
+
+#### 3. Database Import — Better Error Messages
+- **Detailed Logging:** Added `tracing::error!` to the backend's `import` route to log the full agent error details server-side when a restore fails. 
+- **Improved Frontend Error Parsing:** `api.ts` now checks `data.error`, `data.message`, and `data.detail` fields in order, and provides a human-readable hint for 422 responses when no error message is returned.
+- **422 Context:** Added a contextual message explaining that 422 means the file/input was rejected (caller-fixable) rather than a server error.
+
+
 
 ### Major: WordPress Toolkit Accessibility, Website Screenshot Thumbnails, Version Display & Database Improvements
 

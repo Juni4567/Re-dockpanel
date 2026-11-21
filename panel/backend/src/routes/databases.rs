@@ -1416,7 +1416,13 @@ pub async fn import(
     let call = agent.post_long(&agent_path, Some(agent_body), budget + 60);
 
     let result = match tokio::time::timeout(std::time::Duration::from_secs(budget), call).await {
-        Ok(inner) => inner.map_err(|e| agent_error("Database import", e))?,
+        Ok(inner) => inner.map_err(|e| {
+            tracing::error!(
+                database = %name, filename = %filename,
+                "Database import agent error: {e:?}"
+            );
+            agent_error("Database import", e)
+        })?,,
         Err(_elapsed) => {
             tracing::warn!(
                 database = %name, filename = %filename,
