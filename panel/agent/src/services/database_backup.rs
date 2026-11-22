@@ -521,6 +521,25 @@ pub async fn restore_mysql(
     let gunzip_stdout = gunzip_child.stdout.take()
         .ok_or("Failed to capture gzip stdout")?;
 
+    // Pipe through sed to comment out `CREATE DATABASE`, `CREATE SCHEMA`, and `USE <dbname>` statements.
+    // Dumps exported from phpMyAdmin, mysqldump, Plesk, etc. frequently contain hardcoded statements like:
+    //   CREATE DATABASE IF NOT EXISTS `old_db`;
+    //   USE `old_db`;
+    // Because DockPanel provisions isolated containers where the tenant user only has privileges on their
+    // assigned database name, executing CREATE DATABASE triggers `ERROR 1044: Access denied`, and `USE`
+    // switches MariaDB away from the target database. Commenting these out allows all tables to be created
+    // directly in the tenant database container.
+    let mut sed_child = safe_command("sed")
+        .args(["-E", "s/^[[:space:]]*(CREATE DATABASE|CREATE SCHEMA|USE)[[:space:]]/-- & /I"])
+        .stdin(gunzip_stdout.into_owned_fd().map_err(|_| "Failed to get gzip fd")?)
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn sed stream filter: {e}"))?;
+
+    let sed_stdout = sed_child.stdout.take()
+        .ok_or("Failed to capture sed stdout")?;
+
     let env_file = DockerEnvFile::new(&[("MYSQL_PWD", password)])
         .map_err(|e| format!("Failed to prepare credentials: {e}"))?;
     let docker_child = safe_command("docker")
@@ -537,7 +556,7 @@ pub async fn restore_mysql(
             //   --max_allowed_packet=1024M: allows large table rows/blobs to import cleanly
             "mariadb", "-u", user, "--binary-mode", "-o", "--max_allowed_packet=1024M", db_name,
         ])
-        .stdin(gunzip_stdout.into_owned_fd().map_err(|_| "Failed to get fd")?)
+        .stdin(sed_stdout.into_owned_fd().map_err(|_| "Failed to get sed fd")?)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -547,23 +566,21 @@ pub async fn restore_mysql(
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(600),
         async {
-            // Fail the restore if decompression did not complete cleanly — a truncated
-            // .gz that ends on a statement boundary otherwise imports partially and the
-            // mysql client exits 0 (EOF-as-success).
-            let gunzip_status = gunzip_child.wait().await
-                .map_err(|e| format!("gunzip wait error: {e}"))?;
+            // Check docker exit status FIRST. If the mariadb client fails (due to invalid SQL,
+            // access denied, or syntax errors), it exits immediately and closes standard input.
+            // That causes gunzip and sed to receive SIGPIPE (code 141). Evaluating docker first
+            // guarantees we surface the actual database error from stderr rather than masking it
+            // behind a false "decompression error".
             let docker_output = docker_child.wait_with_output().await
                 .map_err(|e| format!("docker exec wait error: {e}"))?;
-            if !gunzip_status.success() {
-                return Err("MySQL restore failed: backup decompression error (truncated/corrupt archive)".to_string());
-            }
+            let gunzip_status = gunzip_child.wait().await
+                .map_err(|e| format!("gunzip wait error: {e}"))?;
+            let sed_status = sed_child.wait().await
+                .map_err(|e| format!("sed wait error: {e}"))?;
+
             if !docker_output.status.success() {
                 let stderr = String::from_utf8_lossy(&docker_output.stderr);
                 let stderr = stderr.trim();
-                // Never report a bare "restore failed:" with nothing after it —
-                // a failure with no reason is unactionable, and this path can
-                // fail with empty stderr (e.g. the client binary is missing and
-                // the runtime writes nothing we captured).
                 if stderr.is_empty() {
                     return Err(format!(
                         "MySQL restore failed: the mariadb client exited with {} and produced no error output",
@@ -572,6 +589,16 @@ pub async fn restore_mysql(
                 }
                 return Err(format!("MySQL restore failed: {stderr}"));
             }
+
+            // Docker succeeded with exit 0. Now verify gunzip and sed did not fail mid-stream
+            // (e.g. truncated .gz or corrupt archive where mariadb hit a clean EOF statement).
+            if !gunzip_status.success() {
+                return Err("MySQL restore failed: backup decompression error (truncated/corrupt archive)".to_string());
+            }
+            if !sed_status.success() {
+                return Err("MySQL restore failed: stream filter error".to_string());
+            }
+
             Ok(())
         }
     )
@@ -634,20 +661,32 @@ pub async fn restore_postgres(
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(600),
         async {
-            // A truncated/corrupt .gz makes gunzip exit non-zero while psql sees a clean
-            // EOF at a statement boundary and exits 0 — the classic EOF-as-success trap.
-            // Fail the restore if decompression did not complete cleanly.
-            let gunzip_status = gunzip_child.wait().await
-                .map_err(|e| format!("gunzip wait error: {e}"))?;
+            // Check docker exit status FIRST. If psql fails on an error, it exits immediately
+            // and closes stdin, causing gunzip to receive SIGPIPE. Checking docker first ensures
+            // we capture the actual postgres error rather than masking it with a decompression error.
             let docker_output = docker_child.wait_with_output().await
                 .map_err(|e| format!("docker exec wait error: {e}"))?;
+            let gunzip_status = gunzip_child.wait().await
+                .map_err(|e| format!("gunzip wait error: {e}"))?;
+
+            if !docker_output.status.success() {
+                let stderr = String::from_utf8_lossy(&docker_output.stderr);
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    return Err(format!(
+                        "PostgreSQL restore failed: psql exited with {} and produced no error output",
+                        docker_output.status
+                    ));
+                }
+                return Err(format!("PostgreSQL restore failed: {stderr}"));
+            }
+
+            // Docker succeeded with 0. Now verify decompression completed cleanly
+            // (EOF-as-success trap guard for truncated/corrupt .gz files).
             if !gunzip_status.success() {
                 return Err("PostgreSQL restore failed: backup decompression error (truncated/corrupt archive)".to_string());
             }
-            if !docker_output.status.success() {
-                let stderr = String::from_utf8_lossy(&docker_output.stderr);
-                return Err(format!("PostgreSQL restore failed: {stderr}"));
-            }
+
             Ok(())
         }
     )

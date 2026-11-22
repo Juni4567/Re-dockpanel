@@ -176,7 +176,10 @@ function uploadWithProgress<T = unknown>(
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve(data as T);
       } else {
-        let message = data.error || `Request failed (${xhr.status})`;
+        let message = data.error || data.message || data.detail || `Request failed (${xhr.status})`;
+        if (xhr.status === 422 && !data.error && !data.message && !data.detail) {
+          message = `The server could not process this request (422). Check the file format and try again.`;
+        }
         if (data.code === "agent_unreachable") {
           message = "Agent offline — the DockPanel agent is not responding.";
         }
