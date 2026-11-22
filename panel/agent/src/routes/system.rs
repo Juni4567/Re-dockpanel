@@ -397,12 +397,35 @@ async fn configure_panel_domain(
         "/etc/nginx/conf.d/dockpanel-panel.conf"
     };
 
+    let ip_out = safe_command_unsandboxed("curl", &[])
+        .args(["-s4", "--max-time", "3", "https://api.ipify.org"])
+        .output()
+        .await;
+    let public_ip = match ip_out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "69.197.168.63".to_string(),
+    };
+
     if let Ok(content) = std::fs::read_to_string(nginx_conf_path) {
         let mut new_lines = Vec::new();
+
+        // Ensure HTTP Port 80 redirect block exists so http://domain upgrades to https://
+        let redirect_block = format!(
+            "server {{\n    listen {public_ip}:80;\n    listen 80;\n    listen [::]:80;\n    server_name {domain};\n\n    location /.well-known/acme-challenge/ {{\n        root /var/www/acme;\n    }}\n\n    location / {{\n        return 301 https://$host$request_uri;\n    }}\n}}\n"
+        );
+        if !content.contains("return 301 https://$host$request_uri;") {
+            new_lines.push(redirect_block);
+        }
+
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("server_name ") {
                 new_lines.push(format!("    server_name {domain};"));
+            } else if trimmed == "listen 8443 ssl;" {
+                new_lines.push(format!("    listen {public_ip}:443 ssl;"));
+                new_lines.push("    listen 443 ssl;".to_string());
+                new_lines.push("    listen [::]:443 ssl;".to_string());
+                new_lines.push("    listen 8443 ssl default_server;".to_string());
             } else {
                 new_lines.push(line.to_string());
             }
