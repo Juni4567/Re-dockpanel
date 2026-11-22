@@ -951,7 +951,7 @@ pub async fn toggle_feature(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
-    let feature_name = body.get("feature").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let feature_name = body.get("feature").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
     let resp: serde_json::Value = agent
         .post(&format!("/wordpress/{domain}/toggle-feature"), Some(body))
         .await
@@ -1009,7 +1009,7 @@ pub async fn copy_data(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
-    let dst_domain = body.get("dst_domain").and_then(|v| v.as_str()).unwrap_or("");
+    let dst_domain = body.get("dst_domain").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if dst_domain.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Destination domain required"));
     }

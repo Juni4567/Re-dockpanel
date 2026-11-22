@@ -7,7 +7,7 @@ use base64::Engine;
 use uuid::Uuid;
 
 use crate::auth::{AuthUser, ServerScope};
-use crate::error::{internal_error, err, agent_error, paginate, require_admin, ApiError};
+use crate::error::{internal_error, err, agent_error, paginate, ApiError};
 use crate::services::agent::AgentError;
 use crate::AppState;
 
@@ -1543,7 +1543,7 @@ pub async fn upload_dump(
         return Err(err(StatusCode::BAD_REQUEST, "File is empty"));
     }
 
-    let is_gzipped = decoded_bytes.starts_with(&[0x1f, 0x8b]);
+    let _is_gzipped = decoded_bytes.starts_with(&[0x1f, 0x8b]);
     let is_zip = decoded_bytes.starts_with(&[0x50, 0x4b, 0x03, 0x04]);
 
     // If a ZIP archive was uploaded, extract the internal .sql dump
