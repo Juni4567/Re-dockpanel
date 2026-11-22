@@ -119,6 +119,7 @@ pub fn router() -> Router<AppState> {
         .route("/wordpress/{domain}/integrity", post(integrity_route))
         .route("/wordpress/{domain}/copy-data", post(copy_data_route))
         .route("/wordpress/{domain}/mitigate-vulns", post(mitigate_vulns_route))
+        .route("/wordpress/{domain}/reinstall-core", post(reinstall_core_route))
 }
 
 async fn db_info_route(
@@ -704,6 +705,16 @@ async fn mitigate_vulns_route(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_domain(&domain)?;
     wordpress::mitigate_vulns(&domain)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn reinstall_core_route(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::reinstall_core(&domain)
         .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))

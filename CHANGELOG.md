@@ -4,6 +4,21 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.248.2] - 2026-11-23
+
+### Features & Security: 1-Click WordPress Core Reinstallation, Checksum Mismatch Alert & Sanitized Documentation
+- **1-Click WordPress Core Reinstallation:**
+  - Added backend route `POST /api/sites/{id}/wordpress/reinstall-core` and agent route `POST /wordpress/{domain}/reinstall-core`.
+  - Safely downloads official pristine WordPress core files from WordPress.org using `wp core download --skip-content --force` without altering `wp-content/` (themes, plugins, uploads), configuration files (`wp-config.php`), or database records.
+  - Automatically resets directory ownership to `www-data:www-data` on document root.
+  - Added 1-click `[Re-install Core]` trigger inside the Updates card of the WordPress Toolkit dashboard.
+- **Integrity Checksum Mismatch Suggestion Banner:**
+  - Enhanced the WordPress Integrity Check modal to immediately display a prominent action alert with a 1-click `[ 🔄 Re-install WordPress Core Files ]` button when any modified, missing, or corrupted core file checksums are detected.
+  - Added dedicated `Re-install Core` action in modal footer with real-time re-verification.
+- **Sanitization of Documentation & Assets:**
+  - Fully sanitized `README.md`, `CHANGELOG.md`, `deploy.ps1`, and agent configuration fallbacks, replacing all customer and personal domains, real server IPs, and account emails with clean, generic documentation placeholders (`example.com`, `cloud-store.example.com`, `admin@example.com`, `203.0.113.195`).
+  - Regenerated all GitHub README showcase screenshots in `.github/screenshots/` with pristine, generic demonstration data.
+
 ## [2.248.1] - 2026-11-23
 
 ### Refinement: Exact Plesk Visual Alignment for WordPress Toolkit
@@ -150,7 +165,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Search, Sorting & View Modes:** Added search bar, sorting (Name, Engine, Port, Created), and Table vs Grid view toggle.
 
 #### 4. DockPanel Domain & Automatic Let's Encrypt SSL
-- **Dual-Port SNI Routing**: Configures the panel domain to listen on both standard HTTPS port 443 and port 8443 with specific IP bindings, plus an automatic HTTP port 80 redirect. This completely prevents requests to the panel domain from falling back to other vhosts on the server (e.g. `drhinakhan.com`).
+- **Dual-Port SNI Routing**: Configures the panel domain to listen on both standard HTTPS port 443 and port 8443 with specific IP bindings, plus an automatic HTTP port 80 redirect. This completely prevents requests to the panel domain from falling back to other vhosts on the server (e.g. `example.com`).
 - **Panel Domain Management:** Added backend & agent routes `GET /api/settings/panel-domain` and `POST /api/settings/panel-domain` to reconfigure Nginx `server_name`, issue Let's Encrypt SSL certificates via `certbot`, configure HTTPS redirect, and update `base_url`.
 - **Settings Card:** Added dedicated "Panel Domain & SSL" card in Settings > General showing current domain, SSL status, server public IP with copy button, DNS A-record setup instructions, domain configuration form, and CLI fallback command.
 - **Initial Setup Field:** Added optional "Panel Domain" field during initial administrator setup (`/setup`).
@@ -247,7 +262,7 @@ This release significantly upgrades the File Manager into a full-featured web-ba
 - **Real-Time Upload Progress:** Added an interactive progress bar showing current file index, percentage, uploaded MB vs total MB, and distinct phases (`reading` -> `uploading` -> `processing`).
 
 #### 3. Multi-Site SSL & SNI Routing Fix
-- Fixed `net::ERR_CERT_COMMON_NAME_INVALID` where Nginx fallback certificate collisions caused certificates from one domain (e.g. `hhhfacility.com`) to be served on unrelated domains (e.g. `3swift.com`, `drhinakhan.com`).
+- Fixed `net::ERR_CERT_COMMON_NAME_INVALID` where Nginx fallback certificate collisions caused certificates from one domain (e.g. `site-a.example.com`) to be served on unrelated domains (e.g. `site-b.example.com`, `example.com`).
 - Ensured strict SNI virtual host matching and proper default catch-all certificates.
 
 #### 4. Git Deploy Incident Blocker Resolution & Private Repositories

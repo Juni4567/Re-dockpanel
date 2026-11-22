@@ -3,7 +3,7 @@
     Deploys DockPanel (Re-dockpanel) changes to your Ubuntu 26.x server.
 
 .DESCRIPTION
-    Automates deployment to 69.197.168.63.
+    Automates deployment to your production Ubuntu server.
     Supports Git-based automated deployment (smart auto-detecting what changed),
     specific component targets (frontend, backend, agent, all),
     direct local sync without git commits, and live log streaming.

@@ -53,7 +53,7 @@ This fork (`Re-dockpanel`) includes key production improvements, bug fixes, and 
 - **Real-Time Progress UI**: Live upload progress bar showing transfer percentage, transferred vs total MB, and distinct processing states (`reading` -> `uploading` -> `processing`).
 
 ### 3. 🔒 Multi-Domain SSL / SNI Isolation Fix
-- Resolves `net::ERR_CERT_COMMON_NAME_INVALID` where Nginx fallback certificate collisions caused certificates from one domain (e.g. `hhhfacility.com`) to be served on unrelated domains (e.g. `3swift.com`, `drhinakhan.com`).
+- Resolves `net::ERR_CERT_COMMON_NAME_INVALID` where Nginx fallback certificate collisions caused certificates from one domain (e.g. `site-a.example.com`) to be served on unrelated domains (e.g. `site-b.example.com`, `panel.example.com`).
 - Enforces strict SNI virtual host matching and independent SSL certificate resolution.
 
 ### 4. 🛠️ Git Deploy Incident Blocker Resolution & Private Repositories

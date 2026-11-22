@@ -120,6 +120,7 @@ export default function WordPress() {
 
   // Integrity Check
   const [integrityLoading, setIntegrityLoading] = useState(false);
+  const [reinstallingCore, setReinstallingCore] = useState(false);
   const [integrityResult, setIntegrityResult] = useState<{
     clean: boolean;
     issues: Array<{ file: string; status: string; message?: string }>;
@@ -417,6 +418,21 @@ export default function WordPress() {
       showGlobalNotification("error", e instanceof Error ? e.message : "Failed to verify integrity");
     } finally {
       setIntegrityLoading(false);
+    }
+  };
+
+  // Re-install WordPress Core Files safely
+  const handleReinstallCore = async () => {
+    setReinstallingCore(true);
+    try {
+      const res = await api.post<{ ok: boolean; message: string }>(`/sites/${id}/wordpress/reinstall-core`, {});
+      showGlobalNotification("success", res.message || "WordPress core files re-installed successfully!");
+      await handleCheckIntegrity();
+      loadData();
+    } catch (e) {
+      showGlobalNotification("error", e instanceof Error ? e.message : "Failed to re-install WordPress core");
+    } finally {
+      setReinstallingCore(false);
     }
   };
 
@@ -923,7 +939,17 @@ export default function WordPress() {
                       <div className="space-y-3 text-xs">
                         <div className="flex items-center justify-between">
                           <span className="text-dark-300">WordPress</span>
-                          <span className="font-mono text-dark-100">{info?.version || "7.1.5"}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-dark-100">{info?.version || "7.1.5"}</span>
+                            <button
+                              onClick={handleReinstallCore}
+                              disabled={reinstallingCore}
+                              className="text-[11px] text-accent-400 hover:underline font-medium transition-colors"
+                              title="Safely re-install pristine official WordPress core files"
+                            >
+                              {reinstallingCore ? "Re-installing..." : "[Re-install Core]"}
+                            </button>
+                          </div>
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="text-dark-300">Plugins</span>
@@ -1851,6 +1877,46 @@ export default function WordPress() {
                   </div>
                 </div>
 
+                {!integrityResult.clean && (
+                  <div className="p-4 bg-warn-500/10 border border-warn-500/30 rounded-lg space-y-3">
+                    <div className="flex items-start gap-3">
+                      <span className="text-xl text-warn-400">⚠</span>
+                      <div className="space-y-1">
+                        <div className="font-semibold text-warn-300">
+                          Integrity Mismatch Detected — Suggested Action: Re-install WordPress Core
+                        </div>
+                        <p className="text-xs text-dark-200 leading-relaxed">
+                          Core files do not match the official WordPress.org cryptographic release. You can safely re-install pristine official core files with a single click. This replaces corrupted or modified system files while keeping your uploads, plugins, themes, database, and configuration completely untouched.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex justify-end pt-1">
+                      <button
+                        onClick={handleReinstallCore}
+                        disabled={reinstallingCore}
+                        className="px-4 py-2 bg-rust-500 hover:bg-rust-600 disabled:opacity-50 text-white rounded text-xs font-semibold flex items-center gap-2 shadow transition-colors"
+                      >
+                        {reinstallingCore ? (
+                          <>
+                            <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                            </svg>
+                            Re-installing Official Core...
+                          </>
+                        ) : (
+                          <>
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                            </svg>
+                            Re-install WordPress Core Files
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {integrityResult.issues.length > 0 ? (
                   <div className="max-h-60 overflow-y-auto border border-dark-700 rounded bg-dark-900 p-2">
                     <table className="w-full text-xs text-left">
@@ -1880,20 +1946,30 @@ export default function WordPress() {
               </div>
             ) : null}
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+            <div className="flex justify-between items-center gap-2 pt-2 border-t border-dark-700">
               <button
-                onClick={handleCheckIntegrity}
-                disabled={integrityLoading}
-                className="px-4 py-2 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium transition-colors"
+                onClick={handleReinstallCore}
+                disabled={reinstallingCore}
+                className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 rounded text-xs transition-colors flex items-center gap-1.5"
+                title="Safely re-install pristine official WordPress core files"
               >
-                Re-check
+                {reinstallingCore ? "Re-installing..." : "⟳ Re-install Core"}
               </button>
-              <button
-                onClick={() => setShowIntegrityModal(false)}
-                className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
-              >
-                Close
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleCheckIntegrity}
+                  disabled={integrityLoading || reinstallingCore}
+                  className="px-4 py-2 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium transition-colors"
+                >
+                  Re-check
+                </button>
+                <button
+                  onClick={() => setShowIntegrityModal(false)}
+                  className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
+                >
+                  Close
+                </button>
+              </div>
             </div>
           </div>
         </div>

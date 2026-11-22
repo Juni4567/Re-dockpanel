@@ -976,6 +976,21 @@ pub async fn verify_integrity(domain: &str) -> Result<serde_json::Value, String>
     }))
 }
 
+/// Re-install WordPress core files cleanly from wordpress.org, preserving wp-content and wp-config.php.
+pub async fn reinstall_core(domain: &str) -> Result<serde_json::Value, String> {
+    let res = wp(domain, &["core", "download", "--skip-content", "--force"]).await?;
+    let doc_root = format!("/var/www/{domain}/public");
+    let _ = tokio::process::Command::new("chown")
+        .args(&["-R", "www-data:www-data", &doc_root])
+        .output()
+        .await;
+    Ok(serde_json::json!({
+        "ok": true,
+        "message": "WordPress core files re-installed successfully from official WordPress.org release.",
+        "output": res
+    }))
+}
+
 /// Update setup credentials (admin user, email, password, and site title).
 pub async fn setup_admin(
     domain: &str,

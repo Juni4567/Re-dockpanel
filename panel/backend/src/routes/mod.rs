@@ -1451,6 +1451,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/wordpress/copy-data", post(wordpress::copy_data))
         .route("/api/sites/{id}/wordpress/mitigate-vulns", post(wordpress::mitigate_vulns))
         .route("/api/sites/{id}/wordpress/autoupdate-settings", post(wordpress::autoupdate_settings))
+        .route("/api/sites/{id}/wordpress/reinstall-core", post(wordpress::reinstall_core))
         // Git Deploy
         .route("/api/sites/{id}/deploy", get(deploy::get_config).put(deploy::set_config).delete(deploy::remove_config))
         .route("/api/sites/{id}/deploy/trigger", post(deploy::trigger))

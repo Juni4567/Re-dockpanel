@@ -1062,3 +1062,23 @@ pub async fn autoupdate_settings(
         .map_err(|e| agent_error("WP autoupdate settings", e))?;
     Ok(Json(resp))
 }
+
+/// POST /api/sites/{id}/wordpress/reinstall-core — Re-install WordPress core files cleanly
+pub async fn reinstall_core(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/reinstall-core"), None::<serde_json::Value>)
+        .await
+        .map_err(|e| agent_error("WP reinstall core", e))?;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        "wordpress.reinstall_core", Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
+}

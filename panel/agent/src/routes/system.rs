@@ -367,7 +367,7 @@ async fn get_panel_domain() -> Result<Json<serde_json::Value>, (axum::http::Stat
         .await;
     let public_ip = match ip_out {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => "69.197.168.63".to_string(),
+        _ => "127.0.0.1".to_string(),
     };
 
     let ssl_active = std::path::Path::new("/etc/letsencrypt/live").exists()
@@ -403,7 +403,7 @@ async fn configure_panel_domain(
         .await;
     let public_ip = match ip_out {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => "69.197.168.63".to_string(),
+        _ => "127.0.0.1".to_string(),
     };
 
     if let Ok(content) = std::fs::read_to_string(nginx_conf_path) {
