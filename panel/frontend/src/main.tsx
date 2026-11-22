@@ -144,6 +144,7 @@ createRoot(document.getElementById("root")!).render(
               <Route path="/sites/:id/crons" element={<Crons />} />
               <Route path="/sites/:id/deploy" element={<Deploy />} />
               <Route path="/sites/:id/wordpress" element={<WordPress />} />
+              <Route path="/wordpress" element={<Navigate to="/wordpress-toolkit" replace />} />
               <Route path="/wordpress-toolkit" element={<WordPressToolkit />} />
               <Route path="/cdn" element={<Cdn />} />
               <Route path="/dns" element={<Dns />} />

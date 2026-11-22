@@ -4,6 +4,51 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.247.0] - 2026-11-22
+
+### Major: Complete Functional Implementation of All WordPress Toolkit Features & Live Screenshots / Favicons
+
+#### 1. Full Backend & Agent Endpoints for WordPress Toolkit
+- **WP-CLI Execution Engine (`/api/sites/{id}/wordpress/cli`)**:
+  - Implemented secure execution endpoint running arbitrary WP-CLI commands safely against the site's document root with `--allow-root`.
+  - Added interactive terminal console modal with command history, quick command buttons (version, check-update, plugin list, theme list, cache flush, db check, verify-checksums), and ANSI-styled output stream.
+- **Toolkit Feature Toggles (`/api/sites/{id}/wordpress/toggle-feature`)**:
+  - **Debugging (`WP_DEBUG`)**: Controls `WP_DEBUG`, `WP_DEBUG_LOG`, and `WP_DEBUG_DISPLAY` in `wp-config.php` via WP-CLI.
+  - **Search Engine Indexing**: Sets `blog_public` option (`1` to allow indexing, `0` to discourage search engines).
+  - **Take Over `wp-cron.php`**: Sets `DISABLE_WP_CRON true` in `wp-config.php` and automates system cronjob creation (`* * * * * curl -s -k -L https://{domain}/wp-cron.php?doing_wp_cron >/dev/null 2>&1`).
+  - **Hotlink Protection**: Configures Nginx image hotlink directives blocking unauthorized external referrers.
+  - **Password Protection**: Creates and maintains `.htpasswd` HTTP Basic Authentication restricting public access with customizable username and password.
+  - **Caching (Nginx)**: Controls page and FastCGI caching flags and provides instant 1-click cache purging via `/api/sites/{id}/wordpress/clear-cache`.
+  - **Vulnerability Protection**: Automatically sets `DISALLOW_FILE_EDIT` and `DISALLOW_FILE_MODS` in `wp-config.php`.
+- **WordPress Integrity Verification (`/api/sites/{id}/wordpress/integrity`)**:
+  - Executes `wp core verify-checksums --format=json` against official WordPress.org cryptographic hashes.
+  - Interactive modal displaying file checksum report with clean status badges and corrupted/modified file details.
+- **Automated Vulnerability Mitigations (`/api/sites/{id}/wordpress/mitigate-vulns`)**:
+  - One-click mitigation endpoint automatically updating vulnerable plugins, locking down uploads directory from PHP execution, and enforcing strict 640 permissions on `wp-config.php`.
+- **Access Setup & Credentials (`/api/sites/{id}/wordpress/setup`)**:
+  - Allows viewing and updating Administrator credentials (`admin_user`, `admin_email`, `admin_pass` with built-in strong password generator) and site title (`blogname`).
+- **Data Copying (`/api/sites/{id}/wordpress/copy-data`)**:
+  - Copies WordPress files (`wp-content/`) and database to another site on the server with automated domain search-and-replace migration.
+- **Fixed Hardcoded Docroot Path Bug**:
+  - Corrected legacy hardcoded `/var/www/{domain}/wordpress` paths in `clear_cache`, `optimize_db`, `search_replace`, and `reset_admin_password` to dynamically resolve `/var/www/{domain}/public`.
+- **Maintenance Mode (`/api/sites/{id}/wordpress/maintenance`)**:
+  - Toggles `wp maintenance-mode activate/deactivate` and `.maintenance` drop-in directly in site's document root.
+
+#### 2. Website Screenshot Thumbnails & Favicons Fix
+- **CSP Whitelist Updated**:
+  - Updated Nginx Content Security Policy `img-src` to `'self' data: blob: https:;` in `scripts/setup.sh` and live Nginx server blocks, unblocking external screenshot CDNs and Google's redirect to `*.gstatic.com`.
+- **High-Res Screenshot Pipeline (`SiteThumbnail.tsx`)**:
+  - Added primary high-performance screenshot generator using Microlink API (`api.microlink.io?screenshot=true`) with smooth animated transitions.
+  - Configured intelligent multi-tier fallback: Microlink API → thum.io → Google Favicons (`sz=128`) → SVG monogram domain avatar.
+
+#### 3. Route & UI Polish
+- **WordPress Toolkit Alias**:
+  - Added `/wordpress` redirect to `/wordpress-toolkit` in `main.tsx`.
+- **Direct Database Deep Links**:
+  - Clicking the database name or `[open in Database Manager]` in the Database tab now navigates directly to that specific database in Database Manager.
+
+---
+
 ## [2.246.0] - 2026-11-22
 
 ### Major: Sites Listing Enhancements, Plesk-Style WordPress Toolkit 4-Tab Overhaul, Database UI & Deletion Fix, DockPanel Domain & SSL

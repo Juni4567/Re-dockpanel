@@ -1535,7 +1535,7 @@ ${PANEL_TLS_BLOCK}
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
         add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://www.google.com https://image.thum.io https://s0.wp.com; font-src 'self' data:; connect-src 'self' wss:; frame-ancestors 'none';" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' wss:; frame-ancestors 'none';" always;
         add_header X-XSS-Protection "1; mode=block" always;
     }
 
@@ -1557,7 +1557,7 @@ ${PANEL_TLS_BLOCK}
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
         add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://www.google.com https://image.thum.io https://s0.wp.com; font-src 'self' data:; connect-src 'self' wss:; frame-ancestors 'none';" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' wss:; frame-ancestors 'none';" always;
         add_header X-XSS-Protection "1; mode=block" always;
     }
 
@@ -1573,7 +1573,7 @@ ${PANEL_TLS_BLOCK}
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://www.google.com https://image.thum.io https://s0.wp.com; font-src 'self' data:; connect-src 'self' wss:; frame-ancestors 'none';" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' wss:; frame-ancestors 'none';" always;
     add_header X-XSS-Protection "1; mode=block" always;
 }
 NGINXEOF

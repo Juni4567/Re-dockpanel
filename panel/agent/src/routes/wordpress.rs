@@ -31,6 +31,43 @@ pub struct AutoUpdateRequest {
     enabled: bool,
 }
 
+#[derive(serde::Deserialize)]
+pub struct CliRequest {
+    command: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ToggleFeatureRequest {
+    feature: String,
+    enabled: bool,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct MaintenanceRequest {
+    enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetupRequest {
+    admin_user: String,
+    admin_email: String,
+    #[serde(default)]
+    admin_pass: Option<String>,
+    #[serde(default)]
+    site_title: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct CopyDataRequest {
+    dst_domain: String,
+    #[serde(default)]
+    copy_files: bool,
+    #[serde(default)]
+    copy_db: bool,
+}
+
 fn validate_domain(domain: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if !is_valid_domain(domain) {
         return Err((
@@ -74,6 +111,14 @@ pub fn router() -> Router<AppState> {
         .route("/wordpress/{domain}/search-replace", post(search_replace_route))
         .route("/wordpress/{domain}/reset-admin-password", post(reset_admin_password))
         .route("/wordpress/{domain}/db-info", get(db_info_route))
+        .route("/wordpress/{domain}/cli", post(run_cli_route))
+        .route("/wordpress/{domain}/features-status", get(features_status_route))
+        .route("/wordpress/{domain}/toggle-feature", post(toggle_feature_route))
+        .route("/wordpress/{domain}/maintenance", post(maintenance_route))
+        .route("/wordpress/{domain}/setup", post(setup_route))
+        .route("/wordpress/{domain}/integrity", post(integrity_route))
+        .route("/wordpress/{domain}/copy-data", post(copy_data_route))
+        .route("/wordpress/{domain}/mitigate-vulns", post(mitigate_vulns_route))
 }
 
 async fn db_info_route(
@@ -358,11 +403,16 @@ async fn clear_cache(
     Path(domain): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_domain(&domain)?;
-    // Try wp-cli cache flush and delete expired transients
+    let path = wordpress::site_path(&domain).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
     let cache_result = tokio::process::Command::new("wp")
         .args([
             "cache", "flush",
-            &format!("--path=/var/www/{domain}/wordpress"),
+            &format!("--path={path}"),
             "--allow-root",
         ])
         .output()
@@ -371,7 +421,7 @@ async fn clear_cache(
     let transient_result = tokio::process::Command::new("wp")
         .args([
             "transient", "delete", "--expired",
-            &format!("--path=/var/www/{domain}/wordpress"),
+            &format!("--path={path}"),
             "--allow-root",
         ])
         .output()
@@ -393,10 +443,16 @@ async fn optimize_db(
     Path(domain): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_domain(&domain)?;
+    let path = wordpress::site_path(&domain).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
     let output = tokio::process::Command::new("wp")
         .args([
             "db", "optimize",
-            &format!("--path=/var/www/{domain}/wordpress"),
+            &format!("--path={path}"),
             "--allow-root",
         ])
         .output()
@@ -438,12 +494,18 @@ async fn search_replace_route(
             Json(serde_json::json!({"error": "Search string cannot be empty"})),
         ));
     }
+    let path = wordpress::site_path(&domain).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
 
     let mut args = vec![
         "search-replace".to_string(),
         body.search.clone(),
         body.replace.clone(),
-        format!("--path=/var/www/{domain}/wordpress"),
+        format!("--path={path}"),
         "--allow-root".to_string(),
         "--report-changed-only".to_string(),
     ];
@@ -492,6 +554,12 @@ async fn reset_admin_password(
             Json(serde_json::json!({"error": "Password must be at least 8 characters"})),
         ));
     }
+    let path = wordpress::site_path(&domain).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
 
     // Get the first admin user login
     let get_admin = tokio::process::Command::new("wp")
@@ -501,7 +569,7 @@ async fn reset_admin_password(
             "--fields=user_login",
             "--format=csv",
             "--limit=1",
-            &format!("--path=/var/www/{domain}/wordpress"),
+            &format!("--path={path}"),
             "--allow-root",
         ])
         .output()
@@ -509,7 +577,6 @@ async fn reset_admin_password(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Could not list users: {e}")}))))?;
 
     let output_str = String::from_utf8_lossy(&get_admin.stdout);
-    // CSV output: first line is header "user_login", second is the value
     let admin_login = output_str
         .lines()
         .nth(1)
@@ -528,7 +595,7 @@ async fn reset_admin_password(
         .args([
             "user", "update", &admin_login,
             &format!("--user_pass={}", body.new_password),
-            &format!("--path=/var/www/{domain}/wordpress"),
+            &format!("--path={path}"),
             "--allow-root",
         ])
         .output()
@@ -548,4 +615,96 @@ async fn reset_admin_password(
             Json(serde_json::json!({"error": format!("Failed to reset password: {stderr}")})),
         ))
     }
+}
+
+async fn run_cli_route(
+    Path(domain): Path<String>,
+    Json(body): Json<CliRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::run_cli(&domain, &body.command)
+        .await
+        .map(|out| Json(serde_json::json!({ "ok": true, "output": out })))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn features_status_route(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::get_features_status(&domain)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn toggle_feature_route(
+    Path(domain): Path<String>,
+    Json(body): Json<ToggleFeatureRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::toggle_feature(&domain, &body.feature, body.enabled, body.params)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn maintenance_route(
+    Path(domain): Path<String>,
+    Json(body): Json<MaintenanceRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::maintenance(&domain, body.enabled)
+        .await
+        .map(|_| Json(serde_json::json!({ "ok": true, "enabled": body.enabled })))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn setup_route(
+    Path(domain): Path<String>,
+    Json(body): Json<SetupRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::setup_admin(
+        &domain,
+        &body.admin_user,
+        &body.admin_email,
+        body.admin_pass.as_deref(),
+        body.site_title.as_deref(),
+    )
+    .await
+    .map(|msg| Json(serde_json::json!({ "ok": true, "message": msg })))
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn integrity_route(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::verify_integrity(&domain)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn copy_data_route(
+    Path(domain): Path<String>,
+    Json(body): Json<CopyDataRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    validate_domain(&body.dst_domain)?;
+    wordpress::copy_data(&domain, &body.dst_domain, body.copy_files, body.copy_db)
+        .await
+        .map(|msg| Json(serde_json::json!({ "ok": true, "message": msg })))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+}
+
+async fn mitigate_vulns_route(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    wordpress::mitigate_vulns(&domain)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
 }

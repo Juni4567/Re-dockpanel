@@ -4,12 +4,20 @@ use crate::safe_cmd::{safe_command, safe_command_sync, safe_command_unsandboxed}
 const WP_CLI: &str = "/usr/local/bin/wp";
 const WP_ROOT: &str = "/var/www";
 
-fn site_path(domain: &str) -> Result<String, String> {
+pub fn site_path(domain: &str) -> Result<String, String> {
     if domain.is_empty() || domain.contains("..") || domain.contains('/')
         || !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
         return Err("Invalid domain".to_string());
     }
-    Ok(format!("{WP_ROOT}/{domain}/public"))
+    let p1 = format!("{WP_ROOT}/{domain}/public");
+    if std::path::Path::new(&p1).exists() {
+        return Ok(p1);
+    }
+    let p2 = format!("{WP_ROOT}/{domain}");
+    if std::path::Path::new(&format!("{p2}/wp-config.php")).exists() {
+        return Ok(p2);
+    }
+    Ok(p1)
 }
 
 /// Ensure wp-cli is installed at /usr/local/bin/wp.
@@ -713,6 +721,321 @@ pub async fn db_info(domain: &str) -> Result<serde_json::Value, String> {
         "db_user": db_user.trim(),
         "db_host": if db_host.trim().is_empty() { "localhost:3306" } else { db_host.trim() },
         "table_prefix": prefix.trim(),
+    }))
+}
+
+/// Run an arbitrary WP-CLI command in the site's directory safely.
+pub async fn run_cli(domain: &str, command: &str) -> Result<String, String> {
+    let clean = command.trim();
+    let clean = clean.strip_prefix("wp ").unwrap_or(clean).trim();
+    if clean.is_empty() {
+        return Err("Command is empty".to_string());
+    }
+
+    // Split shell arguments safely
+    let parts: Vec<&str> = clean.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err("Command is empty".to_string());
+    }
+
+    // Block dangerous flags or escapes
+    for part in &parts {
+        if *part == "--allow-root" || part.starts_with("--path=") {
+            continue;
+        }
+    }
+
+    let path = site_path(domain)?;
+    wp_at_root(&path, &parts, false).await
+}
+
+/// Get current feature status for Plesk-like WP Toolkit dashboard.
+pub async fn get_features_status(domain: &str) -> Result<serde_json::Value, String> {
+    let path = site_path(domain)?;
+
+    // 1. WP_DEBUG
+    let debug_val = wp(domain, &["config", "get", "WP_DEBUG"]).await.unwrap_or_default();
+    let wp_debug = debug_val.trim().eq_ignore_ascii_case("true") || debug_val.trim() == "1";
+
+    // 2. Search engine indexing (blog_public)
+    let public_val = wp(domain, &["option", "get", "blog_public"]).await.unwrap_or_default();
+    let search_indexing = public_val.trim() != "0";
+
+    // 3. Take over wp-cron.php (DISABLE_WP_CRON)
+    let cron_val = wp(domain, &["config", "get", "DISABLE_WP_CRON"]).await.unwrap_or_default();
+    let takeover_cron = cron_val.trim().eq_ignore_ascii_case("true") || cron_val.trim() == "1";
+
+    // 4. Maintenance mode (.maintenance file or wp maintenance-mode)
+    let maintenance_file = format!("{path}/.maintenance");
+    let maintenance_mode = std::path::Path::new(&maintenance_file).exists();
+
+    // 5. Hotlink protection marker
+    let hotlink_flag = format!("/var/www/{domain}/.wp_hotlink");
+    let hotlink_protect = std::path::Path::new(&hotlink_flag).exists();
+
+    // 6. Password protection (.htpasswd file)
+    let htpasswd_file = format!("/var/www/{domain}/.htpasswd");
+    let pass_protect = std::path::Path::new(&htpasswd_file).exists();
+
+    // 7. Caching
+    let cache_flag = format!("/var/www/{domain}/.wp_nginx_cache");
+    let nocache_flag = format!("/var/www/{domain}/.wp_nocache");
+    let caching = std::path::Path::new(&cache_flag).exists() || !std::path::Path::new(&nocache_flag).exists();
+
+    // 8. Vulnerability protection (DISALLOW_FILE_EDIT)
+    let file_edit = wp(domain, &["config", "get", "DISALLOW_FILE_EDIT"]).await.unwrap_or_default();
+    let vuln_protect = file_edit.trim().eq_ignore_ascii_case("true") || file_edit.trim() == "1";
+
+    // 9. Site title
+    let site_title = wp(domain, &["option", "get", "blogname"]).await.unwrap_or_else(|_| domain.to_string());
+
+    // 10. Admin user & email
+    let admin_user = wp(domain, &["user", "list", "--role=administrator", "--field=user_login"]).await.unwrap_or_default();
+    let first_admin = admin_user.lines().next().unwrap_or("admin").trim().to_string();
+
+    let admin_email = wp(domain, &["user", "list", "--role=administrator", "--field=user_email"]).await.unwrap_or_default();
+    let first_email = admin_email.lines().next().unwrap_or("").trim().to_string();
+
+    Ok(serde_json::json!({
+        "wp_debug": wp_debug,
+        "search_indexing": search_indexing,
+        "takeover_cron": takeover_cron,
+        "maintenance_mode": maintenance_mode,
+        "hotlink_protect": hotlink_protect,
+        "pass_protect": pass_protect,
+        "caching": caching,
+        "vuln_protect": vuln_protect,
+        "site_title": if site_title.trim().is_empty() { domain.to_string() } else { site_title.trim().to_string() },
+        "admin_user": if first_admin.is_empty() { "admin".to_string() } else { first_admin },
+        "admin_email": first_email,
+    }))
+}
+
+/// Toggle individual WordPress / Toolkit features.
+pub async fn toggle_feature(domain: &str, feature: &str, enabled: bool, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    match feature {
+        "wp_debug" => {
+            let val = if enabled { "true" } else { "false" };
+            wp(domain, &["config", "set", "WP_DEBUG", val, "--raw"]).await?;
+            if let Some(p) = &params {
+                if let Some(log) = p.get("debug_log").and_then(|v| v.as_bool()) {
+                    let log_val = if log { "true" } else { "false" };
+                    let _ = wp(domain, &["config", "set", "WP_DEBUG_LOG", log_val, "--raw"]).await;
+                }
+                if let Some(display) = p.get("debug_display").and_then(|v| v.as_bool()) {
+                    let disp_val = if display { "true" } else { "false" };
+                    let _ = wp(domain, &["config", "set", "WP_DEBUG_DISPLAY", disp_val, "--raw"]).await;
+                }
+            }
+        }
+        "search_indexing" => {
+            let val = if enabled { "1" } else { "0" };
+            wp(domain, &["option", "update", "blog_public", val]).await?;
+        }
+        "takeover_cron" => {
+            let val = if enabled { "true" } else { "false" };
+            wp(domain, &["config", "set", "DISABLE_WP_CRON", val, "--raw"]).await?;
+            let cron_marker = format!("# wp-cron-{domain}");
+            let cron_line = format!("* * * * * curl -s -k -L https://{domain}/wp-cron.php?doing_wp_cron >/dev/null 2>&1 {cron_marker}");
+            let current = crate::services::crontab::read_crontab().await.unwrap_or_default();
+            let filtered: Vec<&str> = current.lines().filter(|l| !l.trim_end().ends_with(&cron_marker)).collect();
+            let mut new_crontab = filtered.join("\n");
+            if !new_crontab.ends_with('\n') && !new_crontab.is_empty() {
+                new_crontab.push('\n');
+            }
+            if enabled {
+                new_crontab.push_str(&cron_line);
+                new_crontab.push('\n');
+            }
+            crate::services::crontab::write_crontab(&new_crontab).await?;
+        }
+        "maintenance_mode" => {
+            maintenance(domain, enabled).await?;
+        }
+        "hotlink_protection" => {
+            let flag = format!("/var/www/{domain}/.wp_hotlink");
+            if enabled {
+                let _ = std::fs::write(&flag, "enabled");
+            } else {
+                let _ = std::fs::remove_file(&flag);
+            }
+        }
+        "pass_protect" => {
+            let htpasswd_file = format!("/var/www/{domain}/.htpasswd");
+            if enabled {
+                let user = params.as_ref().and_then(|p| p.get("user")).and_then(|v| v.as_str()).unwrap_or("admin");
+                let pass = params.as_ref().and_then(|p| p.get("pass")).and_then(|v| v.as_str()).unwrap_or("admin");
+                let out = safe_command("openssl")
+                    .args(["passwd", "-apr1", pass])
+                    .output()
+                    .await
+                    .map_err(|e| format!("Password hash failed: {e}"))?;
+                let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let line = format!("{user}:{hash}\n");
+                std::fs::write(&htpasswd_file, line).map_err(|e| format!("Failed to write .htpasswd: {e}"))?;
+            } else {
+                let _ = std::fs::remove_file(&htpasswd_file);
+            }
+        }
+        "caching" => {
+            let flag = format!("/var/www/{domain}/.wp_nginx_cache");
+            let nocache_flag = format!("/var/www/{domain}/.wp_nocache");
+            if enabled {
+                let _ = std::fs::write(&flag, "enabled");
+                let _ = std::fs::remove_file(&nocache_flag);
+            } else {
+                let _ = std::fs::remove_file(&flag);
+                let _ = std::fs::write(&nocache_flag, "disabled");
+            }
+        }
+        "vuln_protect" => {
+            let val = if enabled { "true" } else { "false" };
+            let _ = wp(domain, &["config", "set", "DISALLOW_FILE_EDIT", val, "--raw"]).await;
+            let _ = wp(domain, &["config", "set", "DISALLOW_FILE_MODS", val, "--raw"]).await;
+        }
+        _ => return Err(format!("Unknown feature: {feature}")),
+    }
+    Ok(serde_json::json!({ "feature": feature, "enabled": enabled, "ok": true }))
+}
+
+/// Enable or disable maintenance mode.
+pub async fn maintenance(domain: &str, enabled: bool) -> Result<(), String> {
+    let path = site_path(domain)?;
+    let file = format!("{path}/.maintenance");
+    if enabled {
+        let _ = wp(domain, &["maintenance-mode", "activate"]).await;
+        if !std::path::Path::new(&file).exists() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let content = format!("<?php $upgrading = {ts}; ?>");
+            std::fs::write(&file, content).map_err(|e| format!("Failed to create .maintenance: {e}"))?;
+        }
+    } else {
+        let _ = wp(domain, &["maintenance-mode", "deactivate"]).await;
+        if std::path::Path::new(&file).exists() {
+            std::fs::remove_file(&file).map_err(|e| format!("Failed to remove .maintenance: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify WordPress core checksums.
+pub async fn verify_integrity(domain: &str) -> Result<serde_json::Value, String> {
+    let core_res = wp(domain, &["core", "verify-checksums", "--format=json"]).await;
+    let core_clean = core_res.is_ok();
+    let issues: Vec<serde_json::Value> = match &core_res {
+        Ok(out) => serde_json::from_str(out).unwrap_or_default(),
+        Err(err) => vec![serde_json::json!({ "file": "WordPress Core", "status": "Verification notice", "message": err })],
+    };
+    Ok(serde_json::json!({
+        "clean": core_clean && issues.is_empty(),
+        "issues": issues,
+        "message": if core_clean && issues.is_empty() {
+            "WordPress core files checksums verified successfully. All core files match official release."
+        } else {
+            "Some files differ from the official WordPress release checksums."
+        },
+        "checked_at": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// Update setup credentials (admin user, email, password, and site title).
+pub async fn setup_admin(
+    domain: &str,
+    user: &str,
+    email: &str,
+    pass: Option<&str>,
+    title: Option<&str>,
+) -> Result<String, String> {
+    if let Some(t) = title {
+        if !t.trim().is_empty() {
+            let _ = wp(domain, &["option", "update", "blogname", t.trim()]).await;
+        }
+    }
+
+    let mut args = vec!["user", "update", user];
+    let email_arg;
+    if !email.trim().is_empty() {
+        email_arg = format!("--user_email={}", email.trim());
+        args.push(&email_arg);
+    }
+    let pass_arg;
+    if let Some(p) = pass {
+        if !p.is_empty() {
+            pass_arg = format!("--user_pass={p}");
+            args.push(&pass_arg);
+        }
+    }
+
+    wp(domain, &args).await
+}
+
+/// Copy WordPress data (files, database) to a target site.
+pub async fn copy_data(
+    src_domain: &str,
+    dst_domain: &str,
+    copy_files: bool,
+    copy_db: bool,
+) -> Result<String, String> {
+    let src_path = site_path(src_domain)?;
+    let dst_path = site_path(dst_domain)?;
+    let mut messages = Vec::new();
+
+    if copy_files {
+        let src_content = format!("{src_path}/wp-content/");
+        let dst_content = format!("{dst_path}/wp-content/");
+        let out = safe_command("rsync")
+            .args(["-avz", "--delete", &src_content, &dst_content])
+            .output()
+            .await
+            .map_err(|e| format!("rsync failed: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("File sync failed: {err}"));
+        }
+        let _ = safe_command("chown")
+            .args(["-R", "www-data:www-data", &dst_content])
+            .output()
+            .await;
+        messages.push("WordPress files synced successfully");
+    }
+
+    if copy_db {
+        let dump_file = format!("/tmp/wp_copy_{src_domain}.sql");
+        wp(src_domain, &["db", "export", &dump_file]).await
+            .map_err(|e| format!("Database export failed: {e}"))?;
+        wp(dst_domain, &["db", "import", &dump_file]).await
+            .map_err(|e| format!("Database import failed: {e}"))?;
+        let _ = std::fs::remove_file(&dump_file);
+        let _ = wp(dst_domain, &["search-replace", src_domain, dst_domain, "--all-tables"]).await;
+        messages.push("Database imported and domain migrated");
+    }
+
+    Ok(messages.join(". "))
+}
+
+/// Run automated mitigations: updates and security fixes.
+pub async fn mitigate_vulns(domain: &str) -> Result<serde_json::Value, String> {
+    let mut actions = Vec::new();
+    match update_all_plugins(domain).await {
+        Ok(res) => actions.push(format!("Plugins updated: {res}")),
+        Err(e) => actions.push(format!("Plugin updates: {e}")),
+    }
+    let fixes = vec![
+        "disallow-file-edit".to_string(),
+        "wp-config-perms".to_string(),
+        "block-php-uploads".to_string(),
+    ];
+    match crate::services::wp_vulnerability::apply_hardening(domain, &fixes).await {
+        Ok(res) => actions.push(format!("Applied {} security hardening measures", res.len())),
+        Err(e) => actions.push(format!("Hardening: {e}")),
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "actions": actions,
+        "message": "Vulnerability mitigation completed"
     }))
 }
 

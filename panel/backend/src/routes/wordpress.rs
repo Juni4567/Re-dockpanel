@@ -699,16 +699,10 @@ pub async fn maintenance_mode(
     let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
     let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // Use wp-cli to toggle maintenance mode via the agent shell
-    let cmd = if enabled {
-        format!("wp maintenance-mode activate --path=/var/www/{domain}/wordpress --allow-root 2>&1 || touch /var/www/{domain}/wordpress/.maintenance")
-    } else {
-        format!("wp maintenance-mode deactivate --path=/var/www/{domain}/wordpress --allow-root 2>&1 || rm -f /var/www/{domain}/wordpress/.maintenance")
-    };
-    let agent_body = serde_json::json!({ "command": cmd });
-    let _ = agent
-        .post(&format!("/wordpress/{domain}/shell-exec"), Some(agent_body))
-        .await;
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/maintenance"), Some(body))
+        .await
+        .map_err(|e| agent_error("WordPress maintenance", e))?;
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email,
@@ -716,7 +710,7 @@ pub async fn maintenance_mode(
         Some("site"), Some(&domain), None, None, claims.key_id,
     ).await;
 
-    Ok(Json(serde_json::json!({ "ok": true, "enabled": enabled })))
+    Ok(Json(resp))
 }
 
 /// POST /api/sites/{id}/wordpress/clear-cache — Clear WP object cache and transients.
@@ -918,4 +912,153 @@ pub async fn scan_all_sites(
         "total_vulns": total_vulns,
         "critical_count": critical_count,
     })))
+}
+
+/// POST /api/sites/{id}/wordpress/cli — Run arbitrary WP-CLI command
+pub async fn cli(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/cli"), Some(body))
+        .await
+        .map_err(|e| agent_error("WP-CLI", e))?;
+    Ok(Json(resp))
+}
+
+/// GET /api/sites/{id}/wordpress/features-status — Get WordPress Toolkit feature toggles state
+pub async fn features_status(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let resp: serde_json::Value = agent
+        .get(&format!("/wordpress/{domain}/features-status"))
+        .await
+        .map_err(|e| agent_error("WP features status", e))?;
+    Ok(Json(resp))
+}
+
+/// POST /api/sites/{id}/wordpress/toggle-feature — Toggle individual feature
+pub async fn toggle_feature(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let feature_name = body.get("feature").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/toggle-feature"), Some(body))
+        .await
+        .map_err(|e| agent_error("WP toggle feature", e))?;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        &format!("wordpress.toggle.{feature_name}"),
+        Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
+}
+
+/// POST /api/sites/{id}/wordpress/setup — Update WordPress setup credentials
+pub async fn setup(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/setup"), Some(body))
+        .await
+        .map_err(|e| agent_error("WP setup", e))?;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        "wordpress.setup", Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
+}
+
+/// POST /api/sites/{id}/wordpress/integrity — Check WordPress core integrity checksums
+pub async fn integrity(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/integrity"), None::<serde_json::Value>)
+        .await
+        .map_err(|e| agent_error("WP integrity", e))?;
+    Ok(Json(resp))
+}
+
+/// POST /api/sites/{id}/wordpress/copy-data — Copy files/database to target WordPress site
+pub async fn copy_data(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let dst_domain = body.get("dst_domain").and_then(|v| v.as_str()).unwrap_or("");
+    if dst_domain.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "Destination domain required"));
+    }
+
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/copy-data"), Some(body))
+        .await
+        .map_err(|e| agent_error("WP copy data", e))?;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        "wordpress.copy_data", Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
+}
+
+/// POST /api/sites/{id}/wordpress/mitigate-vulns — Apply automated vulnerability mitigations
+pub async fn mitigate_vulns(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/mitigate-vulns"), None::<serde_json::Value>)
+        .await
+        .map_err(|e| agent_error("WP mitigate vulnerabilities", e))?;
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email,
+        "wordpress.mitigate_vulns", Some("site"), Some(&domain), None, None, claims.key_id,
+    ).await;
+
+    Ok(Json(resp))
+}
+
+/// POST /api/sites/{id}/wordpress/autoupdate-settings — Configure autoupdate policies
+pub async fn autoupdate_settings(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let resp: serde_json::Value = agent
+        .post(&format!("/wordpress/{domain}/auto-update"), Some(serde_json::json!({ "enabled": enabled })))
+        .await
+        .map_err(|e| agent_error("WP autoupdate settings", e))?;
+    Ok(Json(resp))
 }

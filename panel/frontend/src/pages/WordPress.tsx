@@ -45,6 +45,27 @@ interface WpTheme {
   vulnerable?: boolean;
 }
 
+interface WpFeaturesStatus {
+  wp_debug: boolean;
+  search_indexing: boolean;
+  takeover_cron: boolean;
+  maintenance_mode: boolean;
+  hotlink_protect: boolean;
+  pass_protect: boolean;
+  caching: boolean;
+  vuln_protect: boolean;
+  site_title: string;
+  admin_user: string;
+  admin_email: string;
+}
+
+interface CliHistoryItem {
+  cmd: string;
+  output: string;
+  time: string;
+  success: boolean;
+}
+
 export default function WordPress() {
   const { id } = useParams<{ id: string }>();
   const [site, setSite] = useState<Site | null>(null);
@@ -56,7 +77,6 @@ export default function WordPress() {
   const [error, setError] = useState("");
   const [tab, setTab] = useState<"dashboard" | "plugins" | "themes" | "database">("dashboard");
   const [busy, setBusy] = useState("");
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   // Plesk dashboard toggle switches state
   const [siteTitle, setSiteTitle] = useState("WordPress Site");
@@ -73,21 +93,69 @@ export default function WordPress() {
   const [autoUpdatePlugins, setAutoUpdatePlugins] = useState(false);
   const [autoUpdateThemes, setAutoUpdateThemes] = useState(false);
 
-  // Modals
+  // Setup / Admin credentials
+  const [setupUser, setSetupUser] = useState("admin");
+  const [setupPassword, setSetupPassword] = useState("");
+  const [setupEmail, setSetupEmail] = useState("");
+
+  // Modals state
   const [showSetupModal, setShowSetupModal] = useState(false);
   const [showWpCliModal, setShowWpCliModal] = useState(false);
-  const [cliCmd, setCliCmd] = useState("core check-update");
-  const [cliOutput, setCliOutput] = useState("");
+  const [showIntegrityModal, setShowIntegrityModal] = useState(false);
+  const [showMitigateModal, setShowMitigateModal] = useState(false);
+  const [showCopyDataModal, setShowCopyDataModal] = useState(false);
+  const [showPassModal, setShowPassModal] = useState(false);
+  const [showDebugModal, setShowDebugModal] = useState(false);
+  const [showCacheModal, setShowCacheModal] = useState(false);
+  const [showAutoupdateModal, setShowAutoupdateModal] = useState(false);
+  const [showHotlinkModal, setShowHotlinkModal] = useState(false);
+
+  // WP-CLI Console
+  const [cliCmd, setCliCmd] = useState("core version");
   const [cliRunning, setCliRunning] = useState(false);
+  const [cliHistory, setCliHistory] = useState<CliHistoryItem[]>([]);
+
+  // Integrity Check
+  const [integrityLoading, setIntegrityLoading] = useState(false);
+  const [integrityResult, setIntegrityResult] = useState<{
+    clean: boolean;
+    issues: Array<{ file: string; status: string; message?: string }>;
+    message: string;
+    checked_at: string;
+  } | null>(null);
+
+  // Mitigate Vulnerabilities
+  const [mitigating, setMitigating] = useState(false);
+  const [mitigateResult, setMitigateResult] = useState<{
+    ok: boolean;
+    actions: string[];
+    message: string;
+  } | null>(null);
+
+  // Copy Data
+  const [allSites, setAllSites] = useState<Array<{ id: string; domain: string }>>([]);
+  const [copyDstDomain, setCopyDstDomain] = useState("");
+  const [copyFiles, setCopyFiles] = useState(true);
+  const [copyDb, setCopyDb] = useState(true);
+  const [copying, setCopying] = useState(false);
+
+  // Password Protection modal
+  const [passUser, setPassUser] = useState("admin");
+  const [passPassword, setPassPassword] = useState("");
+
+  // Debug settings modal
+  const [debugLog, setDebugLog] = useState(true);
+  const [debugDisplay, setDebugDisplay] = useState(false);
+
+  // Caching modal
+  const [cacheClearing, setCacheClearing] = useState(false);
+
+  // Autoupdate settings
+  const [autoUpdateCore, setAutoUpdateCore] = useState<"minor" | "all" | "disabled">("minor");
 
   // Selected plugins / themes for bulk action
   const [selectedPlugins, setSelectedPlugins] = useState<Set<string>>(new Set());
   const [selectedThemes, setSelectedThemes] = useState<Set<string>>(new Set());
-
-  // Setup / Admin credentials form
-  const [setupUser, setSetupUser] = useState("admin");
-  const [setupPassword, setSetupPassword] = useState("");
-  const [setupEmail, setSetupEmail] = useState("");
 
   // Install form state
   const [showInstall, setShowInstall] = useState(false);
@@ -117,11 +185,31 @@ export default function WordPress() {
         loadPlugins();
         loadThemes();
         loadDbInfo();
+        loadFeaturesStatus();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load WordPress status");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadFeaturesStatus = async () => {
+    try {
+      const feat = await api.get<WpFeaturesStatus>(`/sites/${id}/wordpress/features-status`);
+      setWpDebug(feat.wp_debug);
+      setSearchIndexing(feat.search_indexing);
+      setTakeoverCron(feat.takeover_cron);
+      setMaintenanceMode(feat.maintenance_mode);
+      setHotlinkProtect(feat.hotlink_protect);
+      setPassProtect(feat.pass_protect);
+      setNginxCache(feat.caching);
+      setVulnProtect(feat.vuln_protect);
+      if (feat.site_title) setSiteTitle(feat.site_title);
+      if (feat.admin_user) setSetupUser(feat.admin_user);
+      if (feat.admin_email) setSetupEmail(feat.admin_email);
+    } catch {
+      // defaults preserved
     }
   };
 
@@ -178,8 +266,13 @@ export default function WordPress() {
   const handleUpdate = async (target: string) => {
     setBusy(`update-${target}`);
     try {
-      await api.post(`/sites/${id}/wordpress/update/${target}`, {});
-      showGlobalNotification("success", `${target.toUpperCase()} updated successfully`);
+      if (smartUpdate) {
+        await api.post(`/sites/${id}/wordpress/update-safe`, {});
+        showGlobalNotification("success", `Smart Update: ${target.toUpperCase()} updated with verified health check`);
+      } else {
+        await api.post(`/sites/${id}/wordpress/update/${target}`, {});
+        showGlobalNotification("success", `${target.toUpperCase()} updated successfully`);
+      }
       loadData();
     } catch (e) {
       showGlobalNotification("error", e instanceof Error ? e.message : "Update failed");
@@ -214,6 +307,28 @@ export default function WordPress() {
     }
   };
 
+  // Toggle Features with Backend API
+  const handleToggleFeature = async (feature: string, currentVal: boolean, params?: Record<string, unknown>) => {
+    const nextVal = !currentVal;
+    try {
+      await api.post(`/sites/${id}/wordpress/toggle-feature`, {
+        feature,
+        enabled: nextVal,
+        params,
+      });
+      if (feature === "wp_debug") setWpDebug(nextVal);
+      if (feature === "search_indexing") setSearchIndexing(nextVal);
+      if (feature === "takeover_cron") setTakeoverCron(nextVal);
+      if (feature === "hotlink_protection") setHotlinkProtect(nextVal);
+      if (feature === "pass_protect") setPassProtect(nextVal);
+      if (feature === "caching") setNginxCache(nextVal);
+      if (feature === "vuln_protect") setVulnProtect(nextVal);
+      showGlobalNotification("success", `${feature.replace(/_/g, " ")} ${nextVal ? "enabled" : "disabled"}`);
+    } catch (e) {
+      showGlobalNotification("error", e instanceof Error ? e.message : `Failed to toggle ${feature}`);
+    }
+  };
+
   const handleToggleMaintenance = async () => {
     const nextVal = !maintenanceMode;
     try {
@@ -225,27 +340,140 @@ export default function WordPress() {
     }
   };
 
-  const handleRunCli = async () => {
-    if (!cliCmd.trim()) return;
-    setCliRunning(true);
-    setCliOutput("Executing wp-cli...");
+  const handleSetupSave = async () => {
     try {
-      const res = await api.post<{ output?: string; result?: string }>(`/sites/${id}/wordpress/search-replace`, {
-        // Fallback test endpoint or command
-        search: "test",
-        replace: "test",
+      await api.post(`/sites/${id}/wordpress/setup`, {
+        admin_user: setupUser,
+        admin_email: setupEmail,
+        admin_pass: setupPassword || undefined,
+        site_title: siteTitle,
       });
-      setCliOutput(`$ wp ${cliCmd}\nSuccess: command executed.\n` + (res.output || JSON.stringify(res, null, 2)));
+      showGlobalNotification("success", "WordPress access & setup updated successfully");
+      setShowSetupModal(false);
+      setSetupPassword("");
+      loadFeaturesStatus();
     } catch (e) {
-      setCliOutput(`$ wp ${cliCmd}\n${e instanceof Error ? e.message : "Execution failed"}`);
+      showGlobalNotification("error", e instanceof Error ? e.message : "Failed to update setup credentials");
+    }
+  };
+
+  // WP-CLI interactive console runner
+  const handleRunCli = async (cmdToRun?: string) => {
+    const command = (cmdToRun !== undefined ? cmdToRun : cliCmd).trim();
+    if (!command) return;
+    setCliRunning(true);
+    try {
+      const res = await api.post<{ ok: boolean; output: string }>(`/sites/${id}/wordpress/cli`, {
+        command,
+      });
+      const output = res.output || "Success: Command completed with no output.";
+      setCliHistory((prev) => [
+        ...prev,
+        { cmd: command, output, time: new Date().toLocaleTimeString(), success: true },
+      ]);
+      setCliCmd("");
+    } catch (e) {
+      const err = e instanceof Error ? e.message : "Execution failed";
+      setCliHistory((prev) => [
+        ...prev,
+        { cmd: command, output: err, time: new Date().toLocaleTimeString(), success: false },
+      ]);
     } finally {
       setCliRunning(false);
     }
   };
 
-  const updatesAvailable =
-    plugins.filter((p) => p.update === "available").length +
-    themes.filter((t) => t.update === "available").length;
+  // Integrity Check
+  const handleCheckIntegrity = async () => {
+    setShowIntegrityModal(true);
+    setIntegrityLoading(true);
+    try {
+      const res = await api.post<{
+        clean: boolean;
+        issues: Array<{ file: string; status: string; message?: string }>;
+        message: string;
+        checked_at: string;
+      }>(`/sites/${id}/wordpress/integrity`);
+      setIntegrityResult(res);
+    } catch (e) {
+      showGlobalNotification("error", e instanceof Error ? e.message : "Failed to verify integrity");
+    } finally {
+      setIntegrityLoading(false);
+    }
+  };
+
+  // Mitigate Vulnerabilities
+  const handleMitigateVulns = async () => {
+    setMitigating(true);
+    try {
+      const res = await api.post<{
+        ok: boolean;
+        actions: string[];
+        message: string;
+      }>(`/sites/${id}/wordpress/mitigate-vulns`);
+      setMitigateResult(res);
+      showGlobalNotification("success", res.message || "Mitigations applied");
+      loadPlugins();
+      loadThemes();
+    } catch (e) {
+      showGlobalNotification("error", e instanceof Error ? e.message : "Mitigation failed");
+    } finally {
+      setMitigating(false);
+    }
+  };
+
+  // Open Copy Data Modal & fetch destination sites
+  const openCopyDataModal = async () => {
+    setShowCopyDataModal(true);
+    try {
+      const sitesList = await api.get<Array<{ id: string; domain: string }>>("/sites");
+      const others = sitesList.filter((s) => s.id !== id);
+      setAllSites(others);
+      if (others.length > 0 && !copyDstDomain) {
+        setCopyDstDomain(others[0].domain);
+      }
+    } catch {
+      setAllSites([]);
+    }
+  };
+
+  const handleCopyData = async () => {
+    if (!copyDstDomain) {
+      showGlobalNotification("error", "Please select a destination site");
+      return;
+    }
+    setCopying(true);
+    try {
+      const res = await api.post<{ ok: boolean; message: string }>(`/sites/${id}/wordpress/copy-data`, {
+        dst_domain: copyDstDomain,
+        copy_files: copyFiles,
+        copy_db: copyDb,
+      });
+      showGlobalNotification("success", res.message || "WordPress data copied successfully");
+      setShowCopyDataModal(false);
+    } catch (e) {
+      showGlobalNotification("error", e instanceof Error ? e.message : "Copy failed");
+    } finally {
+      setCopying(false);
+    }
+  };
+
+  const handlePurgeCache = async () => {
+    setCacheClearing(true);
+    try {
+      await api.post(`/sites/${id}/wordpress/clear-cache`);
+      showGlobalNotification("success", "Nginx & WordPress cache purged successfully");
+      setShowCacheModal(false);
+    } catch (e) {
+      showGlobalNotification("error", e instanceof Error ? e.message : "Cache purge failed");
+    } finally {
+      setCacheClearing(false);
+    }
+  };
+
+  const vulnerablePluginsCount = plugins.filter(
+    (p) => p.vulnerable || p.name.toLowerCase().includes("contact form") || p.name.toLowerCase().includes("composer")
+  ).length;
 
   if (loading) {
     return (
@@ -263,7 +491,7 @@ export default function WordPress() {
 
   return (
     <div className="p-6 lg:p-8 animate-fade-up">
-      {/* Top Breadcrumb & Site Title Header */}
+      {/* Top Header & Site Title */}
       <div className="flex items-center justify-between gap-4 mb-6 pb-4 border-b border-dark-600">
         <div className="flex items-center gap-3">
           <Link
@@ -281,8 +509,16 @@ export default function WordPress() {
                 type="text"
                 value={siteTitle}
                 onChange={(e) => setSiteTitle(e.target.value)}
-                onBlur={() => setIsEditingTitle(false)}
-                onKeyDown={(e) => { if (e.key === "Enter") setIsEditingTitle(false); }}
+                onBlur={() => {
+                  setIsEditingTitle(false);
+                  handleSetupSave();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    setIsEditingTitle(false);
+                    handleSetupSave();
+                  }
+                }}
                 autoFocus
                 className="text-lg font-bold text-dark-50 bg-dark-700 border border-dark-500 rounded px-2 py-0.5 outline-none focus:border-rust-500"
               />
@@ -292,7 +528,7 @@ export default function WordPress() {
                 <button
                   onClick={() => setIsEditingTitle(true)}
                   className="text-dark-400 hover:text-dark-200 transition-colors"
-                  title="Edit title"
+                  title="Edit site title"
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
@@ -454,7 +690,7 @@ export default function WordPress() {
             ))}
           </div>
 
-          {/* Tab 1: DASHBOARD */}
+          {/* Tab 1: DASHBOARD (Matches Plesk Screenshot 1) */}
           {tab === "dashboard" && (
             <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
               {/* Left Column: Site Screenshot Preview & WP Toolkit Access Box */}
@@ -482,7 +718,13 @@ export default function WordPress() {
                   <div className="text-xs font-semibold text-dark-100 uppercase tracking-wide">
                     WP Toolkit access
                   </div>
-                  <div className="text-[11px] text-accent-400 hover:underline cursor-pointer">
+                  <div
+                    onClick={() => {
+                      setCliCmd("plugin install wp-toolkit --activate");
+                      setShowWpCliModal(true);
+                    }}
+                    className="text-[11px] text-accent-400 hover:underline cursor-pointer"
+                  >
                     Get WP Toolkit plugin for WordPress
                   </div>
 
@@ -500,7 +742,7 @@ export default function WordPress() {
                     </a>
                     <button
                       onClick={() => setShowSetupModal(true)}
-                      className="text-xs text-dark-300 hover:text-dark-100 px-2 py-1.5 hover:bg-dark-700 rounded transition-colors"
+                      className="text-xs text-dark-300 hover:text-dark-100 px-2.5 py-1.5 hover:bg-dark-700 rounded transition-colors border border-dark-600"
                     >
                       Setup
                     </button>
@@ -525,7 +767,7 @@ export default function WordPress() {
                 </div>
               </div>
 
-              {/* Right Column: Actions Toolbar, 4 Boxes, and Footer */}
+              {/* Right Column: Actions Toolbar, 4 Feature Boxes, and Footer */}
               <div className="lg:col-span-3 space-y-6">
                 {/* Top Action Toolbar */}
                 <div className="flex items-center gap-4 flex-wrap text-xs font-medium text-dark-200 border-b border-dark-700/60 pb-3">
@@ -540,7 +782,7 @@ export default function WordPress() {
                   </Link>
 
                   <button
-                    onClick={() => showGlobalNotification("info", "Copying WordPress data...")}
+                    onClick={openCopyDataModal}
                     className="flex items-center gap-1.5 hover:text-dark-50 transition-colors"
                   >
                     <svg className="w-4 h-4 text-dark-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -560,7 +802,7 @@ export default function WordPress() {
                   </Link>
 
                   <Link
-                    to="/backups"
+                    to={`/backups?site=${id}`}
                     className="flex items-center gap-1.5 hover:text-dark-50 transition-colors"
                   >
                     <svg className="w-4 h-4 text-dark-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -602,7 +844,7 @@ export default function WordPress() {
                       </div>
                       <div className="flex items-center justify-between">
                         <span className="text-dark-300">Plugins</span>
-                        {plugins.some(p => p.update === "available") ? (
+                        {plugins.some((p) => p.update === "available") ? (
                           <button
                             onClick={() => handleUpdate("plugins")}
                             className="text-warn-400 hover:underline flex items-center gap-1"
@@ -618,7 +860,7 @@ export default function WordPress() {
                       </div>
                       <div className="flex items-center justify-between">
                         <span className="text-dark-300">Themes</span>
-                        {themes.some(t => t.update === "available") ? (
+                        {themes.some((t) => t.update === "available") ? (
                           <button
                             onClick={() => handleUpdate("themes")}
                             className="text-warn-400 hover:underline flex items-center gap-1"
@@ -646,12 +888,20 @@ export default function WordPress() {
                         </span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-dark-300">Debugging</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-dark-300">Debugging</span>
+                          <button
+                            onClick={() => setShowDebugModal(true)}
+                            className="text-dark-400 hover:text-dark-200"
+                            title="Debugging settings"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
+                          </button>
+                        </div>
                         <button
-                          onClick={() => {
-                            setWpDebug(!wpDebug);
-                            showGlobalNotification("info", `WP_DEBUG ${!wpDebug ? "enabled" : "disabled"}`);
-                          }}
+                          onClick={() => handleToggleFeature("wp_debug", wpDebug)}
                           className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
                             wpDebug ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -660,11 +910,22 @@ export default function WordPress() {
                         </button>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-dark-300">Password protection</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-dark-300">Password protection</span>
+                          <button
+                            onClick={() => setShowPassModal(true)}
+                            className="text-dark-400 hover:text-dark-200"
+                            title="Password protection settings"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
+                          </button>
+                        </div>
                         <button
                           onClick={() => {
-                            setPassProtect(!passProtect);
-                            showGlobalNotification("info", `Password protection ${!passProtect ? "enabled" : "disabled"}`);
+                            if (!passProtect) setShowPassModal(true);
+                            else handleToggleFeature("pass_protect", true);
                           }}
                           className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
                             passProtect ? "bg-accent-600" : "bg-dark-600"
@@ -684,23 +945,38 @@ export default function WordPress() {
                         <svg className="w-3.5 h-3.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
                           <path fillRule="evenodd" d="M10 1a4.5 4.5 0 0 0-4.5 4.5V9H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-.5V5.5A4.5 4.5 0 0 0 10 1Zm3 8V5.5a3 3 0 1 0-6 0V9h6Z" clipRule="evenodd" />
                         </svg>
-                        Let's Encrypt Active
+                        {site?.ssl_enabled ? "Let's Encrypt Active" : "SSL Pending"}
                       </div>
-                      <div>
+                      <div className="space-y-1">
+                        {vulnerablePluginsCount > 0 ? (
+                          <button
+                            onClick={() => setShowMitigateModal(true)}
+                            className="text-warn-400 hover:underline flex items-center gap-1 text-xs"
+                          >
+                            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                            </svg>
+                            Mitigate vulnerabilities ({vulnerablePluginsCount} detected)
+                          </button>
+                        ) : (
+                          <div className="text-dark-300 flex items-center gap-1">
+                            <span className="text-rust-400">✓</span> No known component vulnerabilities
+                          </div>
+                        )}
                         <button
-                          onClick={() => showGlobalNotification("info", "Vulnerability mitigations applied")}
-                          className="text-warn-400 hover:underline flex items-center gap-1 text-xs"
+                          onClick={() => setShowMitigateModal(true)}
+                          className="text-danger-400 hover:underline flex items-center gap-1 text-xs"
                         >
-                          <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                          </svg>
-                          Mitigate vulnerabilities
+                          ● Apply critical security measures
                         </button>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-dark-300">Vulnerability Protection</span>
+                        <div className="flex items-center gap-1">
+                          <span className="text-dark-300">Vulnerability Protection</span>
+                          <span className="text-dark-400 text-[10px]">🔒</span>
+                        </div>
                         <button
-                          onClick={() => setVulnProtect(!vulnProtect)}
+                          onClick={() => handleToggleFeature("vuln_protect", vulnProtect)}
                           className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
                             vulnProtect ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -709,9 +985,20 @@ export default function WordPress() {
                         </button>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-dark-300">Hotlink protection</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-dark-300">Hotlink protection</span>
+                          <button
+                            onClick={() => setShowHotlinkModal(true)}
+                            className="text-dark-400 hover:text-dark-200"
+                            title="Hotlink settings"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
+                          </button>
+                        </div>
                         <button
-                          onClick={() => setHotlinkProtect(!hotlinkProtect)}
+                          onClick={() => handleToggleFeature("hotlink_protection", hotlinkProtect)}
                           className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
                             hotlinkProtect ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -727,9 +1014,12 @@ export default function WordPress() {
                     <h3 className="text-sm font-semibold text-dark-50">Performance</h3>
                     <div className="space-y-3 text-xs">
                       <div className="flex items-center justify-between">
-                        <span className="text-dark-300">Search engine indexing</span>
+                        <div className="flex items-center gap-1">
+                          <span className="text-dark-300">Search engine indexing</span>
+                          <span className="text-dark-400 cursor-pointer" title="Controls blog_public option in WordPress">ⓘ</span>
+                        </div>
                         <button
-                          onClick={() => setSearchIndexing(!searchIndexing)}
+                          onClick={() => handleToggleFeature("search_indexing", searchIndexing)}
                           className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
                             searchIndexing ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -738,9 +1028,20 @@ export default function WordPress() {
                         </button>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-dark-300">Caching (nginx)</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-dark-300">Caching (nginx)</span>
+                          <button
+                            onClick={() => setShowCacheModal(true)}
+                            className="text-dark-400 hover:text-dark-200"
+                            title="Cache settings & purge"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
+                          </button>
+                        </div>
                         <button
-                          onClick={() => setNginxCache(!nginxCache)}
+                          onClick={() => handleToggleFeature("caching", nginxCache)}
                           className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
                             nginxCache ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -749,9 +1050,12 @@ export default function WordPress() {
                         </button>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-dark-300">Take over wp-cron.php</span>
+                        <div className="flex items-center gap-1">
+                          <span className="text-dark-300">Take over wp-cron.php</span>
+                          <span className="text-dark-400 cursor-pointer" title="Replaces WP pseudo-cron with server cronjob">ⓘ</span>
+                        </div>
                         <button
-                          onClick={() => setTakeoverCron(!takeoverCron)}
+                          onClick={() => handleToggleFeature("takeover_cron", takeoverCron)}
                           className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
                             takeoverCron ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -767,7 +1071,10 @@ export default function WordPress() {
                 <div className="pt-4 border-t border-dark-600 flex items-center justify-between flex-wrap gap-4 text-xs text-dark-300">
                   <div className="flex items-center gap-4 flex-wrap">
                     <button
-                      onClick={() => { loadData(); showGlobalNotification("info", "Refreshed updates"); }}
+                      onClick={() => {
+                        loadData();
+                        showGlobalNotification("info", "Refreshed updates");
+                      }}
                       className="hover:text-dark-100 flex items-center gap-1 transition-colors"
                     >
                       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -776,14 +1083,17 @@ export default function WordPress() {
                       Updates
                     </button>
                     <button
-                      onClick={() => showGlobalNotification("info", "Autoupdate settings open")}
+                      onClick={() => setShowAutoupdateModal(true)}
                       className="hover:text-dark-100 transition-colors"
                     >
                       Autoupdate settings
                     </button>
                     <label className="flex items-center gap-1.5 cursor-pointer">
                       <button
-                        onClick={() => setSmartUpdate(!smartUpdate)}
+                        onClick={() => {
+                          setSmartUpdate(!smartUpdate);
+                          showGlobalNotification("info", `Smart Update ${!smartUpdate ? "enabled" : "disabled"}`);
+                        }}
                         className={`relative inline-flex h-3.5 w-7 items-center rounded-full transition-colors ${
                           smartUpdate ? "bg-accent-600" : "bg-dark-600"
                         }`}
@@ -791,12 +1101,13 @@ export default function WordPress() {
                         <span className={`inline-block h-2.5 w-2.5 rounded-full bg-white transition-transform ${smartUpdate ? "translate-x-3.5" : "translate-x-0.5"}`} />
                       </button>
                       <span>Smart Update</span>
+                      <span className="text-[10px]">🔒</span>
                     </label>
                   </div>
 
                   <div className="flex items-center gap-4 flex-wrap">
                     <button
-                      onClick={() => showGlobalNotification("success", "WordPress core checksum verified clean")}
+                      onClick={handleCheckIntegrity}
                       className="text-rust-400 hover:text-rust-300 flex items-center gap-1.5 transition-colors"
                     >
                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -821,25 +1132,31 @@ export default function WordPress() {
             </div>
           )}
 
-          {/* Tab 2: PLUGINS (Matches Screenshot 2) */}
+          {/* Tab 2: PLUGINS (Matches Plesk Screenshot 2) */}
           {tab === "plugins" && (
             <div className="space-y-4">
               <div className="flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={() => showGlobalNotification("info", "Use WordPress Admin to install new plugins or WP-CLI")}
+                    onClick={() => {
+                      setCliCmd("plugin install ");
+                      setShowWpCliModal(true);
+                    }}
                     className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium transition-colors"
                   >
                     + Install
                   </button>
                   <button
                     disabled={selectedPlugins.size === 0}
-                    onClick={() => {
-                      showGlobalNotification("info", `Removing ${selectedPlugins.size} plugins...`);
+                    onClick={async () => {
+                      for (const name of Array.from(selectedPlugins)) {
+                        await handlePluginAction(name, "delete");
+                      }
+                      setSelectedPlugins(new Set());
                     }}
                     className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 disabled:opacity-40 rounded text-xs font-medium transition-colors"
                   >
-                    ✕ Remove
+                    ✕ Remove ({selectedPlugins.size})
                   </button>
                 </div>
 
@@ -855,7 +1172,10 @@ export default function WordPress() {
                     </button>
                     <span>Autoupdate all plugins</span>
                   </label>
-                  <button className="px-2.5 py-1 bg-dark-700 text-dark-200 hover:text-dark-50 rounded text-xs transition-colors">
+                  <button
+                    onClick={() => loadPlugins()}
+                    className="px-2.5 py-1 bg-dark-700 text-dark-200 hover:text-dark-50 rounded text-xs transition-colors"
+                  >
                     Filter
                   </button>
                 </div>
@@ -870,7 +1190,7 @@ export default function WordPress() {
                           type="checkbox"
                           checked={selectedPlugins.size === plugins.length && plugins.length > 0}
                           onChange={(e) => {
-                            if (e.target.checked) setSelectedPlugins(new Set(plugins.map(p => p.name)));
+                            if (e.target.checked) setSelectedPlugins(new Set(plugins.map((p) => p.name)));
                             else setSelectedPlugins(new Set());
                           }}
                           className="rounded border-dark-500 bg-dark-800"
@@ -885,7 +1205,7 @@ export default function WordPress() {
                   </thead>
                   <tbody className="divide-y divide-dark-700/60 font-sans">
                     {plugins.map((p) => {
-                      const isVulnerable = p.name.toLowerCase().includes("contact form") || p.name.toLowerCase().includes("composer");
+                      const isVulnerable = p.vulnerable || p.name.toLowerCase().includes("contact form") || p.name.toLowerCase().includes("composer");
                       return (
                         <tr key={p.name} className="hover:bg-dark-700/20 transition-colors">
                           <td className="p-3">
@@ -903,8 +1223,8 @@ export default function WordPress() {
                           </td>
                           <td className="p-3">
                             <div className="flex items-center gap-2">
-                              <span className="font-medium text-dark-100">{p.name} {p.version}</span>
-                              <span className="text-dark-400 cursor-pointer" title="Info">ⓘ</span>
+                              <span className="font-medium text-dark-100">{p.title || p.name} {p.version}</span>
+                              <span className="text-dark-400 cursor-pointer" title={`Plugin Slug: ${p.name}`}>ⓘ</span>
                               {isVulnerable && (
                                 <span className="inline-flex items-center gap-1 text-[11px] font-medium text-danger-400 bg-danger-500/10 px-1.5 py-0.5 rounded">
                                   ● Vulnerable
@@ -970,23 +1290,31 @@ export default function WordPress() {
             </div>
           )}
 
-          {/* Tab 3: THEMES (Matches Screenshot 3) */}
+          {/* Tab 3: THEMES (Matches Plesk Screenshot 3) */}
           {tab === "themes" && (
             <div className="space-y-4">
               <div className="flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={() => showGlobalNotification("info", "Install themes via WP-CLI or WordPress Admin")}
+                    onClick={() => {
+                      setCliCmd("theme install ");
+                      setShowWpCliModal(true);
+                    }}
                     className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium transition-colors"
                   >
                     + Install
                   </button>
                   <button
                     disabled={selectedThemes.size === 0}
-                    onClick={() => showGlobalNotification("info", `Removing ${selectedThemes.size} themes...`)}
+                    onClick={async () => {
+                      for (const name of Array.from(selectedThemes)) {
+                        await handleThemeAction(name, "delete");
+                      }
+                      setSelectedThemes(new Set());
+                    }}
                     className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 disabled:opacity-40 rounded text-xs font-medium transition-colors"
                   >
-                    ✕ Remove
+                    ✕ Remove ({selectedThemes.size})
                   </button>
                 </div>
 
@@ -1002,7 +1330,10 @@ export default function WordPress() {
                     </button>
                     <span>Autoupdate all themes</span>
                   </label>
-                  <button className="px-2.5 py-1 bg-dark-700 text-dark-200 hover:text-dark-50 rounded text-xs transition-colors">
+                  <button
+                    onClick={() => loadThemes()}
+                    className="px-2.5 py-1 bg-dark-700 text-dark-200 hover:text-dark-50 rounded text-xs transition-colors"
+                  >
                     Filter
                   </button>
                 </div>
@@ -1017,7 +1348,7 @@ export default function WordPress() {
                           type="checkbox"
                           checked={selectedThemes.size === themes.length && themes.length > 0}
                           onChange={(e) => {
-                            if (e.target.checked) setSelectedThemes(new Set(themes.map(t => t.name)));
+                            if (e.target.checked) setSelectedThemes(new Set(themes.map((t) => t.name)));
                             else setSelectedThemes(new Set());
                           }}
                           className="rounded border-dark-500 bg-dark-800"
@@ -1047,8 +1378,8 @@ export default function WordPress() {
                         </td>
                         <td className="p-3">
                           <div className="flex items-center gap-2">
-                            <span className="font-medium text-dark-100">{t.name} {t.version}</span>
-                            <span className="text-dark-400 cursor-pointer" title="Info">ⓘ</span>
+                            <span className="font-medium text-dark-100">{t.title || t.name} {t.version}</span>
+                            <span className="text-dark-400 cursor-pointer" title={`Theme: ${t.name}`}>ⓘ</span>
                           </div>
                         </td>
                         <td className="p-3">
@@ -1092,7 +1423,7 @@ export default function WordPress() {
             </div>
           )}
 
-          {/* Tab 4: DATABASE (Matches Screenshot 4) */}
+          {/* Tab 4: DATABASE (Matches Plesk Screenshot 4) */}
           {tab === "database" && (
             <div className="bg-dark-800 rounded-lg border border-dark-600 p-6 max-w-2xl space-y-5">
               <h3 className="text-base font-semibold text-dark-50">Database</h3>
@@ -1101,7 +1432,12 @@ export default function WordPress() {
                 <div className="grid grid-cols-3 py-2 border-b border-dark-700/60 items-center">
                   <span className="text-dark-300">Database name</span>
                   <div className="col-span-2 flex items-center gap-2">
-                    <span className="font-mono text-dark-100">{dbInfo?.db_name || "wp_db"}</span>
+                    <Link
+                      to={`/databases?search=${dbInfo?.db_name || ""}`}
+                      className="font-mono text-rust-400 hover:text-rust-300 hover:underline font-medium"
+                    >
+                      {dbInfo?.db_name || "wp_db"}
+                    </Link>
                     <Link
                       to={`/databases?search=${dbInfo?.db_name || ""}`}
                       className="text-xs text-accent-400 hover:underline"
@@ -1122,12 +1458,12 @@ export default function WordPress() {
                   <span className="text-dark-300">Database user name</span>
                   <div className="col-span-2 flex items-center gap-2">
                     <span className="font-mono text-dark-100">{dbInfo?.db_user || "wp_user"}</span>
-                    <button
-                      onClick={() => showGlobalNotification("info", "Edit user credentials in Database Manager")}
+                    <Link
+                      to={`/databases?search=${dbInfo?.db_name || ""}`}
                       className="text-xs text-accent-400 hover:underline"
                     >
                       [change]
-                    </button>
+                    </Link>
                   </div>
                 </div>
 
@@ -1147,11 +1483,23 @@ export default function WordPress() {
       {showSetupModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
           <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-md w-full p-6 space-y-4 shadow-xl">
-            <h3 className="text-base font-semibold text-dark-50">WordPress Toolkit Access Setup</h3>
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50">WordPress Toolkit Access Setup</h3>
+              <button onClick={() => setShowSetupModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
             <p className="text-xs text-dark-300">
-              Configure Administrator credentials for automatic login and management.
+              Configure Administrator credentials and site title for automatic login and management.
             </p>
             <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">Site Title</label>
+                <input
+                  type="text"
+                  value={siteTitle}
+                  onChange={(e) => setSiteTitle(e.target.value)}
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded text-sm text-dark-100 focus:border-rust-500 outline-none"
+                />
+              </div>
               <div>
                 <label className="block text-xs font-medium text-dark-200 mb-1">Admin Username</label>
                 <input
@@ -1172,13 +1520,27 @@ export default function WordPress() {
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-dark-200 mb-1">New Password (optional)</label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-dark-200">New Password (optional)</label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+                      let p = "";
+                      for (let i = 0; i < 16; i++) p += chars[Math.floor(Math.random() * chars.length)];
+                      setSetupPassword(p);
+                    }}
+                    className="text-[11px] text-accent-400 hover:underline"
+                  >
+                    Generate Strong Password
+                  </button>
+                </div>
                 <input
-                  type="password"
+                  type="text"
                   value={setupPassword}
                   onChange={(e) => setSetupPassword(e.target.value)}
                   placeholder="Leave empty to keep current password"
-                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded text-sm text-dark-100 focus:border-rust-500 outline-none"
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded text-sm text-dark-100 font-mono focus:border-rust-500 outline-none"
                 />
               </div>
             </div>
@@ -1190,22 +1552,7 @@ export default function WordPress() {
                 Close
               </button>
               <button
-                onClick={async () => {
-                  if (setupPassword) {
-                    try {
-                      await api.post(`/sites/${id}/wordpress/reset-admin-password`, {
-                        username: setupUser,
-                        password: setupPassword,
-                      });
-                      showGlobalNotification("success", "Admin password reset successfully");
-                    } catch (e) {
-                      showGlobalNotification("error", e instanceof Error ? e.message : "Reset failed");
-                    }
-                  } else {
-                    showGlobalNotification("success", "Access configuration saved");
-                  }
-                  setShowSetupModal(false);
-                }}
+                onClick={handleSetupSave}
                 className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
               >
                 Save Changes
@@ -1218,49 +1565,606 @@ export default function WordPress() {
       {/* WP-CLI Interactive Runner Modal */}
       {showWpCliModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
-          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-2xl w-full p-6 space-y-4 shadow-xl">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-3xl w-full p-6 space-y-4 shadow-xl flex flex-col max-h-[90vh]">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-semibold text-dark-50 flex items-center gap-2">
                 <svg className="w-5 h-5 text-rust-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
                 </svg>
-                WP-CLI Console
+                WP-CLI Terminal Console
               </h3>
-              <button
-                onClick={() => setShowWpCliModal(false)}
-                className="text-dark-400 hover:text-dark-100"
-              >
-                ✕
-              </button>
+              <div className="flex items-center gap-2">
+                {cliHistory.length > 0 && (
+                  <button
+                    onClick={() => setCliHistory([])}
+                    className="text-xs text-dark-400 hover:text-dark-200 px-2 py-1 bg-dark-700 rounded"
+                  >
+                    Clear Screen
+                  </button>
+                )}
+                <button
+                  onClick={() => setShowWpCliModal(false)}
+                  className="text-dark-400 hover:text-dark-100 text-lg px-2"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
-            <p className="text-xs text-dark-300">
-              Run arbitrary WP-CLI commands safely against this WordPress document root.
-            </p>
+
+            {/* Quick command pills */}
+            <div className="flex items-center gap-1.5 flex-wrap text-xs">
+              <span className="text-dark-400 text-[11px] font-mono mr-1">Quick:</span>
+              {[
+                "core version",
+                "core check-update",
+                "plugin list",
+                "theme list",
+                "cache flush",
+                "db check",
+                "user list",
+                "core verify-checksums",
+              ].map((cmd) => (
+                <button
+                  key={cmd}
+                  onClick={() => {
+                    setCliCmd(cmd);
+                    handleRunCli(cmd);
+                  }}
+                  disabled={cliRunning}
+                  className="px-2 py-1 bg-dark-700/80 hover:bg-dark-700 text-dark-300 hover:text-dark-100 rounded font-mono text-[11px] transition-colors"
+                >
+                  {cmd}
+                </button>
+              ))}
+            </div>
+
+            {/* Terminal Output Window */}
+            <div className="flex-1 bg-dark-950 border border-dark-700 rounded-lg p-4 font-mono text-xs text-dark-100 overflow-y-auto space-y-3 min-h-[240px] max-h-[380px]">
+              <div className="text-dark-400 border-b border-dark-800 pb-2">
+                WordPress CLI Environment connected to /var/www/{domain}/public
+                Type any WP-CLI command below (wp prefix is automatic).
+              </div>
+              {cliHistory.map((item, idx) => (
+                <div key={idx} className="space-y-1">
+                  <div className="flex items-center justify-between text-dark-400 text-[11px]">
+                    <span className="text-accent-400 font-semibold">$ wp {item.cmd}</span>
+                    <span>{item.time}</span>
+                  </div>
+                  <pre
+                    className={`whitespace-pre-wrap rounded p-2 text-xs font-mono ${
+                      item.success ? "text-dark-100 bg-dark-900/60" : "text-danger-400 bg-danger-500/10"
+                    }`}
+                  >
+                    {item.output}
+                  </pre>
+                </div>
+              ))}
+              {cliRunning && (
+                <div className="flex items-center gap-2 text-accent-400 py-1">
+                  <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                  </svg>
+                  <span>Executing wp-cli...</span>
+                </div>
+              )}
+            </div>
+
+            {/* Input prompt */}
             <div className="flex gap-2">
-              <span className="px-3 py-2 bg-dark-900 border border-dark-600 rounded-l text-xs font-mono text-dark-300">
+              <span className="px-3 py-2 bg-dark-900 border border-dark-600 rounded-l text-xs font-mono text-dark-300 flex items-center">
                 wp
               </span>
               <input
                 type="text"
                 value={cliCmd}
                 onChange={(e) => setCliCmd(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") handleRunCli(); }}
-                placeholder="core check-update, plugin list, cache flush..."
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleRunCli();
+                }}
+                placeholder="plugin list, option get siteurl, cache flush..."
                 className="flex-1 px-3 py-2 bg-dark-900 border border-dark-600 rounded-r text-xs font-mono text-dark-100 focus:border-rust-500 outline-none"
               />
               <button
-                onClick={handleRunCli}
-                disabled={cliRunning}
-                className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors"
+                onClick={() => handleRunCli()}
+                disabled={cliRunning || !cliCmd.trim()}
+                className="px-5 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors"
               >
                 {cliRunning ? "Running..." : "Run"}
               </button>
             </div>
-            {cliOutput && (
-              <pre className="p-3 bg-dark-950 border border-dark-700 rounded text-xs font-mono text-dark-100 max-h-60 overflow-y-auto whitespace-pre-wrap">
-                {cliOutput}
-              </pre>
-            )}
+          </div>
+        </div>
+      )}
+
+      {/* WordPress Integrity Check Modal */}
+      {showIntegrityModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-2xl w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50 flex items-center gap-2">
+                <svg className="w-5 h-5 text-rust-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                </svg>
+                WordPress Core Integrity Check
+              </h3>
+              <button onClick={() => setShowIntegrityModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">
+              Verifies official WordPress.org cryptographic checksums for every core file in this installation.
+            </p>
+
+            {integrityLoading ? (
+              <div className="py-8 text-center text-dark-300 space-y-2">
+                <div className="w-8 h-8 border-2 border-rust-500 border-t-transparent rounded-full animate-spin mx-auto" />
+                <p className="text-xs">Computing cryptographic checksums against official WordPress repository...</p>
+              </div>
+            ) : integrityResult ? (
+              <div className="space-y-4">
+                <div
+                  className={`p-4 rounded-lg border text-sm flex items-center gap-3 ${
+                    integrityResult.clean
+                      ? "bg-rust-500/10 border-rust-500/30 text-rust-300"
+                      : "bg-warn-500/10 border-warn-500/30 text-warn-300"
+                  }`}
+                >
+                  <span className="text-xl">{integrityResult.clean ? "✓" : "⚠"}</span>
+                  <div>
+                    <div className="font-semibold">
+                      {integrityResult.clean ? "Integrity Clean: All Core Files Verified" : "Checksum Differences Detected"}
+                    </div>
+                    <div className="text-xs text-dark-300 mt-0.5">{integrityResult.message}</div>
+                  </div>
+                </div>
+
+                {integrityResult.issues.length > 0 ? (
+                  <div className="max-h-60 overflow-y-auto border border-dark-700 rounded bg-dark-900 p-2">
+                    <table className="w-full text-xs text-left">
+                      <thead className="border-b border-dark-700 text-dark-400">
+                        <tr>
+                          <th className="p-2">File</th>
+                          <th className="p-2">Status</th>
+                          <th className="p-2">Details</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-dark-800 font-mono">
+                        {integrityResult.issues.map((issue, idx) => (
+                          <tr key={idx}>
+                            <td className="p-2 text-dark-100">{issue.file}</td>
+                            <td className="p-2 text-warn-400">{issue.status}</td>
+                            <td className="p-2 text-dark-300">{issue.message || "Checksum mismatch"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="p-3 bg-dark-900 rounded text-xs text-dark-300 font-mono text-center">
+                    All core files match the official release without any modifications.
+                  </div>
+                )}
+              </div>
+            ) : null}
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={handleCheckIntegrity}
+                disabled={integrityLoading}
+                className="px-4 py-2 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium transition-colors"
+              >
+                Re-check
+              </button>
+              <button
+                onClick={() => setShowIntegrityModal(false)}
+                className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Mitigate Vulnerabilities Modal */}
+      {showMitigateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-xl w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50 flex items-center gap-2">
+                <svg className="w-5 h-5 text-warn-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+                Vulnerability Mitigations & Hardening
+              </h3>
+              <button onClick={() => setShowMitigateModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">
+              Apply automated mitigation fixes, patch vulnerable plugins, restrict file execution in wp-content/uploads, and lockdown file modifications.
+            </p>
+
+            <div className="space-y-2 text-xs">
+              <div className="p-3 bg-dark-900 border border-dark-700 rounded space-y-1.5">
+                <div className="font-semibold text-dark-100">Included Mitigation Actions:</div>
+                <div className="text-dark-300 flex items-center gap-2">
+                  <span className="text-rust-400">✓</span> Auto-update all vulnerable plugins to latest patched versions
+                </div>
+                <div className="text-dark-300 flex items-center gap-2">
+                  <span className="text-rust-400">✓</span> Block direct PHP execution inside /wp-content/uploads
+                </div>
+                <div className="text-dark-300 flex items-center gap-2">
+                  <span className="text-rust-400">✓</span> Restrict wp-config.php filesystem permissions to 640
+                </div>
+                <div className="text-dark-300 flex items-center gap-2">
+                  <span className="text-rust-400">✓</span> Lock down dashboard file editors (DISALLOW_FILE_EDIT)
+                </div>
+              </div>
+
+              {mitigateResult && (
+                <div className="p-3 bg-rust-500/10 border border-rust-500/30 rounded text-xs text-rust-300 space-y-1">
+                  <div className="font-semibold">{mitigateResult.message}</div>
+                  <ul className="list-disc pl-4 space-y-0.5 text-dark-200">
+                    {mitigateResult.actions.map((act, i) => (
+                      <li key={i}>{act}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowMitigateModal(false)}
+                className="px-4 py-2 bg-dark-700 hover:bg-dark-600 text-dark-200 rounded text-xs transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleMitigateVulns}
+                disabled={mitigating}
+                className="px-5 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors flex items-center gap-1.5"
+              >
+                {mitigating ? "Applying Mitigations..." : "Apply All Mitigations Now"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Copy Data Modal */}
+      {showCopyDataModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-md w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50 flex items-center gap-2">
+                <svg className="w-5 h-5 text-rust-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                </svg>
+                Copy WordPress Data
+              </h3>
+              <button onClick={() => setShowCopyDataModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">
+              Copy files and database from <strong className="text-dark-100">{domain}</strong> to another destination site with automatic domain migration.
+            </p>
+
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block font-medium text-dark-200 mb-1">Destination Site</label>
+                <select
+                  value={copyDstDomain}
+                  onChange={(e) => setCopyDstDomain(e.target.value)}
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded text-sm text-dark-100 focus:border-rust-500 outline-none"
+                >
+                  {allSites.map((s) => (
+                    <option key={s.id} value={s.domain}>
+                      {s.domain}
+                    </option>
+                  ))}
+                  {allSites.length === 0 && <option value="">No other sites available</option>}
+                </select>
+              </div>
+
+              <div className="p-3 bg-dark-900 border border-dark-700 rounded space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer text-dark-100">
+                  <input
+                    type="checkbox"
+                    checked={copyFiles}
+                    onChange={(e) => setCopyFiles(e.target.checked)}
+                    className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                  />
+                  <span>Copy WordPress Files (themes, plugins, uploads)</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-dark-100">
+                  <input
+                    type="checkbox"
+                    checked={copyDb}
+                    onChange={(e) => setCopyDb(e.target.checked)}
+                    className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                  />
+                  <span>Copy WordPress Database (with search-and-replace migration)</span>
+                </label>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowCopyDataModal(false)}
+                className="px-4 py-2 bg-dark-700 hover:bg-dark-600 text-dark-200 rounded text-xs transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCopyData}
+                disabled={copying || !copyDstDomain || (!copyFiles && !copyDb)}
+                className="px-5 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors"
+              >
+                {copying ? "Copying Data..." : "Start Copy"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Password Protection Modal */}
+      {showPassModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-sm w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50">Password Protection</h3>
+              <button onClick={() => setShowPassModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">
+              Restrict public access to this site with HTTP Basic Authentication (.htpasswd).
+            </p>
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block text-dark-200 mb-1">Username</label>
+                <input
+                  type="text"
+                  value={passUser}
+                  onChange={(e) => setPassUser(e.target.value)}
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded text-dark-100 outline-none focus:border-rust-500"
+                />
+              </div>
+              <div>
+                <label className="block text-dark-200 mb-1">Password</label>
+                <input
+                  type="password"
+                  value={passPassword}
+                  onChange={(e) => setPassPassword(e.target.value)}
+                  placeholder="Enter protection password"
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded text-dark-100 outline-none focus:border-rust-500"
+                />
+              </div>
+            </div>
+            <div className="flex justify-between gap-2 pt-2 border-t border-dark-700">
+              {passProtect ? (
+                <button
+                  onClick={async () => {
+                    await handleToggleFeature("pass_protect", true);
+                    setShowPassModal(false);
+                  }}
+                  className="px-3 py-1.5 bg-danger-500/20 text-danger-300 hover:bg-danger-500/30 rounded text-xs transition-colors"
+                >
+                  Disable Protection
+                </button>
+              ) : <div />}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowPassModal(false)}
+                  className="px-3 py-1.5 bg-dark-700 text-dark-200 rounded text-xs transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={async () => {
+                    await handleToggleFeature("pass_protect", false, { user: passUser, pass: passPassword });
+                    setShowPassModal(false);
+                  }}
+                  disabled={!passPassword}
+                  className="px-4 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors"
+                >
+                  Enable
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Debugging Settings Modal */}
+      {showDebugModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-sm w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50">Debugging Settings</h3>
+              <button onClick={() => setShowDebugModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">Configure WordPress debugging directives in wp-config.php.</p>
+            <div className="space-y-3 text-xs">
+              <label className="flex items-center justify-between p-2 bg-dark-900 rounded border border-dark-700 cursor-pointer">
+                <div>
+                  <div className="font-semibold text-dark-100">WP_DEBUG_LOG</div>
+                  <div className="text-[11px] text-dark-400">Save notices & errors to /wp-content/debug.log</div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={debugLog}
+                  onChange={(e) => setDebugLog(e.target.checked)}
+                  className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                />
+              </label>
+              <label className="flex items-center justify-between p-2 bg-dark-900 rounded border border-dark-700 cursor-pointer">
+                <div>
+                  <div className="font-semibold text-dark-100">WP_DEBUG_DISPLAY</div>
+                  <div className="text-[11px] text-dark-400">Display errors on webpage directly (disable in prod)</div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={debugDisplay}
+                  onChange={(e) => setDebugDisplay(e.target.checked)}
+                  className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                />
+              </label>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowDebugModal(false)}
+                className="px-3 py-1.5 bg-dark-700 text-dark-200 rounded text-xs transition-colors"
+              >
+                Close
+              </button>
+              <button
+                onClick={async () => {
+                  await handleToggleFeature("wp_debug", false, { debug_log: debugLog, debug_display: debugDisplay });
+                  setShowDebugModal(false);
+                }}
+                className="px-4 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Caching Modal */}
+      {showCacheModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-sm w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50">Nginx & WordPress Caching</h3>
+              <button onClick={() => setShowCacheModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">FastCGI caching and object cache management for maximum performance.</p>
+            <div className="space-y-3 text-xs">
+              <div className="p-3 bg-dark-900 rounded border border-dark-700">
+                <div className="font-semibold text-dark-100 mb-1">Status: {nginxCache ? "Active" : "Disabled"}</div>
+                <div className="text-dark-400">Page caching accelerates HTML delivery directly from Nginx RAM cache.</div>
+              </div>
+              <button
+                onClick={handlePurgeCache}
+                disabled={cacheClearing}
+                className="w-full py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
+              >
+                {cacheClearing ? "Purging..." : "Purge All Caches Now"}
+              </button>
+            </div>
+            <div className="flex justify-end pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowCacheModal(false)}
+                className="px-4 py-1.5 bg-dark-700 text-dark-200 rounded text-xs transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Autoupdate Settings Modal */}
+      {showAutoupdateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-sm w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50">Autoupdate Settings</h3>
+              <button onClick={() => setShowAutoupdateModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">Set automated security update policies for WordPress Core, Plugins, and Themes.</p>
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block text-dark-200 mb-1 font-medium">Core Updates</label>
+                <select
+                  value={autoUpdateCore}
+                  onChange={(e) => setAutoUpdateCore(e.target.value as "minor" | "all" | "disabled")}
+                  className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded text-dark-100 outline-none"
+                >
+                  <option value="minor">Minor updates only (Recommended)</option>
+                  <option value="all">Major & minor updates</option>
+                  <option value="disabled">Disable automatic core updates</option>
+                </select>
+              </div>
+              <div className="p-3 bg-dark-900 rounded border border-dark-700 space-y-2">
+                <label className="flex items-center justify-between cursor-pointer">
+                  <span className="text-dark-100">Plugins Autoupdate</span>
+                  <input
+                    type="checkbox"
+                    checked={autoUpdatePlugins}
+                    onChange={(e) => setAutoUpdatePlugins(e.target.checked)}
+                    className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                  />
+                </label>
+                <label className="flex items-center justify-between cursor-pointer">
+                  <span className="text-dark-100">Themes Autoupdate</span>
+                  <input
+                    type="checkbox"
+                    checked={autoUpdateThemes}
+                    onChange={(e) => setAutoUpdateThemes(e.target.checked)}
+                    className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                  />
+                </label>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowAutoupdateModal(false)}
+                className="px-3 py-1.5 bg-dark-700 text-dark-200 rounded text-xs transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    await api.post(`/sites/${id}/wordpress/autoupdate-settings`, {
+                      enabled: autoUpdateCore !== "disabled",
+                    });
+                    showGlobalNotification("success", "Autoupdate settings saved");
+                    setShowAutoupdateModal(false);
+                  } catch (e) {
+                    showGlobalNotification("error", e instanceof Error ? e.message : "Failed to save autoupdate settings");
+                  }
+                }}
+                className="px-4 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hotlink Protection Modal */}
+      {showHotlinkModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-sm w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50">Hotlink Protection</h3>
+              <button onClick={() => setShowHotlinkModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <p className="text-xs text-dark-300">
+              Prevents other websites from embedding your images, saving server bandwidth and preventing content scraping.
+            </p>
+            <div className="p-3 bg-dark-900 rounded border border-dark-700 text-xs text-dark-200">
+              <div>Protected Extensions: .jpg, .jpeg, .png, .gif, .webp, .svg</div>
+              <div className="mt-1 text-dark-400">Allowed Referrers: {domain}, google.com, bing.com</div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowHotlinkModal(false)}
+                className="px-3 py-1.5 bg-dark-700 text-dark-200 rounded text-xs transition-colors"
+              >
+                Close
+              </button>
+              <button
+                onClick={() => {
+                  handleToggleFeature("hotlink_protection", hotlinkProtect);
+                  setShowHotlinkModal(false);
+                }}
+                className="px-4 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
+              >
+                {hotlinkProtect ? "Disable Hotlink Protection" : "Enable Hotlink Protection"}
+              </button>
+            </div>
           </div>
         </div>
       )}
