@@ -1,13 +1,14 @@
 [package]
 name = "dockpanel-api"
-version = "2.245.0"
+version = "2.246.0"
 license = "AGPL-3.0-only"
 edition = "2024"
 
 [profile.release]
 strip = true
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
+opt-level = 3
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }

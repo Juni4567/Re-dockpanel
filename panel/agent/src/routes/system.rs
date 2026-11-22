@@ -335,6 +335,130 @@ async fn port_check(
     Ok(Json(serde_json::json!({ "port": port, "free": free })))
 }
 
+#[derive(serde::Deserialize)]
+struct ConfigurePanelDomainReq {
+    domain: String,
+}
+
+async fn get_panel_domain() -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    let nginx_conf_paths = [
+        "/etc/nginx/sites-enabled/dockpanel-panel.conf",
+        "/etc/nginx/conf.d/dockpanel-panel.conf",
+    ];
+    let mut configured_domain: Option<String> = None;
+    for path in nginx_conf_paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("server_name ") {
+                    let d = trimmed.trim_start_matches("server_name ").trim_end_matches(';').trim();
+                    if !d.is_empty() && d != "_" {
+                        configured_domain = Some(d.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let ip_out = safe_command_unsandboxed("curl", &[])
+        .args(["-s4", "--max-time", "3", "https://api.ipify.org"])
+        .output()
+        .await;
+    let public_ip = match ip_out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "69.197.168.63".to_string(),
+    };
+
+    let ssl_active = std::path::Path::new("/etc/letsencrypt/live").exists()
+        || std::path::Path::new("/etc/dockpanel/ssl/panel.crt").exists();
+
+    Ok(Json(serde_json::json!({
+        "configured_domain": configured_domain,
+        "public_ip": public_ip,
+        "ssl_active": ssl_active,
+    })))
+}
+
+async fn configure_panel_domain(
+    Json(body): Json<ConfigurePanelDomainReq>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    let domain = body.domain.trim().to_lowercase();
+    if domain.is_empty() || !super::is_valid_domain(&domain) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid domain name"})),
+        ));
+    }
+
+    let nginx_conf_path = if std::path::Path::new("/etc/nginx/sites-enabled").exists() {
+        "/etc/nginx/sites-enabled/dockpanel-panel.conf"
+    } else {
+        "/etc/nginx/conf.d/dockpanel-panel.conf"
+    };
+
+    if let Ok(content) = std::fs::read_to_string(nginx_conf_path) {
+        let mut new_lines = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("server_name ") {
+                new_lines.push(format!("    server_name {domain};"));
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+        std::fs::write(nginx_conf_path, new_lines.join("\n")).ok();
+    }
+
+    let certbot_res = safe_command_unsandboxed("certbot", &[])
+        .args([
+            "--nginx",
+            "-d",
+            &domain,
+            "--non-interactive",
+            "--agree-tos",
+            "--register-unsafely-without-email",
+            "--redirect",
+        ])
+        .output()
+        .await;
+
+    let (ssl_success, certbot_msg) = match certbot_res {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            (out.status.success(), format!("{stdout}\n{stderr}"))
+        }
+        Err(e) => (false, format!("Failed to execute certbot: {e}")),
+    };
+
+    let _ = safe_command_unsandboxed("nginx", &["-s", "reload"]).output().await;
+
+    if let Ok(env_content) = std::fs::read_to_string("/etc/dockpanel/api.env") {
+        let mut lines = Vec::new();
+        let mut found = false;
+        for line in env_content.lines() {
+            if line.starts_with("BASE_URL=") {
+                lines.push(format!("BASE_URL=https://{domain}"));
+                found = true;
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+        if !found {
+            lines.push(format!("BASE_URL=https://{domain}"));
+        }
+        std::fs::write("/etc/dockpanel/api.env", lines.join("\n")).ok();
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "domain": domain,
+        "ssl": ssl_success,
+        "details": certbot_msg.trim(),
+    })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/system/info", get(system_info))
@@ -344,4 +468,5 @@ pub fn router() -> Router<AppState> {
         .route("/system/port-check", get(port_check))
         .route("/system/cleanup", axum::routing::post(disk_cleanup))
         .route("/system/hostname", axum::routing::post(change_hostname))
+        .route("/system/panel-domain", get(get_panel_domain).post(configure_panel_domain))
 }

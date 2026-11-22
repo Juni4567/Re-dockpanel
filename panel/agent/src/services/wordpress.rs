@@ -702,6 +702,20 @@ pub async fn update_with_rollback(domain: &str) -> Result<serde_json::Value, Str
     }))
 }
 
+/// Get database connection details from wp-config.php
+pub async fn db_info(domain: &str) -> Result<serde_json::Value, String> {
+    let db_name = wp(domain, &["config", "get", "DB_NAME"]).await.unwrap_or_default();
+    let db_user = wp(domain, &["config", "get", "DB_USER"]).await.unwrap_or_default();
+    let db_host = wp(domain, &["config", "get", "DB_HOST"]).await.unwrap_or_default();
+    let prefix = wp(domain, &["config", "get", "table_prefix"]).await.unwrap_or_else(|_| "wp_".into());
+    Ok(serde_json::json!({
+        "db_name": db_name.trim(),
+        "db_user": db_user.trim(),
+        "db_host": if db_host.trim().is_empty() { "localhost:3306" } else { db_host.trim() },
+        "table_prefix": prefix.trim(),
+    }))
+}
+
 #[cfg(test)]
 mod canonical_url_tests {
     use super::{auto_update_marker, https_promotion_target, line_marked_for};

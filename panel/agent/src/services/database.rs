@@ -240,38 +240,47 @@ pub async fn remove_database(container_id: &str) -> Result<(), String> {
     // carries this same `dockpanel.managed=true` boundary, and this module never did. A
     // stray unmanaged container sharing this exact id would otherwise be force-removed
     // with its volumes.
-    let info = docker
-        .inspect_container(container_id, None)
-        .await
-        .map_err(|e| format!("Failed to inspect container: {e}"))?;
-    let managed = info
-        .config
-        .as_ref()
-        .and_then(|c| c.labels.as_ref())
-        .and_then(|l| l.get("dockpanel.managed"))
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    if !managed {
-        return Err("not a dockpanel-managed container".to_string());
+    let inspect_result = docker.inspect_container(container_id, None).await;
+    match inspect_result {
+        Ok(info) => {
+            let managed = info
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.as_ref())
+                .and_then(|l| l.get("dockpanel.managed"))
+                .map(|v| v == "true")
+                .unwrap_or(false);
+            if !managed {
+                return Err("not a dockpanel-managed container".to_string());
+            }
+
+            // Stop first
+            docker
+                .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+                .await
+                .ok(); // Ignore if already stopped
+
+            docker
+                .remove_container(
+                    container_id,
+                    Some(RemoveContainerOptions {
+                        v: true, // remove volumes
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|e| format!("Failed to remove container: {e}"))?;
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("404") || err_str.to_lowercase().contains("no such container") {
+                tracing::info!("Database container {container_id} already absent from Docker; proceeding");
+            } else {
+                return Err(format!("Failed to inspect container: {e}"));
+            }
+        }
     }
-
-    // Stop first
-    docker
-        .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
-        .await
-        .ok(); // Ignore if already stopped
-
-    docker
-        .remove_container(
-            container_id,
-            Some(RemoveContainerOptions {
-                v: true, // remove volumes
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| format!("Failed to remove container: {e}"))?;
 
     tracing::info!("Database container removed: {container_id}");
     Ok(())

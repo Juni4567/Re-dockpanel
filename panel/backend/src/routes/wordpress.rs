@@ -414,7 +414,7 @@ pub async fn all_wp_sites(
             "timeout".into(),
         ))) {
             // Filter out non-WordPress sites: agent returns `{"installed": false}` for them
-            let installed = info.get("installed").and_then(|v| v.as_bool()).unwrap_or(true);
+            let installed = info.get("installed").and_then(|v| v.as_bool()).unwrap_or(false);
             if !installed {
                 continue;
             }
@@ -423,11 +423,12 @@ pub async fn all_wp_sites(
             let version = info
                 .get("version")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+                .unwrap_or("")
+                .trim()
                 .to_string();
 
-            // Skip sites that returned a non-WP placeholder (empty or "unknown" version with no other WP fields)
-            if version == "unknown" && info.get("update_available").is_none() {
+            // Skip sites that returned a non-WP placeholder
+            if version.is_empty() || version == "unknown" {
                 continue;
             }
             let update_available = info
@@ -858,4 +859,63 @@ pub async fn update_safe(
     ).await;
 
     Ok(Json(result))
+}
+
+/// GET /api/sites/{id}/wordpress/db-info — Get WordPress database details
+pub async fn db_info(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let resp = agent
+        .get(&format!("/wordpress/{domain}/db-info"))
+        .await
+        .map_err(|e| agent_error("WP db info", e))?;
+    Ok(Json(resp))
+}
+
+/// POST /api/wordpress/scan-all — Run vulnerability scan across all WP sites on server
+pub async fn scan_all_sites(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    ServerScope(server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let sites: Vec<(Uuid, Uuid, String)> = if claims.role == "admin" {
+        sqlx::query_as("SELECT id, user_id, domain FROM sites WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| internal_error("scan all wp sites (admin)", e))?
+    } else {
+        sqlx::query_as("SELECT id, user_id, domain FROM sites WHERE user_id = $1 AND server_id = $2")
+            .bind(claims.sub)
+            .bind(server_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| internal_error("scan all wp sites", e))?
+    };
+
+    let mut scanned = 0;
+    let mut total_vulns = 0;
+    let mut critical_count = 0;
+
+    for (site_id, user_id, domain) in sites {
+        if let Ok(info) = agent.get(&format!("/wordpress/{domain}/detect")).await {
+            let is_wp = info.get("detected").and_then(|v| v.as_bool()).unwrap_or(false);
+            if is_wp {
+                if let Ok(res) = scan_and_store(&state.db, site_id, user_id, &domain, &agent).await {
+                    scanned += 1;
+                    total_vulns += res.get("total_vulns").and_then(|v| v.as_i64()).unwrap_or(0);
+                    critical_count += res.get("critical_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "scanned": scanned,
+        "total_vulns": total_vulns,
+        "critical_count": critical_count,
+    })))
 }

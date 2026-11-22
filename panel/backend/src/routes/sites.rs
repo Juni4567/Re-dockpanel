@@ -8,7 +8,7 @@ use axum::{
 use futures::stream::StreamExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
@@ -308,6 +308,97 @@ pub async fn list_for_admin(
     .map_err(|e| internal_error("list sites for admin", e))?;
 
     Ok(Json(sites))
+}
+
+/// GET /api/sites/metrics-overview — Returns disk usage, monthly traffic, server path, and DB/mail indicators for sites.
+pub async fn metrics_overview(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    ServerScope(server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let sites: Vec<(Uuid, String, Option<String>)> = if claims.role == "admin" {
+        sqlx::query_as("SELECT id, domain, root_path FROM sites WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| internal_error("metrics_overview", e))?
+    } else {
+        sqlx::query_as("SELECT id, domain, root_path FROM sites WHERE user_id = $1 AND server_id = $2")
+            .bind(claims.sub)
+            .bind(server_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| internal_error("metrics_overview", e))?
+    };
+
+    let year_month = chrono::Utc::now().format("%Y-%m").to_string();
+    let traffic_rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT site_id, bytes_used FROM site_traffic_usage WHERE year_month = $1",
+    )
+    .bind(&year_month)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let traffic_map: HashMap<Uuid, i64> = traffic_rows.into_iter().collect();
+
+    // Query databases on this server to see which sites have databases
+    let db_sites: Vec<(Option<Uuid>,)> = sqlx::query_as(
+        "SELECT site_id FROM databases WHERE site_id IS NOT NULL",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let db_site_set: HashSet<Uuid> = db_sites.into_iter().filter_map(|(s,)| s).collect();
+
+    // Query mail domains
+    let mail_domains: Vec<(String,)> = sqlx::query_as(
+        "SELECT domain FROM mail_domains",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mail_domain_set: HashSet<String> = mail_domains.into_iter().map(|(d,)| d.to_lowercase()).collect();
+
+    // Query disk usages from agent for all sites
+    let disk_usages = agent.get("/sites/disk-usages").await.ok();
+    let disk_map: HashMap<String, u64> = disk_usages
+        .and_then(|v| serde_json::from_value::<HashMap<String, u64>>(v).ok())
+        .unwrap_or_default();
+
+    let mut result = serde_json::Map::new();
+
+    for (id, domain, root_path) in sites {
+        let clean_domain = domain.trim();
+        let server_location = if let Some(ref rp) = root_path {
+            let trimmed = rp.trim_matches('/');
+            if trimmed.is_empty() {
+                format!("/var/www/{clean_domain}/public")
+            } else {
+                format!("/var/www/{clean_domain}/{trimmed}")
+            }
+        } else {
+            format!("/var/www/{clean_domain}/public")
+        };
+
+        let disk_bytes = disk_map.get(clean_domain).copied().unwrap_or(0);
+        let traffic_bytes = traffic_map.get(&id).copied().unwrap_or(0);
+        let has_database = db_site_set.contains(&id);
+        let has_mail = mail_domain_set.contains(&clean_domain.to_lowercase());
+
+        result.insert(
+            id.to_string(),
+            serde_json::json!({
+                "disk_usage_bytes": disk_bytes,
+                "traffic_bytes_this_month": traffic_bytes,
+                "server_location": server_location,
+                "has_database": has_database,
+                "has_mail": has_mail,
+            }),
+        );
+    }
+
+    Ok(Json(serde_json::Value::Object(result)))
 }
 
 /// POST /api/sites — Create a new site.

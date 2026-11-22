@@ -1022,6 +1022,11 @@ export default function WordPressToolkit() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [updating, setUpdating] = useState(false);
   const [scanning, setScanning] = useState<string | null>(null);
+  const [scanningAll, setScanningAll] = useState(false);
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState<"domain" | "version" | "vulns" | "updates">("domain");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
+  const [viewMode, setViewMode] = useState<"grid" | "table">("grid");
   const [scanResults, setScanResults] = useState<Record<string, VulnScanResult>>({});
   const [securityChecks, setSecurityChecks] = useState<Record<string, SecurityItem[]>>({});
   const [hardeningHistory, setHardeningHistory] = useState<Record<string, HardeningHistoryRow[]>>({});
@@ -1029,6 +1034,22 @@ export default function WordPressToolkit() {
   const [hardening, setHardening] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+
+  const handleScanAll = async () => {
+    setScanningAll(true);
+    try {
+      const res = await api.post<{ scanned: number; total_vulns: number; critical_count: number }>("/wordpress/scan-all");
+      showGlobalNotification(
+        "success",
+        `Scanned ${res.scanned} WordPress site${res.scanned !== 1 ? "s" : ""}. Detected ${res.total_vulns} vulnerabilities (${res.critical_count} critical).`
+      );
+      fetchSites();
+    } catch (e) {
+      showGlobalNotification("error", e instanceof Error ? e.message : "Failed to scan all WordPress sites");
+    } finally {
+      setScanningAll(false);
+    }
+  };
 
   // Fetch WP sites
   const fetchSites = useCallback(async () => {
@@ -1230,7 +1251,7 @@ export default function WordPressToolkit() {
   return (
     <div className="p-6 lg:p-8">
       {/* Header */}
-      <div className="flex items-center justify-between gap-3 mb-6 pb-4 border-b border-dark-600">
+      <div className="flex items-center justify-between gap-3 mb-6 pb-4 border-b border-dark-600 flex-wrap">
         <div>
           <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">
             WordPress Toolkit
@@ -1239,20 +1260,75 @@ export default function WordPressToolkit() {
             Manage all WordPress sites from one place
           </p>
         </div>
-        <div className="flex items-center gap-3 text-xs font-mono">
-          <span className="text-dark-200">
-            {sites.length} site{sites.length !== 1 ? "s" : ""}
-          </span>
-          {updatesAvailable > 0 && (
-            <span className="px-2 py-0.5 bg-warn-500/15 text-warn-400 rounded">
-              {updatesAvailable} update{updatesAvailable !== 1 ? "s" : ""}
-            </span>
-          )}
-          {criticalVulns > 0 && (
-            <span className="px-2 py-0.5 bg-danger-500/15 text-danger-400 rounded">
-              {criticalVulns} critical
-            </span>
-          )}
+        <div className="flex items-center gap-3 flex-wrap text-xs">
+          <button
+            onClick={handleScanAll}
+            disabled={scanningAll}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rust-500 hover:bg-rust-600 disabled:opacity-50 text-white rounded-lg font-medium transition-colors shadow-sm"
+          >
+            {scanningAll ? (
+              <>
+                <Spinner className="w-3.5 h-3.5" />
+                Scanning All Sites...
+              </>
+            ) : (
+              <>
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                Scan All Websites
+              </>
+            )}
+          </button>
+
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search WP sites..."
+            className="px-3 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-xs text-dark-100 placeholder-dark-400 focus:outline-none focus:border-dark-400 w-36 sm:w-44"
+          />
+
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as any)}
+            className="px-2.5 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-xs text-dark-100 focus:outline-none font-mono"
+            aria-label="Sort WordPress sites"
+          >
+            <option value="domain">Domain (A-Z)</option>
+            <option value="version">WP Version</option>
+            <option value="vulns">Vulnerabilities</option>
+            <option value="updates">Updates Available</option>
+          </select>
+
+          <button
+            onClick={() => setSortOrder(o => o === "asc" ? "desc" : "asc")}
+            className="p-1.5 bg-dark-800 border border-dark-600 rounded-lg text-dark-200 hover:text-dark-50 text-xs font-mono"
+            title={sortOrder === "asc" ? "Ascending order" : "Descending order"}
+          >
+            {sortOrder === "asc" ? "↑" : "↓"}
+          </button>
+
+          <div className="flex items-center bg-dark-800 border border-dark-600 rounded-lg p-0.5">
+            <button
+              onClick={() => setViewMode("grid")}
+              className={`p-1.5 rounded ${viewMode === "grid" ? "bg-dark-700 text-dark-50" : "text-dark-400 hover:text-dark-200"}`}
+              title="Grid / Card view"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+              </svg>
+            </button>
+            <button
+              onClick={() => setViewMode("table")}
+              className={`p-1.5 rounded ${viewMode === "table" ? "bg-dark-700 text-dark-50" : "text-dark-400 hover:text-dark-200"}`}
+              title="Table / List view"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -1394,147 +1470,209 @@ export default function WordPressToolkit() {
             </div>
           )}
 
-          {/* Site grid */}
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {/* Select all header */}
-            <div className="col-span-full flex items-center gap-2 mb-1">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={selected.size === sites.length && sites.length > 0}
-                  onChange={toggleSelectAll}
-                  className="w-4 h-4 rounded border-dark-500 bg-dark-700 text-rust-500 focus:ring-rust-500 focus:ring-offset-0"
-                />
-                <span className="text-xs text-dark-300 font-mono">Select all</span>
-              </label>
-            </div>
+          {/* Site list: Table or Grid View */}
+          {(() => {
+            const filteredSites = sites
+              .filter((s) => s.domain.toLowerCase().includes(search.toLowerCase()) || s.wp_version.toLowerCase().includes(search.toLowerCase()))
+              .sort((a, b) => {
+                let cmp = 0;
+                if (sortBy === "domain") cmp = a.domain.localeCompare(b.domain);
+                else if (sortBy === "version") cmp = a.wp_version.localeCompare(b.wp_version);
+                else if (sortBy === "vulns") cmp = a.vulns - b.vulns;
+                else if (sortBy === "updates") cmp = (a.update_available ? 1 : 0) - (b.update_available ? 1 : 0);
+                return sortOrder === "asc" ? cmp : -cmp;
+              });
 
-            {sites.map((site) => (
-              <div
-                key={site.site_id}
-                className={`bg-dark-800 rounded-lg border p-4 transition-colors ${
-                  selected.has(site.site_id)
-                    ? "border-rust-500/50"
-                    : "border-dark-500 hover:border-dark-400"
-                }`}
-              >
-                <div className="flex items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={selected.has(site.site_id)}
-                    onChange={() => toggleSelect(site.site_id)}
-                    className="mt-1 w-4 h-4 rounded border-dark-500 bg-dark-700 text-rust-500 focus:ring-rust-500 focus:ring-offset-0"
-                  />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2.5 mb-1">
-                      <SiteThumbnail domain={site.domain} className="w-9 h-6" />
-                      <h3 className="text-sm font-semibold text-dark-50 truncate">
-                        {site.domain}
-                      </h3>
-                      {site.update_available && (
-                        <span className="shrink-0 px-1.5 py-0.5 bg-warn-500/15 text-warn-400 rounded text-[10px] font-medium">
-                          UPDATE
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-3 text-xs text-dark-200 font-mono mb-3">
-                      <span>WP {site.wp_version}</span>
-                      {site.vulns > 0 && (
-                        <span className={site.critical_vulns > 0 ? "text-danger-400" : "text-warn-400"}>
-                          {site.vulns} vuln{site.vulns !== 1 ? "s" : ""}
-                        </span>
-                      )}
-                      {site.vulns === 0 && (
-                        <span className="text-dark-400">No vulns</span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Link
-                        to={`/sites/${site.site_id}/wordpress`}
-                        className="px-2.5 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600"
-                      >
-                        Manage
-                      </Link>
-                      <button
-                        onClick={() => handleScan(site.site_id)}
-                        disabled={scanning === site.site_id}
-                        className="px-2.5 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 disabled:opacity-50"
-                      >
-                        {scanning === site.site_id ? (
-                          <span className="flex items-center gap-1">
-                            <Spinner className="w-3 h-3" />
-                            Scanning
-                          </span>
-                        ) : (
-                          "Scan"
-                        )}
-                      </button>
-                    </div>
-                  </div>
+            if (viewMode === "table") {
+              return (
+                <div className="bg-dark-800 rounded-lg border border-dark-600 overflow-x-auto">
+                  <table className="w-full text-left text-xs font-mono">
+                    <thead className="bg-dark-900 border-b border-dark-600 text-dark-300">
+                      <tr>
+                        <th className="p-3 w-8">
+                          <input
+                            type="checkbox"
+                            checked={selected.size === filteredSites.length && filteredSites.length > 0}
+                            onChange={toggleSelectAll}
+                            className="rounded border-dark-500 bg-dark-800"
+                          />
+                        </th>
+                        <th className="p-3 font-semibold uppercase tracking-wider">Site / Domain</th>
+                        <th className="p-3 font-semibold uppercase tracking-wider w-28">WordPress</th>
+                        <th className="p-3 font-semibold uppercase tracking-wider w-28">Updates</th>
+                        <th className="p-3 font-semibold uppercase tracking-wider w-36">Vulnerabilities</th>
+                        <th className="p-3 font-semibold uppercase tracking-wider text-right w-36">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-dark-700/60 font-sans">
+                      {filteredSites.map((site) => (
+                        <tr key={site.site_id} className="hover:bg-dark-700/20 transition-colors">
+                          <td className="p-3">
+                            <input
+                              type="checkbox"
+                              checked={selected.has(site.site_id)}
+                              onChange={() => toggleSelect(site.site_id)}
+                              className="rounded border-dark-500 bg-dark-800"
+                            />
+                          </td>
+                          <td className="p-3">
+                            <div className="flex items-center gap-2.5">
+                              <img
+                                src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
+                                alt=""
+                                className="w-4 h-4 rounded-sm shrink-0"
+                                onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
+                              />
+                              <SiteThumbnail domain={site.domain} className="w-8 h-6 rounded border border-dark-600 shrink-0" />
+                              <Link
+                                to={`/sites/${site.site_id}/wordpress`}
+                                className="font-semibold text-rust-400 hover:text-rust-300 font-mono text-sm"
+                              >
+                                {site.domain}
+                              </Link>
+                            </div>
+                          </td>
+                          <td className="p-3 font-mono text-dark-100">
+                            v{site.wp_version}
+                          </td>
+                          <td className="p-3">
+                            {site.update_available ? (
+                              <span className="px-1.5 py-0.5 bg-warn-500/15 text-warn-400 rounded text-[11px] font-medium">
+                                Update Available
+                              </span>
+                            ) : (
+                              <span className="text-dark-300">Up-to-date</span>
+                            )}
+                          </td>
+                          <td className="p-3 font-mono">
+                            {site.vulns > 0 ? (
+                              <span className={site.critical_vulns > 0 ? "text-danger-400 font-semibold" : "text-warn-400 font-semibold"}>
+                                {site.vulns} vuln{site.vulns !== 1 ? "s" : ""}
+                                {site.critical_vulns > 0 && ` (${site.critical_vulns} crit)`}
+                              </span>
+                            ) : (
+                              <span className="text-dark-400">Clean</span>
+                            )}
+                          </td>
+                          <td className="p-3 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <Link
+                                to={`/sites/${site.site_id}/wordpress`}
+                                className="px-2.5 py-1 bg-rust-500/20 text-rust-400 hover:bg-rust-500/30 rounded text-xs font-medium transition-colors"
+                              >
+                                Manage
+                              </Link>
+                              <a
+                                href={`https://${site.domain}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="p-1 text-dark-400 hover:text-dark-200"
+                                title="Open in new tab"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                                </svg>
+                              </a>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            }
+
+            return (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                {/* Select all header */}
+                <div className="col-span-full flex items-center gap-2 mb-1">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selected.size === filteredSites.length && filteredSites.length > 0}
+                      onChange={toggleSelectAll}
+                      className="w-4 h-4 rounded border-dark-500 bg-dark-700 text-rust-500 focus:ring-rust-500 focus:ring-offset-0"
+                    />
+                    <span className="text-xs text-dark-300 font-mono">Select all</span>
+                  </label>
                 </div>
 
-                {/* Scan results inline */}
-                {scanResults[site.site_id] && (
-                  <div className="mt-3 pt-3 border-t border-dark-600">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-xs font-mono text-dark-300">Last Scan Results</div>
-                      {scanResults[site.site_id].scanned_at && (
-                        <span
-                          className="text-xs font-mono text-dark-400"
-                          title={new Date(scanResults[site.site_id].scanned_at).toLocaleString()}
-                        >
-                          Scanned {timeAgo(scanResults[site.site_id].scanned_at)} — checked against 14 known plugin vulnerabilities, not a live feed
-                        </span>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-3 gap-2 text-xs font-mono">
-                      <div>
-                        <span className="text-dark-400">Total: </span>
-                        <span className="text-dark-100">{scanResults[site.site_id].total_vulns ?? 0}</span>
-                      </div>
-                      <div>
-                        <span className="text-dark-400">Critical: </span>
-                        <span className={scanResults[site.site_id].critical_count > 0 ? "text-danger-400" : "text-dark-100"}>
-                          {scanResults[site.site_id].critical_count ?? 0}
-                        </span>
-                      </div>
-                      <div>
-                        <span className="text-dark-400">High: </span>
-                        <span className={scanResults[site.site_id].high_count > 0 ? "text-warn-400" : "text-dark-100"}>
-                          {scanResults[site.site_id].high_count ?? 0}
-                        </span>
-                      </div>
-                    </div>
-                    {(() => {
-                      const vulns = flattenVulns(scanResults[site.site_id]);
-                      return vulns.length > 0 ? (
-                        <div className="mt-2 space-y-1 max-h-32 overflow-y-auto">
-                          {vulns.map((v, i) => (
-                            <div
-                              key={i}
-                              className="flex items-center gap-2 text-xs px-2 py-1 bg-dark-700 rounded"
-                            >
-                              <span
-                                className={`shrink-0 w-1.5 h-1.5 rounded-full ${
-                                  v.severity === "critical"
-                                    ? "bg-danger-500"
-                                    : v.severity === "high"
-                                    ? "bg-warn-500"
-                                    : "bg-dark-400"
-                                }`}
-                              />
-                              <span className="text-dark-100 truncate">{v.title || v.plugin}</span>
-                              <span className="text-dark-400 ml-auto shrink-0">{v.severity}</span>
-                            </div>
-                          ))}
+                {filteredSites.map((site) => (
+                  <div
+                    key={site.site_id}
+                    className={`bg-dark-800 rounded-lg border p-4 transition-colors flex flex-col justify-between ${
+                      selected.has(site.site_id)
+                        ? "border-rust-500/50"
+                        : "border-dark-500 hover:border-dark-400"
+                    }`}
+                  >
+                    <div>
+                      <div className="flex items-start gap-3">
+                        <input
+                          type="checkbox"
+                          checked={selected.has(site.site_id)}
+                          onChange={() => toggleSelect(site.site_id)}
+                          className="mt-1 w-4 h-4 rounded border-dark-500 bg-dark-700 text-rust-500 focus:ring-rust-500 focus:ring-offset-0"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <img
+                              src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
+                              alt=""
+                              className="w-4 h-4 rounded-sm shrink-0"
+                              onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
+                            />
+                            <h3 className="text-sm font-semibold text-dark-50 truncate font-mono">
+                              {site.domain}
+                            </h3>
+                            {site.update_available && (
+                              <span className="shrink-0 px-1.5 py-0.5 bg-warn-500/15 text-warn-400 rounded text-[10px] font-medium">
+                                UPDATE
+                              </span>
+                            )}
+                          </div>
+                          <div className="mb-2">
+                            <SiteThumbnail domain={site.domain} className="w-full h-28 rounded border border-dark-600 object-cover" />
+                          </div>
+                          <div className="flex items-center gap-3 text-xs text-dark-200 font-mono mb-2">
+                            <span>WP {site.wp_version}</span>
+                            {site.vulns > 0 ? (
+                              <span className={site.critical_vulns > 0 ? "text-danger-400" : "text-warn-400"}>
+                                {site.vulns} vuln{site.vulns !== 1 ? "s" : ""}
+                              </span>
+                            ) : (
+                              <span className="text-dark-400">No vulns</span>
+                            )}
+                          </div>
                         </div>
-                      ) : null;
-                    })()}
+                      </div>
+                    </div>
+
+                    <div className="pt-3 border-t border-dark-700/60 flex items-center justify-between">
+                      <a
+                        href={`https://${site.domain}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-dark-400 hover:text-dark-200 flex items-center gap-1"
+                      >
+                        Visit
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                        </svg>
+                      </a>
+                      <Link
+                        to={`/sites/${site.site_id}/wordpress`}
+                        className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
+                      >
+                        Manage Toolkit
+                      </Link>
+                    </div>
                   </div>
-                )}
+                ))}
               </div>
-            ))}
-          </div>
+            );
+          })()}
         </>
       )}
 

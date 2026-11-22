@@ -1,7 +1,7 @@
 use axum::{
     extract::Json,
     http::StatusCode,
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde::Deserialize;
@@ -106,10 +106,19 @@ async fn disk_usage(Json(body): Json<DiskUsageRequest>) -> Result<Json<serde_jso
     Ok(Json(serde_json::json!({ "bytes": bytes })))
 }
 
+/// GET /sites/disk-usages — Get disk usage for all sites under /var/www.
+async fn all_disk_usages() -> Result<Json<serde_json::Value>, ApiErr> {
+    let usages = staging::all_sites_disk_usage()
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(serde_json::to_value(usages).unwrap_or_default()))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/staging/clone", post(clone_files))
         .route("/staging/sync", post(sync_files))
         .route("/staging/delete-files", post(delete_files))
         .route("/staging/disk-usage", post(disk_usage))
+        .route("/sites/disk-usages", get(all_disk_usages))
 }

@@ -268,6 +268,18 @@ export default function Settings() {
 
   const [pendingConfirm, setPendingConfirm] = useState<{ type: string; label: string; data?: Record<string, unknown> } | null>(null);
 
+  // Panel Domain & SSL Configuration
+  const [panelDomainData, setPanelDomainData] = useState<{
+    configured_domain?: string;
+    public_ip?: string;
+    ssl_configured?: boolean;
+    base_url?: string;
+  } | null>(null);
+  const [panelDomainInput, setPanelDomainInput] = useState("");
+  const [configuringDomain, setConfiguringDomain] = useState(false);
+  const [domainConfigMsg, setDomainConfigMsg] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [copiedIp, setCopiedIp] = useState(false);
+
   // OAuth sign-in providers. The keys behind these were writable through the
   // settings API and read by routes/oauth.rs since the feature shipped, with no
   // control anywhere — so the panel's only unconfigurable door was an
@@ -442,6 +454,7 @@ export default function Settings() {
     loadHealth();
     loadNotifyChannels();
     loadCanary();
+    loadPanelDomain();
     api.get<{ count: number }>("/system/updates/count")
       .then((d) => setUpdateCount(d.count))
       .catch(() => {});
@@ -457,6 +470,58 @@ export default function Settings() {
     healthTimer.current = setInterval(loadHealth, 30000);
     return () => clearInterval(healthTimer.current);
   }, []);
+
+  const loadPanelDomain = async () => {
+    try {
+      const res = await api.get<{
+        base_url?: string;
+        agent_info?: {
+          configured_domain?: string;
+          public_ip?: string;
+          ssl_configured?: boolean;
+        };
+      }>("/settings/panel-domain");
+      const agentInfo = res?.agent_info;
+      setPanelDomainData({
+        configured_domain: agentInfo?.configured_domain,
+        public_ip: agentInfo?.public_ip,
+        ssl_configured: agentInfo?.ssl_configured,
+        base_url: res?.base_url,
+      });
+      if (agentInfo?.configured_domain) {
+        setPanelDomainInput(agentInfo.configured_domain);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleConfigurePanelDomain = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!panelDomainInput.trim()) return;
+    setConfiguringDomain(true);
+    setDomainConfigMsg(null);
+    try {
+      const res = await api.post<{
+        success: boolean;
+        domain: string;
+        panel_url: string;
+        message: string;
+      }>("/settings/panel-domain", { domain: panelDomainInput.trim() });
+      setDomainConfigMsg({
+        text: res.message || `Successfully attached domain ${res.domain} and configured SSL!`,
+        type: "success",
+      });
+      await loadPanelDomain();
+    } catch (err) {
+      setDomainConfigMsg({
+        text: err instanceof Error ? err.message : "Failed to configure panel domain",
+        type: "error",
+      });
+    } finally {
+      setConfiguringDomain(false);
+    }
+  };
 
   const saveGeneral = async () => {
     setSaving("general");
@@ -682,6 +747,134 @@ export default function Settings() {
               >
                 {saving === "general" ? "Saving..." : "Save"}
               </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Panel Domain & SSL Configuration */}
+        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+          <div className="px-5 py-3 border-b border-dark-600 flex items-center justify-between">
+            <div>
+              <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Panel Domain & SSL</h3>
+              <p className="text-xs text-dark-200 mt-0.5">Attach a custom domain and get trusted Let's Encrypt SSL certificates for DockPanel</p>
+            </div>
+            {panelDomainData?.ssl_configured ? (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                SSL Secured
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                Direct IP / HTTP
+              </span>
+            )}
+          </div>
+          <div className="p-5 space-y-5">
+            {domainConfigMsg && (
+              <div
+                className={`p-3 rounded-lg text-sm border flex items-center justify-between ${
+                  domainConfigMsg.type === "success"
+                    ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                    : "bg-danger-500/10 text-danger-400 border-danger-500/20"
+                }`}
+              >
+                <span>{domainConfigMsg.text}</span>
+                <button
+                  type="button"
+                  onClick={() => setDomainConfigMsg(null)}
+                  className="text-xs font-semibold px-2 py-0.5 rounded hover:bg-dark-700 ml-3"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="bg-dark-900/60 p-4 rounded-lg border border-dark-700">
+                <div className="text-xs text-dark-400 uppercase font-mono mb-1">Server Public IP</div>
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-sm text-dark-100 font-semibold">
+                    {panelDomainData?.public_ip || window.location.hostname}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const ip = panelDomainData?.public_ip || window.location.hostname;
+                      navigator.clipboard.writeText(ip);
+                      setCopiedIp(true);
+                      setTimeout(() => setCopiedIp(false), 2000);
+                    }}
+                    className="text-xs px-2.5 py-1 bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 rounded transition-colors"
+                  >
+                    {copiedIp ? "Copied!" : "Copy IP"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-dark-900/60 p-4 rounded-lg border border-dark-700">
+                <div className="text-xs text-dark-400 uppercase font-mono mb-1">Current Panel Access</div>
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-sm text-dark-100 truncate max-w-[200px]">
+                    {panelDomainData?.configured_domain || panelDomainData?.base_url || window.location.origin}
+                  </span>
+                  {panelDomainData?.configured_domain && (
+                    <a
+                      href={`https://${panelDomainData.configured_domain}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs px-2.5 py-1 bg-rust-500/20 text-rust-400 hover:bg-rust-500/30 rounded transition-colors"
+                    >
+                      Open ↗
+                    </a>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-blue-500/5 border border-blue-500/20 rounded-lg p-4 text-xs space-y-1.5 text-blue-200/90">
+              <p className="font-medium text-blue-300">How to attach a custom domain:</p>
+              <ol className="list-decimal list-inside space-y-1 text-dark-200">
+                <li>Create an <span className="font-mono text-blue-300 font-semibold">A</span> DNS record pointing your domain (e.g., <span className="font-mono text-white">panel.yourdomain.com</span>) to server IP <span className="font-mono text-rust-400 font-semibold">{panelDomainData?.public_ip || window.location.hostname}</span>.</li>
+                <li>Ensure ports 80 and 443 are open and reachable from the internet.</li>
+                <li>Enter the domain name below and click <span className="font-medium text-white">Configure Domain & Issue SSL</span>. DockPanel will automatically set up Nginx and generate trusted Let's Encrypt SSL certificates.</li>
+              </ol>
+            </div>
+
+            <form onSubmit={handleConfigurePanelDomain} className="space-y-3">
+              <div>
+                <label htmlFor="panel_domain_input" className="block text-sm font-medium text-dark-100 mb-1">
+                  Panel Domain
+                </label>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    id="panel_domain_input"
+                    type="text"
+                    value={panelDomainInput}
+                    onChange={(e) => setPanelDomainInput(e.target.value)}
+                    placeholder="panel.example.com"
+                    className="flex-1 px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 bg-dark-900/50 text-white placeholder-dark-400"
+                  />
+                  <button
+                    type="submit"
+                    disabled={configuringDomain || !panelDomainInput.trim()}
+                    className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50 transition-colors flex items-center justify-center gap-2 whitespace-nowrap"
+                  >
+                    {configuringDomain ? (
+                      <>
+                        <span className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                        Configuring SSL...
+                      </>
+                    ) : (
+                      "Configure Domain & Issue SSL"
+                    )}
+                  </button>
+                </div>
+              </div>
+            </form>
+
+            <div className="pt-2 border-t border-dark-700/60 text-xs text-dark-400 flex items-center justify-between">
+              <span>CLI Alternative: <code className="bg-dark-900 px-1.5 py-0.5 rounded text-dark-300 font-mono">PANEL_DOMAIN=panel.yourdomain.com bash /opt/dockpanel/scripts/setup.sh</code></span>
             </div>
           </div>
         </div>

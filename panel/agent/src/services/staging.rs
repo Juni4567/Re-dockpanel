@@ -164,3 +164,53 @@ pub async fn delete_site_files(domain: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Get disk usage for all site directories under /var/www in bytes in one fast command.
+pub async fn all_sites_disk_usage() -> Result<std::collections::HashMap<String, u64>, String> {
+    let mut map = std::collections::HashMap::new();
+
+    let mut dir = match tokio::fs::read_dir(WEB_ROOT).await {
+        Ok(d) => d,
+        Err(_) => return Ok(map),
+    };
+
+    let mut paths = Vec::new();
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        if let Ok(file_type) = entry.file_type().await {
+            if file_type.is_dir() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if !name.starts_with('.') && name != "acme" && name != "html" {
+                        paths.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        return Ok(map);
+    }
+
+    let mut cmd = safe_command("du");
+    cmd.arg("-sb");
+    for p in &paths {
+        cmd.arg(format!("{WEB_ROOT}/{p}"));
+    }
+    if let Ok(output) = cmd.output().await {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(bytes) = parts[0].parse::<u64>() {
+                        let dir_path = parts[1];
+                        let name = dir_path.trim_start_matches(WEB_ROOT).trim_start_matches('/');
+                        map.insert(name.to_string(), bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(map)
+}

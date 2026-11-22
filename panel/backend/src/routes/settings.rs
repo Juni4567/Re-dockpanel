@@ -1297,3 +1297,64 @@ pub async fn reencrypt_credentials(
         "swept_subjects": crate::services::credential_reencrypt::swept_subjects(),
     })))
 }
+
+#[derive(serde::Deserialize)]
+pub struct ConfigurePanelDomainReq {
+    pub domain: String,
+}
+
+/// GET /api/settings/panel-domain — Read panel domain & SSL status from agent & DB
+pub async fn get_panel_domain(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let current_base_url: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'base_url'")
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or_default();
+
+    let agent_info = agent.get("/system/panel-domain").await.ok();
+
+    Ok(Json(serde_json::json!({
+        "base_url": current_base_url.unwrap_or_default(),
+        "agent_info": agent_info,
+    })))
+}
+
+/// POST /api/settings/panel-domain — Configure domain and request Let's Encrypt certificate for the panel itself
+pub async fn configure_panel_domain(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+    Json(body): Json<ConfigurePanelDomainReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let domain = body.domain.trim().to_lowercase();
+    if !crate::routes::is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain format"));
+    }
+
+    let result = agent
+        .post(
+            "/system/panel-domain",
+            Some(serde_json::json!({ "domain": domain })),
+        )
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("Agent error configuring domain: {e}")))?;
+
+    let new_base_url = format!("https://{domain}");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('base_url', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+    )
+    .bind(&new_base_url)
+    .execute(&state.db)
+    .await
+    .map_err(|e| internal_error("configure_panel_domain save base_url", e))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "domain": domain,
+        "base_url": new_base_url,
+        "agent_result": result,
+    })))
+}

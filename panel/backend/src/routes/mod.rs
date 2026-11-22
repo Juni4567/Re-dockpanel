@@ -1115,6 +1115,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/users/{id}/reset-2fa", post(users::reset_2fa))
         // Sites
         .route("/api/sites", get(sites::list).post(sites::create))
+        .route("/api/sites/metrics-overview", get(sites::metrics_overview))
         // Read-only, admin-only, and the ONLY site read that looks past
         // `user_id`. It is what makes `POST /api/sites/{id}/transfer` reversible
         // — without it an admin who hands a site to a client cannot see the row
@@ -1384,6 +1385,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/logs/check-errors", post(logs::check_errors))
         // Settings (admin)
         .route("/api/settings", get(settings::list).put(settings::update))
+        .route("/api/settings/panel-domain", get(settings::get_panel_domain).post(settings::configure_panel_domain))
         .route("/api/settings/export", get(settings::export_config))
         .route("/api/settings/import", post(settings::import_config))
         .route("/api/settings/recording-coverage", get(settings::recording_coverage))
@@ -1418,6 +1420,7 @@ pub fn router() -> Router<AppState> {
         // WordPress Toolkit
         .route("/api/wordpress/sites", get(wordpress::all_wp_sites))
         .route("/api/wordpress/bulk-update", post(wordpress::bulk_update))
+        .route("/api/wordpress/scan-all", post(wordpress::scan_all_sites))
         .route("/api/wordpress/vuln-scan-settings", get(wordpress::get_scan_settings).put(wordpress::update_scan_settings))
         .route("/api/sites/{id}/wordpress/vuln-scan", post(wordpress::vuln_scan))
         .route("/api/sites/{id}/wordpress/security-check", get(wordpress::security_check))
@@ -1425,6 +1428,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/wordpress/harden", post(wordpress::wp_harden))
         // WordPress Management
         .route("/api/sites/{id}/wordpress", get(wordpress::info))
+        .route("/api/sites/{id}/wordpress/db-info", get(wordpress::db_info))
         .route("/api/sites/{id}/wordpress/install", post(wordpress::install))
         .route("/api/sites/{id}/wordpress/plugins", get(wordpress::plugins))
         .route("/api/sites/{id}/wordpress/themes", get(wordpress::themes))

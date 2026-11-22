@@ -1,7 +1,7 @@
 import { useState, useEffect, FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
-import { formatDate } from "../utils/format";
+import { formatDate, formatSize } from "../utils/format";
 import { statusColors, runtimeLabels } from "../constants";
 import ProvisionLog from "../components/ProvisionLog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
@@ -9,6 +9,14 @@ import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
 import SiteThumbnail from "../components/SiteThumbnail";
 import { useAuth } from "../context/AuthContext";
+
+interface SiteMetrics {
+  disk_usage_bytes: number;
+  traffic_bytes_this_month: number;
+  server_location: string;
+  has_database: boolean;
+  has_mail: boolean;
+}
 
 interface Site {
   id: string;
@@ -36,12 +44,17 @@ interface PanelUser {
 export default function Sites() {
   const { user } = useAuth();
   const [sites, setSites] = useState<Site[]>([]);
+  const [metrics, setMetrics] = useState<Record<string, SiteMetrics>>({});
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState("");
   const [provisioningSiteId, setProvisioningSiteId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [displayCount, setDisplayCount] = useState(25);
+  const [viewMode, setViewMode] = useState<"table" | "grid">("table");
+  const [sortBy, setSortBy] = useState<"domain" | "created" | "disk" | "traffic">("domain");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
+  const [copiedDomain, setCopiedDomain] = useState<string | null>(null);
 
   // Admin all-sites view. Ownership is exclusive, so a site handed to a client
   // leaves the admin's own list entirely — this is how they find it again, and
@@ -70,6 +83,12 @@ export default function Sites() {
   const [adminUser, setAdminUser] = useState("admin");
   const [adminPassword, setAdminPassword] = useState("");
 
+  const copyDomain = (d: string) => {
+    navigator.clipboard.writeText(d);
+    setCopiedDomain(d);
+    setTimeout(() => setCopiedDomain(null), 2000);
+  };
+
   // Preflight the domain as it is typed. Nothing here BLOCKS creation — a site
   // is perfectly valid before its DNS exists, and the brief is explicit that a
   // not-yet-propagated record must not be presented as an error. The point is
@@ -84,6 +103,11 @@ export default function Sites() {
       .then(setSites)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
+
+    api
+      .get<Record<string, SiteMetrics>>("/sites/metrics-overview")
+      .then(setMetrics)
+      .catch(() => {});
   };
 
   useEffect(fetchSites, [allSites]);
@@ -151,7 +175,7 @@ export default function Sites() {
           <h1 className="page-header-title">Sites</h1>
           <p className="page-header-subtitle">Manage your websites and applications</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {isAdmin && (
             <label className="flex items-center gap-2 text-sm text-dark-200 select-none cursor-pointer">
               <input
@@ -160,25 +184,56 @@ export default function Sites() {
                 onChange={(e) => { setLoading(true); setAllSites(e.target.checked); }}
                 className="rounded border-dark-500 bg-dark-800 text-rust-500 focus:ring-rust-500"
               />
-              All sites on this server
+              All sites
             </label>
           )}
-          {sites.length >= 2 && (
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search sites..."
-              className="px-3 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-sm text-dark-100 placeholder-dark-400 focus:outline-none focus:border-dark-400"
-            />
-          )}
-          {/* A `client` holds sites and cannot bring a new domain into service —
-              that single refusal is what the role IS
-              (`services::domain_claim::ensure_claimable`). Offering the control
-              anyway meant the client filled in a domain, a runtime, a PHP version
-              and, for a WordPress choice, an admin username and password, pressed
-              Create, and only then met the refusal. Same predicate as
-              `Dashboard.tsx:680`, which already hides its create tile. */}
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search sites..."
+            className="px-3 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-sm text-dark-100 placeholder-dark-400 focus:outline-none focus:border-dark-400 w-36 sm:w-48"
+          />
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as any)}
+            className="px-2.5 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-xs text-dark-100 focus:outline-none"
+            aria-label="Sort sites"
+          >
+            <option value="domain">Domain (A-Z)</option>
+            <option value="created">Created Date</option>
+            <option value="disk">Disk Usage</option>
+            <option value="traffic">Traffic</option>
+          </select>
+          <button
+            onClick={() => setSortOrder(o => o === "asc" ? "desc" : "asc")}
+            className="p-1.5 bg-dark-800 border border-dark-600 rounded-lg text-dark-200 hover:text-dark-50 text-xs font-mono"
+            title={sortOrder === "asc" ? "Ascending order" : "Descending order"}
+          >
+            {sortOrder === "asc" ? "↑" : "↓"}
+          </button>
+          <div className="flex items-center bg-dark-800 border border-dark-600 rounded-lg p-0.5">
+            <button
+              onClick={() => setViewMode("table")}
+              className={`p-1.5 rounded ${viewMode === "table" ? "bg-dark-700 text-dark-50" : "text-dark-400 hover:text-dark-200"}`}
+              title="Table view"
+              aria-label="Table view"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+            <button
+              onClick={() => setViewMode("grid")}
+              className={`p-1.5 rounded ${viewMode === "grid" ? "bg-dark-700 text-dark-50" : "text-dark-400 hover:text-dark-200"}`}
+              title="Grid / Card view"
+              aria-label="Grid view"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+              </svg>
+            </button>
+          </div>
           {!isClient && (
             <button
               onClick={() => setShowForm(!showForm)}
@@ -462,106 +517,330 @@ export default function Sites() {
           )}
         </div>
       ) : sites.length > 0 ? (
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto elevation-1">
-          <table className="w-full">
-            <thead>
-              <tr className="border-b border-dark-500 bg-dark-900">
-                <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Domain</th>
-                <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">Runtime</th>
-                <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Status</th>
-                <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">SSL</th>
-                <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden lg:table-cell">Created</th>
-                {allSites && (
-                  <>
-                    <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Owner</th>
-                    <th scope="col" className="text-right text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3"><span className="sr-only">Actions</span></th>
-                  </>
-                )}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-dark-600">
-              {(() => {
-                const filtered = sites.filter((s) => !s.parent_site_id && s.domain.toLowerCase().includes(search.toLowerCase()));
-                const displayed = filtered.slice(0, displayCount);
-                const remaining = filtered.length - displayed.length;
-                return (
-                  <>
-                  {displayed.map((site) => (
-                <tr key={site.id} className="hover:bg-dark-700/30 transition-colors">
-                  <td className="px-5 py-4">
-                    <div className="flex items-center gap-3">
-                      <SiteThumbnail domain={site.domain} className="w-12 h-8" />
-                      <Link
-                        to={`/sites/${site.id}`}
-                        className="text-sm font-medium text-rust-400 hover:text-rust-300 font-mono"
-                      >
-                        {site.domain}
-                      </Link>
-                    </div>
-                  </td>
-                  <td className="px-5 py-4 text-sm text-dark-200 hidden sm:table-cell">
-                    {runtimeLabels[site.runtime] || site.runtime}
-                  </td>
-                  <td className="px-5 py-4">
-                    <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                      site.enabled === false ? "bg-warn-500/10 text-warn-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
-                    }`}>
-                      {site.enabled === false ? "disabled" : site.status}
-                    </span>
-                  </td>
-                  <td className="px-5 py-4 hidden md:table-cell">
-                    {site.ssl_enabled ? (
-                      <span className="inline-flex items-center gap-1 text-xs text-rust-400">
-                        <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
-                          <path fillRule="evenodd" d="M10 1a4.5 4.5 0 0 0-4.5 4.5V9H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-.5V5.5A4.5 4.5 0 0 0 10 1Zm3 8V5.5a3 3 0 1 0-6 0V9h6Z" clipRule="evenodd" />
-                        </svg>
-                        Secure
-                      </span>
-                    ) : (
-                      <span className="text-xs text-dark-300">None</span>
-                    )}
-                  </td>
-                  <td className="px-5 py-4 text-sm text-dark-200 hidden lg:table-cell">
-                    {formatDate(site.created_at)}
-                  </td>
-                  {allSites && (
-                    <>
-                      <td className="px-5 py-4 text-sm">
-                        <span className="text-dark-100 font-mono">{site.owner_email ?? "—"}</span>
-                        {site.owner_role && site.owner_role !== "admin" && (
-                          <span className="ml-2 inline-flex px-2 py-0.5 rounded-full text-[10px] font-medium bg-dark-700 text-dark-200 uppercase tracking-wide">
-                            {site.owner_role}
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-5 py-4 text-right">
-                        <button
-                          onClick={() => { setTransferFor(site); setTransferEmail(""); setNotice(""); }}
-                          className="px-2.5 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
-                        >
-                          Transfer
-                        </button>
-                      </td>
-                    </>
-                  )}
-                </tr>
-              ))}
-              </>
-                );
-              })()}
-            </tbody>
-          </table>
+        <div>
           {(() => {
-            const filtered = sites.filter((s) => !s.parent_site_id && s.domain.toLowerCase().includes(search.toLowerCase()));
-            const remaining = filtered.length - displayCount;
-            return remaining > 0 ? (
-              <button
-                onClick={() => setDisplayCount((c) => c + 25)}
-                className="w-full py-2 text-sm text-dark-300 hover:text-dark-100 border-t border-dark-600 hover:bg-dark-700/30 transition-colors"
-              >
-                Show more ({remaining} remaining)
-              </button>
-            ) : null;
+            const filtered = sites
+              .filter((s) => !s.parent_site_id && s.domain.toLowerCase().includes(search.toLowerCase()))
+              .sort((a, b) => {
+                let cmp = 0;
+                if (sortBy === "domain") {
+                  cmp = a.domain.localeCompare(b.domain);
+                } else if (sortBy === "created") {
+                  cmp = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+                } else if (sortBy === "disk") {
+                  cmp = (metrics[a.id]?.disk_usage_bytes || 0) - (metrics[b.id]?.disk_usage_bytes || 0);
+                } else if (sortBy === "traffic") {
+                  cmp = (metrics[a.id]?.traffic_bytes_this_month || 0) - (metrics[b.id]?.traffic_bytes_this_month || 0);
+                }
+                return sortOrder === "asc" ? cmp : -cmp;
+              });
+            const displayed = filtered.slice(0, displayCount);
+            const remaining = filtered.length - displayed.length;
+
+            if (viewMode === "grid") {
+              return (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {displayed.map((site) => {
+                      const m = metrics[site.id];
+                      return (
+                        <div
+                          key={site.id}
+                          className="bg-dark-800 rounded-lg border border-dark-500 hover:border-dark-400 p-4 transition-all flex flex-col justify-between"
+                        >
+                          <div>
+                            <div className="flex items-start justify-between gap-2 mb-3">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <img
+                                  src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
+                                  alt=""
+                                  className="w-4 h-4 rounded-sm flex-shrink-0"
+                                  onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
+                                />
+                                <Link
+                                  to={`/sites/${site.id}`}
+                                  className="text-sm font-semibold text-rust-400 hover:text-rust-300 font-mono truncate"
+                                  title={site.domain}
+                                >
+                                  {site.domain}
+                                </Link>
+                              </div>
+                              <div className="flex items-center gap-1 shrink-0">
+                                <button
+                                  onClick={() => copyDomain(site.domain)}
+                                  className="p-1 rounded text-dark-300 hover:text-dark-100 hover:bg-dark-700 transition-colors"
+                                  title={copiedDomain === site.domain ? "Copied!" : "Copy domain"}
+                                >
+                                  {copiedDomain === site.domain ? (
+                                    <svg className="w-3.5 h-3.5 text-rust-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                    </svg>
+                                  ) : (
+                                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                    </svg>
+                                  )}
+                                </button>
+                                <a
+                                  href={site.ssl_enabled ? `https://${site.domain}` : `http://${site.domain}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="p-1 rounded text-dark-300 hover:text-dark-100 hover:bg-dark-700 transition-colors"
+                                  title="Open in new tab"
+                                >
+                                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                                  </svg>
+                                </a>
+                              </div>
+                            </div>
+
+                            <div className="mb-3">
+                              <SiteThumbnail domain={site.domain} className="w-full h-28 rounded border border-dark-600 object-cover" />
+                            </div>
+
+                            <div className="space-y-1.5 text-xs text-dark-200 mb-4">
+                              <div className="flex items-center justify-between">
+                                <span className="text-dark-300">Runtime:</span>
+                                <span className="font-mono text-dark-100">{runtimeLabels[site.runtime] || site.runtime}</span>
+                              </div>
+                              <div className="flex items-center justify-between">
+                                <span className="text-dark-300">Disk Usage:</span>
+                                <span className="font-mono text-dark-100">{formatSize(m?.disk_usage_bytes || 0)}</span>
+                              </div>
+                              <div className="flex items-center justify-between">
+                                <span className="text-dark-300">Traffic / mo:</span>
+                                <span className="font-mono text-dark-100">
+                                  {m?.traffic_bytes_this_month ? `${formatSize(m.traffic_bytes_this_month)} / mo` : "0 B / mo"}
+                                </span>
+                              </div>
+                              <div className="pt-1 border-t border-dark-700/60 truncate" title={m?.server_location || `/var/www/${site.domain}/public`}>
+                                <span className="text-[11px] text-dark-400 font-mono flex items-center gap-1 truncate">
+                                  <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                                  </svg>
+                                  {m?.server_location || `/var/www/${site.domain}/public`}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="pt-3 border-t border-dark-600 flex items-center justify-between">
+                            <div className="flex items-center gap-1">
+                              <Link
+                                to={`/files/${site.domain}`}
+                                className="p-1.5 rounded text-dark-300 hover:text-dark-100 hover:bg-dark-700 transition-colors"
+                                title="File Manager"
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                                </svg>
+                              </Link>
+                              <Link
+                                to={`/mail?domain=${site.domain}`}
+                                className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
+                                title={m?.has_mail ? "Mail configured" : "Mail"}
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                                </svg>
+                              </Link>
+                              <Link
+                                to={`/databases?search=${site.domain}`}
+                                className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}
+                                title={m?.has_database ? "Database connected" : "Databases"}
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
+                                </svg>
+                              </Link>
+                            </div>
+                            <Link
+                              to={`/sites/${site.id}`}
+                              className="px-3 py-1 bg-dark-700 hover:bg-dark-600 text-dark-100 text-xs font-medium rounded transition-colors"
+                            >
+                              Manage
+                            </Link>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {remaining > 0 && (
+                    <button
+                      onClick={() => setDisplayCount((c) => c + 25)}
+                      className="w-full mt-4 py-2 text-sm text-dark-300 hover:text-dark-100 bg-dark-800 rounded-lg border border-dark-600 hover:bg-dark-700/30 transition-colors"
+                    >
+                      Show more ({remaining} remaining)
+                    </button>
+                  )}
+                </>
+              );
+            }
+
+            return (
+              <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto elevation-1">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-dark-500 bg-dark-900">
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Domain</th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden xl:table-cell">Server Location</th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-4 py-3">Disk Usage</th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-4 py-3 hidden md:table-cell">Traffic / mo</th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-4 py-3 hidden sm:table-cell">Runtime</th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-4 py-3">Status</th>
+                      <th scope="col" className="text-center text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-4 py-3">Quick Actions</th>
+                      {allSites && (
+                        <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-4 py-3 hidden lg:table-cell">Owner</th>
+                      )}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-dark-600">
+                    {displayed.map((site) => {
+                      const m = metrics[site.id];
+                      return (
+                        <tr key={site.id} className="hover:bg-dark-700/30 transition-colors">
+                          <td className="px-5 py-4">
+                            <div className="flex items-center gap-3">
+                              <img
+                                src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
+                                alt=""
+                                className="w-4 h-4 rounded-sm flex-shrink-0"
+                                onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
+                              />
+                              <SiteThumbnail domain={site.domain} className="w-10 h-7 rounded border border-dark-600 hidden sm:block shrink-0" />
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-1.5">
+                                  <Link
+                                    to={`/sites/${site.id}`}
+                                    className="text-sm font-medium text-rust-400 hover:text-rust-300 font-mono truncate"
+                                  >
+                                    {site.domain}
+                                  </Link>
+                                  <button
+                                    onClick={() => copyDomain(site.domain)}
+                                    className="p-1 rounded text-dark-300 hover:text-dark-100 hover:bg-dark-700 transition-colors"
+                                    title={copiedDomain === site.domain ? "Copied!" : "Copy domain"}
+                                  >
+                                    {copiedDomain === site.domain ? (
+                                      <svg className="w-3.5 h-3.5 text-rust-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                      </svg>
+                                    ) : (
+                                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                      </svg>
+                                    )}
+                                  </button>
+                                  <a
+                                    href={site.ssl_enabled ? `https://${site.domain}` : `http://${site.domain}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="p-1 rounded text-dark-300 hover:text-dark-100 hover:bg-dark-700 transition-colors"
+                                    title="Open in new tab"
+                                  >
+                                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                                    </svg>
+                                  </a>
+                                </div>
+                                <div className="text-[11px] text-dark-400 font-mono xl:hidden truncate">
+                                  {m?.server_location || `/var/www/${site.domain}/public`}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-5 py-4 text-xs font-mono text-dark-300 hidden xl:table-cell max-w-xs truncate">
+                            <span className="flex items-center gap-1.5 truncate" title={m?.server_location || `/var/www/${site.domain}/public`}>
+                              <svg className="w-3.5 h-3.5 text-dark-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                              </svg>
+                              <span className="truncate">{m?.server_location || `/var/www/${site.domain}/public`}</span>
+                            </span>
+                          </td>
+                          <td className="px-4 py-4 text-xs font-mono text-dark-100 whitespace-nowrap">
+                            {formatSize(m?.disk_usage_bytes || 0)}
+                          </td>
+                          <td className="px-4 py-4 text-xs font-mono text-dark-200 hidden md:table-cell whitespace-nowrap">
+                            {m?.traffic_bytes_this_month ? `${formatSize(m.traffic_bytes_this_month)} / mo` : "0 B / mo"}
+                          </td>
+                          <td className="px-4 py-4 text-sm text-dark-200 hidden sm:table-cell">
+                            {runtimeLabels[site.runtime] || site.runtime}
+                          </td>
+                          <td className="px-4 py-4 whitespace-nowrap">
+                            <div className="flex items-center gap-1.5">
+                              <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${
+                                site.enabled === false ? "bg-warn-500/10 text-warn-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
+                              }`}>
+                                {site.enabled === false ? "disabled" : site.status}
+                              </span>
+                              {site.ssl_enabled ? (
+                                <span className="inline-flex items-center text-rust-400" title="SSL Active">
+                                  <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                                    <path fillRule="evenodd" d="M10 1a4.5 4.5 0 0 0-4.5 4.5V9H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-.5V5.5A4.5 4.5 0 0 0 10 1Zm3 8V5.5a3 3 0 1 0-6 0V9h6Z" clipRule="evenodd" />
+                                  </svg>
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-dark-400">no SSL</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-4 py-4 text-center whitespace-nowrap">
+                            <div className="flex items-center justify-center gap-1">
+                              <Link
+                                to={`/files/${site.domain}`}
+                                className="p-1.5 rounded hover:bg-dark-700 text-dark-300 hover:text-dark-100 transition-colors"
+                                title="File Manager"
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                                </svg>
+                              </Link>
+                              <Link
+                                to={`/mail?domain=${site.domain}`}
+                                className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
+                                title={m?.has_mail ? "Mail configured" : "Mail"}
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                                </svg>
+                              </Link>
+                              <Link
+                                to={`/databases?search=${site.domain}`}
+                                className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}
+                                title={m?.has_database ? "Database connected" : "Databases"}
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
+                                </svg>
+                              </Link>
+                            </div>
+                          </td>
+                          {allSites && (
+                            <td className="px-4 py-4 text-sm hidden lg:table-cell">
+                              <span className="text-dark-100 font-mono text-xs">{site.owner_email ?? "—"}</span>
+                              {site.owner_role && site.owner_role !== "admin" && (
+                                <span className="ml-2 inline-flex px-2 py-0.5 rounded-full text-[10px] font-medium bg-dark-700 text-dark-200 uppercase tracking-wide">
+                                  {site.owner_role}
+                                </span>
+                              )}
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {remaining > 0 && (
+                  <button
+                    onClick={() => setDisplayCount((c) => c + 25)}
+                    className="w-full py-2 text-sm text-dark-300 hover:text-dark-100 border-t border-dark-600 hover:bg-dark-700/30 transition-colors"
+                  >
+                    Show more ({remaining} remaining)
+                  </button>
+                )}
+              </div>
+            );
           })()}
         </div>
       ) : null}

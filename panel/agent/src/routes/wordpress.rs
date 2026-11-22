@@ -73,6 +73,22 @@ pub fn router() -> Router<AppState> {
         .route("/wordpress/{domain}/optimize-db", post(optimize_db))
         .route("/wordpress/{domain}/search-replace", post(search_replace_route))
         .route("/wordpress/{domain}/reset-admin-password", post(reset_admin_password))
+        .route("/wordpress/{domain}/db-info", get(db_info_route))
+}
+
+async fn db_info_route(
+    Path(domain): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_domain(&domain)?;
+    if !wordpress::detect(&domain) {
+        return Ok(Json(serde_json::json!({ "installed": false })));
+    }
+    wordpress::db_info(&domain).await.map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        )
+    })
 }
 
 async fn detect(

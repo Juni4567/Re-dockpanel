@@ -4,6 +4,52 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.246.0] - 2026-11-22
+
+### Major: Sites Listing Enhancements, Plesk-Style WordPress Toolkit 4-Tab Overhaul, Database UI & Deletion Fix, DockPanel Domain & SSL
+
+#### 1. Sites List Enhancements (`Sites.tsx`)
+- **Disk Usage Column:** Live disk usage calculation per site (`MB`/`GB`) via new `/api/sites/metrics-overview` and agent `/sites/disk-usages` endpoints.
+- **Monthly Traffic Display:** Estimated traffic per site (`X MB / mo`).
+- **Server Location Address:** Direct filesystem path display (`/var/www/{domain}/public`) with folder indicator.
+- **Quick Action Column:** Dedicated icon buttons for instant navigation to **File Manager** (`/files/{domain}`), **Mail** (`/mail?domain={domain}`), and **Database** (`/databases?search={domain}`).
+- **Domain Utilities:** One-click copy domain button with animated checkmark tooltip feedback, and external link button to open domain in a new tab.
+- **Favicon Integration:** Dynamic website favicon resolution using Google Favicon service with crisp 32px display.
+- **Search, Sorting & View Modes:** Global search bar across domains, multi-field sorting (Domain, Created, Disk usage, Traffic) with direction toggle (`↑`/`↓`), and toggle between Table view and Grid/Card view.
+
+#### 2. WordPress Toolkit — Complete Plesk-Style Overhaul (`WordPress.tsx` & `WordPressToolkit.tsx`)
+- **Strict Plesk Design Match:**
+  - **Dashboard Tab:**
+    - Left column: large site preview thumbnail with zoom modal, WP Toolkit access card with 1-click `Log in` to `/wp-admin`, `Setup` modal to change admin credentials/email, display of admin username, and `Manage domain` quick link.
+    - Top action toolbar: File Manager, Copy Data, Clone, Back Up / Restore, Logs, and interactive WP-CLI console modal.
+    - 4 Core Feature Cards: Updates (WP core, plugins, themes with update triggers), Tools (PHP version details, Debugging toggle, Password protection toggle), Security (Let's Encrypt status, Mitigate vulnerabilities, Apply critical security measures, Vulnerability Protection toggle, Hotlink protection toggle), and Performance (Search engine indexing toggle, Nginx caching toggle, Take over wp-cron.php toggle).
+    - Footer bar: Updates link, Autoupdate settings modal, Smart Update toggle, Check WordPress Integrity runner, Maintenance mode toggle.
+  - **Plugins Tab:**
+    - `+ Install`, `✕ Remove`, `Autoupdate all plugins` toggle, filter search.
+    - Complete plugins table with selection checkboxes, Name with version and info popover, Active toggle, Autoupdate toggle, vulnerable badges (`▲ Vulnerable`, `● Vulnerable`), one-click Updates action, and individual Delete action.
+  - **Themes Tab:**
+    - `+ Install`, `✕ Remove`, `Autoupdate all themes` toggle, filter search.
+    - Complete themes table with selection checkboxes, Name with version, Active toggle, Autoupdate toggle, vulnerable badges, and Delete action.
+  - **Database Tab:**
+    - Database name with 1-click `[open in Database Manager]` deep link, Database table prefix (`wp_`), Database user with `[change]` modal, Database server (`localhost:3306`).
+- **Scan All Websites:** Top-level "Scan All Websites" action button in WordPress Toolkit header to discover new WP installations across the entire server with live scanning indicator.
+- **Non-WP Site Filtering:** Filtered out non-WordPress websites from WordPress Toolkit.
+- **Search & View Controls:** Added search input, sorting (Domain, Version, Vulns, Updates), and Grid vs Table view toggle.
+
+#### 3. Database Listing & Deletion Fix (`Databases.tsx`)
+- **Deletion Bug Fix:** Fixed bug where deletion confirmation dialog was blocked by obsolete state guard; databases now delete reliably.
+- **Docker 404 Resiliency:** Agent handles Docker 404 (already cleaned container) gracefully so database deletion is never blocked.
+- **Clean Action Layout:** Replaced cluttered 8-button layout with a primary **Manage** button (opening Database Manager with Browse, Structure, SQL Console, and Import/Export tabs), secondary **Connect** button, and a clean `...` dropdown menu for secondary actions (`SQL Console`, `Table Structure`, `Import / Export`, `Reset Password`, `Delete Database`).
+- **Search, Sorting & View Modes:** Added search bar, sorting (Name, Engine, Port, Created), and Table vs Grid view toggle.
+
+#### 4. DockPanel Domain & Automatic Let's Encrypt SSL
+- **Panel Domain Management:** Added backend & agent routes `GET /api/settings/panel-domain` and `POST /api/settings/panel-domain` to reconfigure Nginx `server_name`, issue Let's Encrypt SSL certificates via `certbot`, configure HTTPS redirect, and update `base_url`.
+- **Settings Card:** Added dedicated "Panel Domain & SSL" card in Settings > General showing current domain, SSL status, server public IP with copy button, DNS A-record setup instructions, domain configuration form, and CLI fallback command.
+- **Initial Setup Field:** Added optional "Panel Domain" field during initial administrator setup (`/setup`).
+
+#### 5. Build Performance Optimization
+- **ThinLTO & Codegen Units:** Optimized Cargo release profiles in `agent/Cargo.toml` and `backend/Cargo.toml` (`lto = "thin"`, `codegen-units = 16`, `opt-level = 3`), slashing release build times from ~7 minutes to ~40 seconds.
+
 ## [2.245.0] - 2026-11-22
 
 ### Major: Plesk-Like WordPress Toolkit, Screenshot Thumbnails Fix, DB Import Error Improvements

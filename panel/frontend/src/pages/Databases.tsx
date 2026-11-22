@@ -2015,6 +2015,10 @@ export default function Databases() {
   // Advanced Database Manager & Lethal Confirmation states
   const [manageDb, setManageDb] = useState<{ db: Database; tab?: ManagerTab } | null>(null);
   const [deleteTargetDb, setDeleteTargetDb] = useState<Database | null>(null);
+  const [viewMode, setViewMode] = useState<"table" | "grid">("table");
+  const [sortBy, setSortBy] = useState<"name" | "engine" | "port" | "created">("name");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
+  const [activeMenuDbId, setActiveMenuDbId] = useState<string | null>(null);
 
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
@@ -2071,23 +2075,22 @@ export default function Databases() {
   };
 
   const handleDelete = async (id: string) => {
-    if (confirmDeleteId !== id) {
-      setConfirmDeleteId(id);
-      return;
-    }
     setDeletingId(id);
     setSuccessMsg("");
+    setError("");
     try {
       await api.delete(`/databases/${id}`);
       setConfirmDeleteId(null);
-      setSuccessMsg("Database deleted");
+      showGlobalNotification("success", "Database deleted successfully");
       if (credentialsId === id) {
         setCredentialsId(null);
         setCredentials(null);
       }
       fetchData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Delete failed");
+      const msg = err instanceof Error ? err.message : "Delete failed";
+      setError(msg);
+      showGlobalNotification("error", msg);
     } finally {
       setDeletingId(null);
     }
@@ -2179,16 +2182,54 @@ export default function Databases() {
           <h1 className="page-header-title">Databases</h1>
           <p className="page-header-subtitle">Create and manage your databases</p>
         </div>
-        <div className="flex items-center gap-2">
-          {databases.length >= 2 && (
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search databases..."
-              className="px-3 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-sm text-dark-100 placeholder-dark-400 focus:outline-none focus:border-dark-400"
-            />
-          )}
+        <div className="flex items-center gap-2 flex-wrap">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search databases..."
+            className="px-3 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-sm text-dark-100 placeholder-dark-400 focus:outline-none focus:border-dark-400 w-36 sm:w-48"
+          />
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value as any)}
+            className="px-2.5 py-1.5 bg-dark-800 border border-dark-600 rounded-lg text-xs text-dark-100 focus:outline-none"
+            aria-label="Sort databases"
+          >
+            <option value="name">Name (A-Z)</option>
+            <option value="engine">Engine</option>
+            <option value="port">Port</option>
+            <option value="created">Created Date</option>
+          </select>
+          <button
+            onClick={() => setSortOrder(o => o === "asc" ? "desc" : "asc")}
+            className="p-1.5 bg-dark-800 border border-dark-600 rounded-lg text-dark-200 hover:text-dark-50 text-xs font-mono"
+            title={sortOrder === "asc" ? "Ascending order" : "Descending order"}
+          >
+            {sortOrder === "asc" ? "↑" : "↓"}
+          </button>
+          <div className="flex items-center bg-dark-800 border border-dark-600 rounded-lg p-0.5">
+            <button
+              onClick={() => setViewMode("table")}
+              className={`p-1.5 rounded ${viewMode === "table" ? "bg-dark-700 text-dark-50" : "text-dark-400 hover:text-dark-200"}`}
+              title="Table view"
+              aria-label="Table view"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+              </svg>
+            </button>
+            <button
+              onClick={() => setViewMode("grid")}
+              className={`p-1.5 rounded ${viewMode === "grid" ? "bg-dark-700 text-dark-50" : "text-dark-400 hover:text-dark-200"}`}
+              title="Grid / Card view"
+              aria-label="Grid view"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+              </svg>
+            </button>
+          </div>
           <button
             onClick={() => setShowForm(!showForm)}
             className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors"
@@ -2399,150 +2440,243 @@ export default function Databases() {
           </button>
         </div>
       ) : databases.length > 0 ? (
-        <div className="space-y-0">
-          <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-dark-500 bg-dark-900">
-                  <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">
-                    Name
-                  </th>
-                  <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">
-                    Engine
-                  </th>
-                  <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">
-                    Owner
-                  </th>
-                  <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">
-                    Port
-                  </th>
-                  <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden lg:table-cell">
-                    Created
-                  </th>
-                  <th scope="col" className="text-right text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-dark-600">
-                {(() => {
-                  const filtered = databases.filter((db) => db.name.toLowerCase().includes(search.toLowerCase()));
-                  const displayed = filtered.slice(0, displayCount);
-                  return displayed.map((db) => (
-                  <tr key={db.id} className="hover:bg-dark-700/30 transition-colors">
-                    <td className="px-5 py-4 text-sm font-medium text-dark-50 font-mono">
-                      {db.name}
-                    </td>
-                    <td className="px-5 py-4 text-sm text-dark-200">
-                      {engineLabels[db.engine] || db.engine}
-                    </td>
-                    <td className="px-5 py-4 text-sm text-dark-200 hidden md:table-cell font-mono">
-                      {getOwnerLabel(db)}
-                    </td>
-                    <td className="px-5 py-4 text-sm text-dark-200 font-mono hidden sm:table-cell">
-                      {db.port || "\u2014"}
-                    </td>
-                    <td className="px-5 py-4 text-sm text-dark-200 hidden lg:table-cell">
-                      {formatDate(db.created_at)}
-                    </td>
-                    <td className="px-5 py-4 text-right">
-                      <div className="flex items-center justify-end gap-2">
-                        <button
-                          onClick={() => setManageDb({ db, tab: "browse" })}
-                          className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
-                        >
-                          Browse
-                        </button>
-                        <button
-                          onClick={() => setManageDb({ db, tab: "structure" })}
-                          className="px-2 py-1 rounded text-xs font-medium bg-accent-500/10 text-accent-400 hover:bg-accent-500/15 transition-colors"
-                        >
-                          Structure
-                        </button>
-                        <button
-                          onClick={() => setManageDb({ db, tab: "sql" })}
-                          className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
-                        >
-                          SQL
-                        </button>
-                        <button
-                          onClick={() => setManageDb({ db, tab: "import" })}
-                          className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-200 hover:bg-dark-600 transition-colors"
-                          title="Import, upload or export dumps"
-                        >
-                          Import/Export
-                        </button>
-                        <button
-                          onClick={async () => {
-                            try {
-                              const cfg = await api.get<{ pitr_enabled: boolean; retention_hours: number }>(`/databases/${db.id}/pitr`);
-                              const newEnabled = !cfg.pitr_enabled;
-                              await api.put(`/databases/${db.id}/pitr`, {
-                                pitr_enabled: newEnabled,
-                                retention_hours: cfg.retention_hours || 24,
-                              });
-                              setError("");
-                              // The flag is stored and nothing consumes it: no WAL is
-                              // archived, no binlog retained, and the restore endpoint
-                              // answers 501. Saying "recovery enabled" promised a
-                              // recoverability nothing behind this button can deliver —
-                              // the worst place in the product to be optimistic.
-                              setSuccessMsg(
-                                newEnabled
-                                  ? `Retention preference saved for ${db.name}. Point-in-time recovery is not implemented — nothing is being archived, and restore is unavailable. Use scheduled backups.`
-                                  : `Retention preference cleared for ${db.name}.`
-                              );
-                            } catch (e) { setError(e instanceof Error ? e.message : "Failed to save retention preference"); }
-                          }}
-                          className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-300 hover:bg-dark-600 transition-colors"
-                          title="Store a PITR retention preference. Point-in-time recovery itself is not implemented — nothing is archived and restore returns 501."
-                        >
-                          PITR
-                        </button>
-                        <button
-                          onClick={() => handleResetPassword(db.id)}
-                          disabled={resettingPw === db.id}
-                          className="px-2 py-1 rounded text-xs font-medium bg-dark-700 text-dark-300 hover:bg-dark-600 disabled:opacity-50 transition-colors"
-                          title="Generate a new database password"
-                        >
-                          {resettingPw === db.id ? "..." : "Reset PW"}
-                        </button>
-                        <button
-                          onClick={() => toggleCredentials(db.id)}
-                          className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
-                            credentialsId === db.id
-                              ? "bg-rust-500/15 text-rust-400"
-                              : "bg-dark-700 text-dark-200 hover:bg-dark-600"
-                          }`}
-                        >
-                          {credentialsId === db.id ? "Hide" : "Connect"}
-                        </button>
-                        <button
-                          onClick={() => setDeleteTargetDb(db)}
-                          className="text-xs text-danger-400 hover:text-danger-300"
-                        >
-                          Delete
-                        </button>
+        <div className="space-y-4">
+          {(() => {
+            const filtered = databases
+              .filter((db) => db.name.toLowerCase().includes(search.toLowerCase()) || db.engine.toLowerCase().includes(search.toLowerCase()))
+              .sort((a, b) => {
+                let cmp = 0;
+                if (sortBy === "name") cmp = a.name.localeCompare(b.name);
+                else if (sortBy === "engine") cmp = a.engine.localeCompare(b.engine);
+                else if (sortBy === "port") cmp = (a.port || 0) - (b.port || 0);
+                else if (sortBy === "created") cmp = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+                return sortOrder === "asc" ? cmp : -cmp;
+              });
+            const displayed = filtered.slice(0, displayCount);
+            const remaining = filtered.length - displayed.length;
+
+            if (viewMode === "grid") {
+              return (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {displayed.map((db) => (
+                      <div
+                        key={db.id}
+                        className="bg-dark-800 rounded-lg border border-dark-600 hover:border-dark-400 p-5 transition-all flex flex-col justify-between"
+                      >
+                        <div>
+                          <div className="flex items-start justify-between gap-2 mb-3">
+                            <div className="flex items-center gap-2">
+                              <span className="p-2 bg-dark-700 rounded-lg text-rust-400">
+                                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
+                                </svg>
+                              </span>
+                              <div>
+                                <h3 className="text-sm font-bold text-dark-50 font-mono">{db.name}</h3>
+                                <span className="inline-block px-2 py-0.5 mt-0.5 rounded text-[10px] font-medium bg-dark-700 text-dark-200 uppercase tracking-wide">
+                                  {engineLabels[db.engine] || db.engine}
+                                </span>
+                              </div>
+                            </div>
+                            <span className="text-xs font-mono text-dark-300">
+                              Port: {db.port || "—"}
+                            </span>
+                          </div>
+
+                          <div className="space-y-1.5 text-xs text-dark-300 mb-4">
+                            <div className="flex justify-between">
+                              <span>Owner:</span>
+                              <span className="text-dark-100 font-mono">{getOwnerLabel(db)}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>Created:</span>
+                              <span className="text-dark-200">{formatDate(db.created_at)}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="pt-3 border-t border-dark-700/60 flex items-center justify-between gap-2">
+                          <button
+                            onClick={() => setManageDb({ db, tab: "browse" })}
+                            className="flex-1 py-1.5 px-3 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors text-center"
+                          >
+                            Manage
+                          </button>
+                          <button
+                            onClick={() => toggleCredentials(db.id)}
+                            className="py-1.5 px-3 bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 rounded text-xs font-medium transition-colors"
+                          >
+                            {credentialsId === db.id ? "Hide" : "Connect"}
+                          </button>
+                          <button
+                            onClick={() => setDeleteTargetDb(db)}
+                            className="p-1.5 text-dark-400 hover:text-danger-400 transition-colors"
+                            title="Delete database"
+                          >
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
+                            </svg>
+                          </button>
+                        </div>
                       </div>
-                    </td>
-                  </tr>
-                ));
-                })()}
-              </tbody>
-            </table>
-            {(() => {
-              const filtered = databases.filter((db) => db.name.toLowerCase().includes(search.toLowerCase()));
-              const remaining = filtered.length - displayCount;
-              return remaining > 0 ? (
-                <button
-                  onClick={() => setDisplayCount((c) => c + 25)}
-                  className="w-full py-2 text-sm text-dark-300 hover:text-dark-100 border-t border-dark-600 hover:bg-dark-700/30 transition-colors"
-                >
-                  Show more ({remaining} remaining)
-                </button>
-              ) : null;
-            })()}
-          </div>
+                    ))}
+                  </div>
+                  {remaining > 0 && (
+                    <button
+                      onClick={() => setDisplayCount((c) => c + 25)}
+                      className="w-full mt-4 py-2 text-sm text-dark-300 hover:text-dark-100 bg-dark-800 rounded-lg border border-dark-600 hover:bg-dark-700/30 transition-colors"
+                    >
+                      Show more ({remaining} remaining)
+                    </button>
+                  )}
+                </>
+              );
+            }
+
+            return (
+              <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-dark-500 bg-dark-900">
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">
+                        Name
+                      </th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">
+                        Engine
+                      </th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">
+                        Owner
+                      </th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">
+                        Port
+                      </th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden lg:table-cell">
+                        Created
+                      </th>
+                      <th scope="col" className="text-right text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">
+                        Actions
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-dark-600">
+                    {displayed.map((db) => (
+                      <tr key={db.id} className="hover:bg-dark-700/30 transition-colors">
+                        <td className="px-5 py-4">
+                          <div className="flex items-center gap-2.5">
+                            <span className="p-1.5 bg-dark-700 rounded text-rust-400">
+                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
+                              </svg>
+                            </span>
+                            <span className="text-sm font-semibold text-dark-50 font-mono">
+                              {db.name}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-5 py-4 text-xs font-mono text-dark-200">
+                          <span className="px-2 py-0.5 rounded bg-dark-700 text-dark-200">
+                            {engineLabels[db.engine] || db.engine}
+                          </span>
+                        </td>
+                        <td className="px-5 py-4 text-xs text-dark-200 hidden md:table-cell font-mono">
+                          {getOwnerLabel(db)}
+                        </td>
+                        <td className="px-5 py-4 text-xs text-dark-200 font-mono hidden sm:table-cell">
+                          {db.port || "\u2014"}
+                        </td>
+                        <td className="px-5 py-4 text-xs text-dark-200 hidden lg:table-cell">
+                          {formatDate(db.created_at)}
+                        </td>
+                        <td className="px-5 py-4 text-right">
+                          <div className="flex items-center justify-end gap-2 relative">
+                            {/* Primary Action: Manage Button */}
+                            <button
+                              onClick={() => setManageDb({ db, tab: "browse" })}
+                              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-rust-500 hover:bg-rust-600 text-white transition-colors flex items-center gap-1 shadow-sm"
+                            >
+                              Manage
+                            </button>
+
+                            {/* Secondary Action: Connect Button */}
+                            <button
+                              onClick={() => toggleCredentials(db.id)}
+                              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                                credentialsId === db.id
+                                  ? "bg-rust-500/15 text-rust-400"
+                                  : "bg-dark-700 text-dark-200 hover:bg-dark-600"
+                              }`}
+                            >
+                              {credentialsId === db.id ? "Hide" : "Connect"}
+                            </button>
+
+                            {/* Secondary Action: More Menu */}
+                            <div className="relative">
+                              <button
+                                onClick={() => setActiveMenuDbId(activeMenuDbId === db.id ? null : db.id)}
+                                className="p-1.5 rounded-lg bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 transition-colors"
+                                title="More options"
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
+                                </svg>
+                              </button>
+
+                              {activeMenuDbId === db.id && (
+                                <div className="absolute right-0 top-8 z-30 w-44 bg-dark-900 border border-dark-600 rounded-lg shadow-xl py-1 text-xs text-left">
+                                  <button
+                                    onClick={() => { setActiveMenuDbId(null); setManageDb({ db, tab: "sql" }); }}
+                                    className="w-full px-3 py-2 text-dark-200 hover:text-dark-50 hover:bg-dark-800 text-left flex items-center gap-2"
+                                  >
+                                    SQL Console
+                                  </button>
+                                  <button
+                                    onClick={() => { setActiveMenuDbId(null); setManageDb({ db, tab: "structure" }); }}
+                                    className="w-full px-3 py-2 text-dark-200 hover:text-dark-50 hover:bg-dark-800 text-left flex items-center gap-2"
+                                  >
+                                    Table Structure
+                                  </button>
+                                  <button
+                                    onClick={() => { setActiveMenuDbId(null); setManageDb({ db, tab: "import" }); }}
+                                    className="w-full px-3 py-2 text-dark-200 hover:text-dark-50 hover:bg-dark-800 text-left flex items-center gap-2"
+                                  >
+                                    Import / Export
+                                  </button>
+                                  <button
+                                    onClick={() => { setActiveMenuDbId(null); handleResetPassword(db.id); }}
+                                    disabled={resettingPw === db.id}
+                                    className="w-full px-3 py-2 text-dark-200 hover:text-dark-50 hover:bg-dark-800 text-left flex items-center gap-2"
+                                  >
+                                    Reset Password
+                                  </button>
+                                  <div className="border-t border-dark-700/60 my-1" />
+                                  <button
+                                    onClick={() => { setActiveMenuDbId(null); setDeleteTargetDb(db); }}
+                                    className="w-full px-3 py-2 text-danger-400 hover:bg-danger-500/10 text-left flex items-center gap-2 font-medium"
+                                  >
+                                    Delete Database
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {remaining > 0 && (
+                  <button
+                    onClick={() => setDisplayCount((c) => c + 25)}
+                    className="w-full py-2 text-sm text-dark-300 hover:text-dark-100 border-t border-dark-600 hover:bg-dark-700/30 transition-colors"
+                  >
+                    Show more ({remaining} remaining)
+                  </button>
+                )}
+              </div>
+            );
+          })()}
+        </div>
 
           {/* Password reset success */}
           {pwResetSuccess && (

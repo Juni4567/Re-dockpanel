@@ -10,6 +10,7 @@ export default function Setup() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [domain, setDomain] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -45,6 +46,13 @@ export default function Setup() {
     // are established exactly as they are everywhere else.
     try {
       const challenge = await login(email, password);
+      if (domain.trim()) {
+        try {
+          await api.post("/settings/panel-domain", { domain: domain.trim() });
+        } catch (domainErr) {
+          console.warn("Could not auto-configure panel domain during setup", domainErr);
+        }
+      }
       // A brand-new account cannot have 2FA yet, but never assume a branch is
       // unreachable: hand it to the login screen, which knows how to finish.
       navigate(challenge ? "/login" : "/");
@@ -117,6 +125,23 @@ export default function Setup() {
               required
               className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none transition-shadow text-sm"
             />
+          </div>
+
+          <div>
+            <label htmlFor="setup-domain" className="block text-sm font-medium text-dark-100 mb-1">
+              Panel Domain <span className="text-dark-400 text-xs font-normal">(Optional)</span>
+            </label>
+            <input
+              id="setup-domain"
+              type="text"
+              placeholder="panel.example.com"
+              value={domain}
+              onChange={(e) => setDomain(e.target.value)}
+              className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none transition-shadow text-sm"
+            />
+            <p className="text-xs text-dark-300 mt-1">
+              Point your domain's DNS A record to this server before configuring. You can also configure this anytime in Settings.
+            </p>
           </div>
 
           <button
