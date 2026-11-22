@@ -318,9 +318,16 @@ async fn reset_password(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// GET /databases/sizes — Return disk usage in bytes for all managed database containers.
+async fn get_database_sizes() -> Json<serde_json::Value> {
+    let sizes = database::all_database_sizes().await;
+    Json(serde_json::json!({ "sizes": sizes }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/databases", post(create).get(list))
+        .route("/databases/sizes", get(get_database_sizes))
         .route("/databases/query", post(query_db))
         .route("/databases/reset-password", post(reset_password))
         .route("/databases/{container_id}", delete(remove))

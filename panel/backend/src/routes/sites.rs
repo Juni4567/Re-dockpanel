@@ -1099,10 +1099,10 @@ pub async fn create(
                     // 1. Create database (if needed)
                     let mut db_host = String::new();
                     if needs_db {
-                        emit_step(&cms_logs, site_id, "database", "Creating MySQL database", "in_progress", None);
+                        emit_step(&cms_logs, site_id, "database", "Creating MariaDB database", "in_progress", None);
 
                         let db_result = cms_agent.post("/databases", Some(serde_json::json!({
-                            "engine": "mysql",
+                            "engine": "mariadb",
                             "name": db_name,
                             "password": db_password,
                         }))).await;
@@ -1111,12 +1111,12 @@ pub async fn create(
                             Ok(resp) => {
                                 let port = resp.get("port").and_then(|v| v.as_u64()).unwrap_or(3306) as u16;
                                 let cid = resp.get("container_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                emit_step(&cms_logs, site_id, "database", "Creating MySQL database", "done", None);
+                                emit_step(&cms_logs, site_id, "database", "Creating MariaDB database", "done", None);
                                 (format!("127.0.0.1:{port}"), port as i32, cid)
                             }
                             Err(e) => {
                                 tracing::error!("{cms_label} DB creation failed for {cms_domain}: {e}");
-                                emit_step(&cms_logs, site_id, "database", "Creating MySQL database", "error",
+                                emit_step(&cms_logs, site_id, "database", "Creating MariaDB database", "error",
                                     Some(format!("Database creation failed: {e}")));
                                 emit_step(&cms_logs, site_id, "complete", "Provisioning failed", "error", None);
                                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -1139,7 +1139,7 @@ pub async fn create(
                         // orphan the retention sweep can never see.
                         let _ = sqlx::query(
                             "INSERT INTO databases (site_id, engine, name, db_user, db_password_enc, container_id, port) \
-                             VALUES ($1, 'mysql', $2, $3, $4, $5, $6) \
+                             VALUES ($1, 'mariadb', $2, $3, $4, $5, $6) \
                              ON CONFLICT DO NOTHING",
                         )
                         .bind(site_id)

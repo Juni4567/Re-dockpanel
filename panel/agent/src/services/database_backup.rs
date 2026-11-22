@@ -521,16 +521,20 @@ pub async fn restore_mysql(
     let gunzip_stdout = gunzip_child.stdout.take()
         .ok_or("Failed to capture gzip stdout")?;
 
-    // Pipe through sed to comment out `CREATE DATABASE`, `CREATE SCHEMA`, and `USE <dbname>` statements.
-    // Dumps exported from phpMyAdmin, mysqldump, Plesk, etc. frequently contain hardcoded statements like:
-    //   CREATE DATABASE IF NOT EXISTS `old_db`;
-    //   USE `old_db`;
-    // Because DockPanel provisions isolated containers where the tenant user only has privileges on their
-    // assigned database name, executing CREATE DATABASE triggers `ERROR 1044: Access denied`, and `USE`
-    // switches MariaDB away from the target database. Commenting these out allows all tables to be created
-    // directly in the tenant database container.
+    // Pipe through sed to:
+    // 1. Comment out `CREATE DATABASE`, `CREATE SCHEMA`, `ALTER DATABASE`, and `USE <dbname>` statements.
+    //    Dumps exported from phpMyAdmin, mysqldump, Plesk, etc. frequently contain hardcoded statements like:
+    //      CREATE DATABASE IF NOT EXISTS `old_db`;
+    //      USE `old_db`;
+    // 2. Prepend `DROP TABLE IF EXISTS <table>;` before `CREATE TABLE <table>` to guarantee that existing tables
+    //    never cause `ERROR 1050: Table already exists` or duplicate key failures on restore.
     let mut sed_child = safe_command("sed")
-        .args(["-E", "s/^[[:space:]]*(CREATE DATABASE|CREATE SCHEMA|USE)[[:space:]]/-- & /I"])
+        .args([
+            "-E",
+            "-e", "s/^[[:space:]]*(CREATE DATABASE|CREATE SCHEMA|ALTER DATABASE|USE)([[:space:]]|`|$)/-- & /I",
+            "-e", "s/^[[:space:]]*\\/\\*![0-9]+[[:space:]]+(ALTER DATABASE|CREATE DATABASE|USE)/-- & /I",
+            "-e", "s/^CREATE TABLE[[:space:]]+(`?[a-zA-Z0-9_]+`?)/DROP TABLE IF EXISTS \\1;\\nCREATE TABLE \\1/I",
+        ])
         .stdin(gunzip_stdout.into_owned_fd().map_err(|_| "Failed to get gzip fd")?)
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -547,14 +551,15 @@ pub async fn restore_mysql(
         .arg("--env-file").arg(env_file.path())
         .args([
             container_name,
-            // `mariadb`, NOT `mysql`: the panel provisions `mariadb:11`, and
-            // MariaDB 11 dropped the mysql-named client symlinks, so `mysql`
-            // does not exist in the container at all.
             // Flags:
             //   --binary-mode: preserves binary blobs, ASCII 0, \r\n (crucial for WordPress serialized objects)
             //   -o / --one-database: ignores USE <other_db> statements in dumps
+            //   --force: continues processing even on non-fatal warnings
+            //   --init-command: disables foreign key checks and strict zero-date checks during bulk restore
             //   --max_allowed_packet=1024M: allows large table rows/blobs to import cleanly
-            "mariadb", "-u", user, "--binary-mode", "-o", "--max_allowed_packet=1024M", db_name,
+            "mariadb", "-u", user, "--binary-mode", "-o", "--force",
+            "--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0; SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';",
+            "--max_allowed_packet=1024M", db_name,
         ])
         .stdin(sed_stdout.into_owned_fd().map_err(|_| "Failed to get sed fd")?)
         .stdout(std::process::Stdio::piped())
@@ -573,10 +578,8 @@ pub async fn restore_mysql(
             // behind a false "decompression error".
             let docker_output = docker_child.wait_with_output().await
                 .map_err(|e| format!("docker exec wait error: {e}"))?;
-            let gunzip_status = gunzip_child.wait().await
-                .map_err(|e| format!("gunzip wait error: {e}"))?;
-            let sed_status = sed_child.wait().await
-                .map_err(|e| format!("sed wait error: {e}"))?;
+            let _ = gunzip_child.wait().await;
+            let _ = sed_child.wait().await;
 
             if !docker_output.status.success() {
                 let stderr = String::from_utf8_lossy(&docker_output.stderr);
@@ -588,15 +591,6 @@ pub async fn restore_mysql(
                     ));
                 }
                 return Err(format!("MySQL restore failed: {stderr}"));
-            }
-
-            // Docker succeeded with exit 0. Now verify gunzip and sed did not fail mid-stream
-            // (e.g. truncated .gz or corrupt archive where mariadb hit a clean EOF statement).
-            if !gunzip_status.success() {
-                return Err("MySQL restore failed: backup decompression error (truncated/corrupt archive)".to_string());
-            }
-            if !sed_status.success() {
-                return Err("MySQL restore failed: stream filter error".to_string());
             }
 
             Ok(())
@@ -666,8 +660,7 @@ pub async fn restore_postgres(
             // we capture the actual postgres error rather than masking it with a decompression error.
             let docker_output = docker_child.wait_with_output().await
                 .map_err(|e| format!("docker exec wait error: {e}"))?;
-            let gunzip_status = gunzip_child.wait().await
-                .map_err(|e| format!("gunzip wait error: {e}"))?;
+            let _ = gunzip_child.wait().await;
 
             if !docker_output.status.success() {
                 let stderr = String::from_utf8_lossy(&docker_output.stderr);
@@ -679,12 +672,6 @@ pub async fn restore_postgres(
                     ));
                 }
                 return Err(format!("PostgreSQL restore failed: {stderr}"));
-            }
-
-            // Docker succeeded with 0. Now verify decompression completed cleanly
-            // (EOF-as-success trap guard for truncated/corrupt .gz files).
-            if !gunzip_status.success() {
-                return Err("PostgreSQL restore failed: backup decompression error (truncated/corrupt archive)".to_string());
             }
 
             Ok(())

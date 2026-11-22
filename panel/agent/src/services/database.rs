@@ -339,6 +339,65 @@ pub async fn list_databases() -> Result<Vec<DbContainer>, String> {
     Ok(dbs)
 }
 
+/// Query the disk usage (in bytes) of each DockPanel-managed database container.
+pub async fn all_database_sizes() -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    let docker = match Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(_) => return map,
+    };
+
+    let mut filters = HashMap::new();
+    filters.insert("name", vec!["dockpanel-db-"]);
+
+    let containers = match docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => return map,
+    };
+
+    for c in containers {
+        let names = c.names.unwrap_or_default();
+        let c_name = names.into_iter().next().unwrap_or_default();
+        let raw_name = c_name.trim_start_matches('/').trim_start_matches("dockpanel-db-");
+        if raw_name.is_empty() {
+            continue;
+        }
+
+        if let Some(mounts) = c.mounts {
+            for m in mounts {
+                if let Some(src) = m.source {
+                    if let Ok(meta) = std::fs::metadata(&src) {
+                        if meta.is_dir() {
+                            if let Ok(out) = tokio::process::Command::new("du")
+                                .args(["-sb", &src])
+                                .output()
+                                .await
+                            {
+                                if let Ok(s) = std::str::from_utf8(&out.stdout) {
+                                    if let Some(first) = s.split_whitespace().next() {
+                                        if let Ok(bytes) = first.parse::<u64>() {
+                                            map.insert(raw_name.to_string(), bytes);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    map
+}
+
 /// Result of a SQL query execution.
 #[derive(serde::Serialize)]
 pub struct QueryResult {

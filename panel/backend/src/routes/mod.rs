@@ -1207,6 +1207,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/terminal/share/{id}", delete(terminal::revoke_share))
         // Databases
         .route("/api/databases", get(databases::list).post(databases::create))
+        .route("/api/databases/sizes", get(databases::get_database_sizes))
         .route("/api/databases/{id}", delete(databases::remove))
         .route("/api/databases/{id}/credentials", get(databases::credentials))
         .route("/api/databases/{id}/tables", get(databases::tables))

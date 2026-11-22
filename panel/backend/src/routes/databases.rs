@@ -1717,6 +1717,16 @@ pub async fn delete_dump(
     })))
 }
 
+/// GET /api/databases/sizes — Return disk usage in bytes for all database containers on this server.
+pub async fn get_database_sizes(
+    State(_state): State<AppState>,
+    AuthUser(_claims): AuthUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let res = agent.get("/databases/sizes").await.unwrap_or_else(|_| serde_json::json!({ "sizes": {} }));
+    Ok(Json(res))
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_reserved_db_name;

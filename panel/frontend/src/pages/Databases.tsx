@@ -50,12 +50,12 @@ interface QueryResult {
 }
 
 const engineLabels: Record<string, string> = {
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  mariadb: "MariaDB",
+  postgres: "PostgreSQL 16",
+  mysql: "MySQL 8.0",
+  mariadb: "MariaDB 11",
 };
 
-/* ─── Advanced Database Manager (phpMyAdmin Alternative) ───────────── */
+/* ─── Advanced Database Manager ───────────── */
 
 type ManagerTab = "browse" | "structure" | "sql" | "import" | "export" | "find_replace";
 
@@ -174,6 +174,71 @@ function AdvancedDatabaseManager({
   const [showInsertModal, setShowInsertModal] = useState(false);
   const [insertColValues, setInsertColValues] = useState<Record<string, string>>({});
   const [inserting, setInserting] = useState(false);
+
+  // Inline cell editing (double-click to edit)
+  const [editingCell, setEditingCell] = useState<{
+    rIdx: number;
+    cIdx: number;
+    val: string;
+    originalVal: string;
+  } | null>(null);
+  const [savingCell, setSavingCell] = useState(false);
+
+  const handleSaveCell = async () => {
+    if (!editingCell || !browseRows || !selectedTable) return;
+    const { rIdx, cIdx, val, originalVal } = editingCell;
+    if (val === originalVal) {
+      setEditingCell(null);
+      return;
+    }
+
+    setSavingCell(true);
+    try {
+      const col = browseRows.columns[cIdx];
+      const row = browseRows.rows[rIdx];
+      const isNull = val === "" || val.toUpperCase() === "NULL";
+
+      let whereConditions: string[] = [];
+      const idColIdx = browseRows.columns.findIndex(
+        (c) => c.toLowerCase() === "id" || c.toLowerCase().endsWith("_id")
+      );
+
+      if (idColIdx !== -1 && row[idColIdx] !== "\\N" && row[idColIdx] !== "") {
+        whereConditions.push(`${q}${browseRows.columns[idColIdx]}${q} = '${row[idColIdx].replace(/'/g, "''")}'`);
+      } else {
+        browseRows.columns.forEach((c, idx) => {
+          const v = row[idx];
+          if (v === "\\N" || v === "") {
+            whereConditions.push(`${q}${c}${q} IS NULL`);
+          } else {
+            whereConditions.push(`${q}${c}${q} = '${v.replace(/'/g, "''")}'`);
+          }
+        });
+      }
+
+      const escapedVal = val.replace(/'/g, "''");
+      const setClause = isNull ? `${q}${col}${q} = NULL` : `${q}${col}${q} = '${escapedVal}'`;
+      const limitClause = database.engine === "postgres" ? "" : " LIMIT 1";
+      const sql = `UPDATE ${q}${selectedTable}${q} SET ${setClause} WHERE ${whereConditions.join(" AND ")}${limitClause}`;
+
+      await api.post(`/databases/${database.id}/query`, { sql });
+
+      const newRows = [...browseRows.rows];
+      newRows[rIdx] = [...newRows[rIdx]];
+      newRows[rIdx][cIdx] = isNull ? "\\N" : val;
+      setBrowseRows({ ...browseRows, rows: newRows });
+
+      showGlobalNotification("success", `Updated column "${col}" successfully`);
+      setEditingCell(null);
+    } catch (err) {
+      showGlobalNotification(
+        "error",
+        err instanceof Error ? err.message : "Failed to update cell"
+      );
+    } finally {
+      setSavingCell(false);
+    }
+  };
 
   const loadBrowseData = useCallback(async (tableToLoad?: string) => {
     const tbl = tableToLoad || selectedTable;
@@ -805,7 +870,7 @@ function AdvancedDatabaseManager({
                 <span className="text-xs text-dark-400 font-mono">Port {database.port}</span>
               )}
             </div>
-            <p className="text-xs text-dark-400 mt-0.5">phpMyAdmin-grade SQL Management Suite</p>
+            <p className="text-xs text-dark-400 mt-0.5">Built-in SQL Management Studio & Browser</p>
           </div>
         </div>
 
@@ -1182,19 +1247,68 @@ function AdvancedDatabaseManager({
                               <td className="px-3 py-2 text-[10px] text-dark-500 font-mono">
                                 {browsePage * pageSize + rIdx + 1}
                               </td>
-                              {row.map((val, cIdx) => (
-                                <td
-                                  key={cIdx}
-                                  className="px-3 py-2 text-dark-200 whitespace-nowrap max-w-sm truncate"
-                                  title={val}
-                                >
-                                  {val === "" || val === "\N" ? (
-                                    <span className="text-dark-500 italic text-[10px]">NULL</span>
-                                  ) : (
-                                    val
-                                  )}
-                                </td>
-                              ))}
+                              {row.map((val, cIdx) => {
+                                const isEditing = editingCell?.rIdx === rIdx && editingCell?.cIdx === cIdx;
+                                return (
+                                  <td
+                                    key={cIdx}
+                                    onDoubleClick={() => {
+                                      setEditingCell({
+                                        rIdx,
+                                        cIdx,
+                                        val: val === "\\N" ? "" : val,
+                                        originalVal: val === "\\N" ? "" : val,
+                                      });
+                                    }}
+                                    className={`px-3 py-2 whitespace-nowrap max-w-sm truncate relative transition-colors ${
+                                      isEditing
+                                        ? "p-1 bg-dark-900 border border-rust-500 rounded"
+                                        : "text-dark-200 cursor-pointer hover:bg-dark-700/50 hover:text-white"
+                                    }`}
+                                    title={isEditing ? undefined : `Double-click to edit (current: ${val})`}
+                                  >
+                                    {isEditing ? (
+                                      <div className="flex items-center gap-1 min-w-[160px]">
+                                        <input
+                                          autoFocus
+                                          type="text"
+                                          value={editingCell.val}
+                                          onChange={(e) =>
+                                            setEditingCell({ ...editingCell, val: e.target.value })
+                                          }
+                                          onKeyDown={(e) => {
+                                            if (e.key === "Enter") handleSaveCell();
+                                            if (e.key === "Escape") setEditingCell(null);
+                                          }}
+                                          disabled={savingCell}
+                                          className="flex-1 bg-dark-950 border border-dark-600 rounded px-2 py-0.5 text-xs text-white focus:outline-none focus:border-rust-500 font-mono"
+                                        />
+                                        <button
+                                          type="button"
+                                          onClick={handleSaveCell}
+                                          disabled={savingCell}
+                                          className="p-1 text-emerald-400 hover:text-emerald-300 transition-colors"
+                                          title="Save (Enter)"
+                                        >
+                                          ✓
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditingCell(null)}
+                                          className="p-1 text-dark-400 hover:text-dark-200 transition-colors"
+                                          title="Cancel (Esc)"
+                                        >
+                                          ✕
+                                        </button>
+                                      </div>
+                                    ) : val === "" || val === "\\N" ? (
+                                      <span className="text-dark-500 italic text-[10px]">NULL</span>
+                                    ) : (
+                                      val
+                                    )}
+                                  </td>
+                                );
+                              })}
                             </tr>
                           ))}
                         </tbody>
@@ -1997,8 +2111,9 @@ export default function Databases() {
   const [siteId, setSiteId] = useState("");
   const [stackId, setStackId] = useState("");
   const [dbName, setDbName] = useState("");
-  const [engine, setEngine] = useState("postgres");
+  const [engine, setEngine] = useState("mariadb");
   const [submitting, setSubmitting] = useState(false);
+  const [dbSizes, setDbSizes] = useState<Record<string, number>>({});
 
   // Delete state
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -2039,6 +2154,9 @@ export default function Databases() {
       setDatabases(dbs);
       setSites(sitesData);
       setStacks(stacksData);
+      api.get<{ sizes?: Record<string, number> }>("/databases/sizes")
+        .then((res) => { if (res.sizes) setDbSizes(res.sizes); })
+        .catch(() => {});
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load data");
     } finally {
@@ -2382,10 +2500,10 @@ export default function Databases() {
                 onChange={(e) => setEngine(e.target.value)}
                 className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800"
               >
+                <option value="mariadb">MariaDB 11 (MySQL-compatible)</option>
                 <option value="postgres">PostgreSQL 16</option>
-                <option value="mariadb">MariaDB 11</option>
               </select>
-              <p className="text-xs text-dark-300 mt-1">MySQL, MariaDB, or PostgreSQL</p>
+              <p className="text-xs text-dark-300 mt-1">MariaDB 11 (MySQL-compatible) or PostgreSQL 16</p>
             </div>
           </div>
           <div className="flex gap-3">
@@ -2473,15 +2591,24 @@ export default function Databases() {
                                 </svg>
                               </span>
                               <div>
-                                <h3 className="text-sm font-bold text-dark-50 font-mono">{db.name}</h3>
+                                <button
+                                  onClick={() => setManageDb({ db, tab: "browse" })}
+                                  className="text-sm font-bold text-dark-50 hover:text-rust-400 font-mono text-left transition-colors cursor-pointer block"
+                                  title="Click to open in Database Browser"
+                                >
+                                  {db.name}
+                                </button>
                                 <span className="inline-block px-2 py-0.5 mt-0.5 rounded text-[10px] font-medium bg-dark-700 text-dark-200 uppercase tracking-wide">
                                   {engineLabels[db.engine] || db.engine}
                                 </span>
                               </div>
                             </div>
-                            <span className="text-xs font-mono text-dark-300">
-                              Port: {db.port || "—"}
-                            </span>
+                            <div className="flex flex-col items-end text-xs font-mono text-dark-300">
+                              <span>Port: {db.port || "—"}</span>
+                              {dbSizes[db.name] !== undefined && (
+                                <span className="text-rust-400 font-medium text-[11px] mt-0.5">{formatBytes(dbSizes[db.name])}</span>
+                              )}
+                            </div>
                           </div>
 
                           <div className="space-y-1.5 text-xs text-dark-300 mb-4">
@@ -2551,6 +2678,9 @@ export default function Databases() {
                       <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">
                         Port
                       </th>
+                      <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">
+                        Size
+                      </th>
                       <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden lg:table-cell">
                         Created
                       </th>
@@ -2569,9 +2699,13 @@ export default function Databases() {
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
                               </svg>
                             </span>
-                            <span className="text-sm font-semibold text-dark-50 font-mono">
+                            <button
+                              onClick={() => setManageDb({ db, tab: "browse" })}
+                              className="text-sm font-semibold text-dark-50 hover:text-rust-400 font-mono transition-colors text-left cursor-pointer"
+                              title="Click to open in Database Browser"
+                            >
                               {db.name}
-                            </span>
+                            </button>
                           </div>
                         </td>
                         <td className="px-5 py-4 text-xs font-mono text-dark-200">
@@ -2584,6 +2718,9 @@ export default function Databases() {
                         </td>
                         <td className="px-5 py-4 text-xs text-dark-200 font-mono hidden sm:table-cell">
                           {db.port || "\u2014"}
+                        </td>
+                        <td className="px-5 py-4 text-xs font-mono text-dark-200 hidden sm:table-cell">
+                          {dbSizes[db.name] !== undefined ? formatBytes(dbSizes[db.name]) : "—"}
                         </td>
                         <td className="px-5 py-4 text-xs text-dark-200 hidden lg:table-cell">
                           {formatDate(db.created_at)}
