@@ -432,7 +432,7 @@ async fn configure_panel_domain(
         Err(e) => (false, format!("Failed to execute certbot: {e}")),
     };
 
-    let _ = safe_command_unsandboxed("nginx", &["-s", "reload"]).output().await;
+    let _ = safe_command_unsandboxed("nginx", &[]).args(["-s", "reload"]).output().await;
 
     if let Ok(env_content) = std::fs::read_to_string("/etc/dockpanel/api.env") {
         let mut lines = Vec::new();
