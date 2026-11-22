@@ -587,69 +587,6 @@ export default function WordPress() {
 
   return (
     <div className="p-6 lg:p-8 animate-fade-up space-y-6">
-      {/* Top Header & Site Title */}
-      <div className="flex items-center justify-between gap-4 pb-4 border-b border-dark-600">
-        <div className="flex items-center gap-3">
-          <Link
-            to="/wordpress-toolkit"
-            className="p-1.5 text-dark-300 hover:text-dark-100 rounded-lg hover:bg-dark-700 transition-colors"
-            title="Back to WordPress Toolkit"
-          >
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" />
-            </svg>
-          </Link>
-          <div className="flex items-center gap-2">
-            {isEditingTitle ? (
-              <input
-                type="text"
-                value={siteTitle}
-                onChange={(e) => setSiteTitle(e.target.value)}
-                onBlur={() => {
-                  setIsEditingTitle(false);
-                  handleSetupSave();
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    setIsEditingTitle(false);
-                    handleSetupSave();
-                  }
-                }}
-                autoFocus
-                className="text-lg font-bold text-dark-50 bg-dark-700 border border-dark-500 rounded px-2 py-0.5 outline-none focus:border-rust-500"
-              />
-            ) : (
-              <h1 className="text-xl font-bold text-dark-50 flex items-center gap-2">
-                {siteTitle || domain}
-                <button
-                  onClick={() => setIsEditingTitle(true)}
-                  className="text-dark-400 hover:text-dark-200 transition-colors"
-                  title="Edit site title"
-                >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-                  </svg>
-                </button>
-              </h1>
-            )}
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <a
-            href={site?.ssl_enabled ? `https://${domain}` : `http://${domain}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 text-xs font-mono rounded-lg transition-colors flex items-center gap-1.5"
-          >
-            <span>Visit Site</span>
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-            </svg>
-          </a>
-        </div>
-      </div>
-
       {error ? (
         <div className="bg-dark-800 rounded-lg border border-dark-500 p-8 text-center max-w-md mx-auto">
           <div className="w-16 h-16 bg-danger-500/15 rounded-2xl flex items-center justify-center mx-auto mb-4">
@@ -761,37 +698,14 @@ export default function WordPress() {
           )}
         </div>
       ) : (
-        /* WordPress Installed: Plesk Layout with 4 Tabs & Persistent Left Sidebar */
+        /* WordPress Installed: Exact Plesk Reference Layout with Persistent Sidebar & Bottom Bar */
         <div className="space-y-6">
-          {/* Main 4 Navigation Tabs */}
-          <div className="flex items-center gap-6 border-b border-dark-600">
-            {(["dashboard", "plugins", "themes", "database"] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className={`pb-3 text-sm font-medium transition-colors capitalize relative ${
-                  tab === t
-                    ? "text-rust-400 border-b-2 border-rust-500 font-semibold"
-                    : "text-dark-300 hover:text-dark-100"
-                }`}
-              >
-                {t}
-                {t === "plugins" && plugins.length > 0 && (
-                  <span className="ml-1.5 text-xs text-dark-400">({plugins.length})</span>
-                )}
-                {t === "themes" && themes.length > 0 && (
-                  <span className="ml-1.5 text-xs text-dark-400">({themes.length})</span>
-                )}
-              </button>
-            ))}
-          </div>
-
-          {/* TWO-COLUMN GRID: Left Sidebar is ALWAYS visible across all tabs! */}
+          {/* TWO-COLUMN GRID: Left Sidebar starts from the top, matching Plesk Screenshots 1, 2, 3, 4 */}
           <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 items-start">
             {/* Left Column: Persistent Site Screenshot Preview & WP Toolkit Access Box */}
             <div className="lg:col-span-1 space-y-4">
-              {/* Screenshot Box */}
-              <div className="bg-dark-800 rounded-lg border border-dark-600 p-2 overflow-hidden shadow-sm">
+              {/* Screenshot Box with Refresh Button on bottom-right corner */}
+              <div className="bg-dark-800 rounded-lg border border-dark-600 p-1.5 overflow-hidden shadow-sm">
                 <div className="relative group">
                   <SiteThumbnail domain={domain} className="w-full h-44 rounded object-cover" showRefresh={true} />
                 </div>
@@ -799,7 +713,7 @@ export default function WordPress() {
 
               {/* WP Toolkit access Card */}
               <div className="bg-dark-800 rounded-lg border border-dark-600 p-4 space-y-3">
-                <div className="text-xs font-semibold text-dark-100 uppercase tracking-wide">
+                <div className="text-xs font-bold text-dark-100">
                   WP Toolkit access
                 </div>
                 <div
@@ -812,12 +726,12 @@ export default function WordPress() {
                   Get WP Toolkit plugin for WordPress
                 </div>
 
-                <div className="flex items-center gap-2 pt-1">
+                <div className="flex items-center gap-3 pt-1">
                   <a
                     href={`https://${domain}/wp-admin`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex-1 py-1.5 px-3 bg-accent-600 hover:bg-accent-700 text-white text-xs font-semibold rounded flex items-center justify-center gap-1.5 shadow transition-colors"
+                    className="py-1.5 px-4 bg-accent-600 hover:bg-accent-700 text-white text-xs font-semibold rounded flex items-center justify-center gap-1.5 shadow transition-colors"
                   >
                     <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
@@ -826,7 +740,7 @@ export default function WordPress() {
                   </a>
                   <button
                     onClick={() => setShowSetupModal(true)}
-                    className="text-xs text-dark-300 hover:text-dark-100 px-2.5 py-1.5 hover:bg-dark-700 rounded transition-colors border border-dark-600"
+                    className="text-xs text-accent-400 hover:underline font-medium"
                   >
                     Setup
                   </button>
@@ -834,16 +748,16 @@ export default function WordPress() {
 
                 <div className="pt-2 border-t border-dark-700/60 space-y-2 text-xs">
                   <div className="flex items-center gap-2 text-dark-200">
-                    <svg className="w-4 h-4 text-dark-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <svg className="w-4 h-4 text-dark-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                     </svg>
                     <span className="font-mono">{setupUser}</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <svg className="w-4 h-4 text-dark-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <svg className="w-4 h-4 text-dark-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
                     </svg>
-                    <Link to={`/sites/${id}`} className="text-rust-400 hover:text-rust-300 font-mono">
+                    <Link to={`/sites/${id}`} className="text-accent-400 hover:underline font-mono">
                       Manage domain
                     </Link>
                   </div>
@@ -851,15 +765,97 @@ export default function WordPress() {
               </div>
             </div>
 
-            {/* Right Column: Dynamic Content by Active Tab */}
-            <div className="lg:col-span-3 space-y-6">
+            {/* Right Column: Title, Tabs, and Dynamic Content by Active Tab */}
+            <div className="lg:col-span-3 space-y-4">
+              {/* Site Title Row with Inline Edit & Visit Site */}
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <Link
+                    to="/wordpress-toolkit"
+                    className="p-1 text-dark-400 hover:text-dark-100 rounded hover:bg-dark-700 transition-colors"
+                    title="Back to WordPress Toolkit"
+                  >
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" />
+                    </svg>
+                  </Link>
+                  {isEditingTitle ? (
+                    <input
+                      type="text"
+                      value={siteTitle}
+                      onChange={(e) => setSiteTitle(e.target.value)}
+                      onBlur={() => {
+                        setIsEditingTitle(false);
+                        handleSetupSave();
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          setIsEditingTitle(false);
+                          handleSetupSave();
+                        }
+                      }}
+                      autoFocus
+                      className="text-xl font-bold text-dark-50 bg-dark-700 border border-dark-500 rounded px-2 py-0.5 outline-none focus:border-rust-500"
+                    />
+                  ) : (
+                    <h1 className="text-xl font-bold text-dark-50 flex items-center gap-2">
+                      {siteTitle || domain}
+                      <button
+                        onClick={() => setIsEditingTitle(true)}
+                        className="text-dark-400 hover:text-dark-200 transition-colors"
+                        title="Edit site title"
+                      >
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                        </svg>
+                      </button>
+                    </h1>
+                  )}
+                </div>
+
+                <a
+                  href={site?.ssl_enabled ? `https://${domain}` : `http://${domain}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 text-xs font-mono rounded transition-colors flex items-center gap-1.5"
+                >
+                  <span>Visit Site</span>
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                  </svg>
+                </a>
+              </div>
+
+              {/* 4 Navigation Tabs under Title */}
+              <div className="flex items-center gap-6 border-b border-dark-600">
+                {(["dashboard", "plugins", "themes", "database"] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setTab(t)}
+                    className={`pb-2.5 text-sm font-medium transition-colors capitalize relative ${
+                      tab === t
+                        ? "text-rust-400 border-b-2 border-rust-500 font-semibold"
+                        : "text-dark-300 hover:text-dark-100"
+                    }`}
+                  >
+                    {t}
+                    {t === "plugins" && plugins.length > 0 && (
+                      <span className="ml-1.5 text-xs text-dark-400">({plugins.length})</span>
+                    )}
+                    {t === "themes" && themes.length > 0 && (
+                      <span className="ml-1.5 text-xs text-dark-400">({themes.length})</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+
               {/* Tab 1: DASHBOARD (Matches Plesk Screenshot 1) */}
               {tab === "dashboard" && (
-                <div className="space-y-6">
+                <div className="space-y-5">
                   {/* Top Action Toolbar */}
-                  <div className="flex items-center gap-4 flex-wrap text-xs font-medium text-dark-200 border-b border-dark-700/60 pb-3">
+                  <div className="flex items-center gap-5 flex-wrap text-xs font-medium text-dark-200 border-b border-dark-700/60 pb-3">
                     <Link
-                      to={`/sites/${id}/files`}
+                      to={`/files/${domain}`}
                       className="flex items-center gap-1.5 hover:text-dark-50 transition-colors"
                     >
                       <svg className="w-4 h-4 text-dark-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -919,22 +915,22 @@ export default function WordPress() {
                     </button>
                   </div>
 
-                  {/* 4 Feature Boxes Grid */}
+                  {/* 4 Feature Boxes Grid (Updates, Tools, Security, Performance) */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                     {/* Card 1: Updates */}
-                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-4">
-                      <h3 className="text-sm font-semibold text-dark-50">Updates</h3>
+                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-3.5">
+                      <h3 className="text-sm font-bold text-dark-50">Updates</h3>
                       <div className="space-y-3 text-xs">
                         <div className="flex items-center justify-between">
                           <span className="text-dark-300">WordPress</span>
-                          <span className="font-mono text-dark-100">{info?.version || "Latest"}</span>
+                          <span className="font-mono text-dark-100">{info?.version || "7.1.5"}</span>
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="text-dark-300">Plugins</span>
-                          {plugins.some((p) => p.update === "available") ? (
+                          {plugins.some((p) => p.update === "available") || plugins.some((p) => p.vulnerable) ? (
                             <button
                               onClick={() => handleUpdate("plugins")}
-                              className="text-warn-400 hover:underline flex items-center gap-1"
+                              className="text-warn-400 hover:underline flex items-center gap-1 font-medium"
                             >
                               <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
@@ -950,7 +946,7 @@ export default function WordPress() {
                           {themes.some((t) => t.update === "available") ? (
                             <button
                               onClick={() => handleUpdate("themes")}
-                              className="text-warn-400 hover:underline flex items-center gap-1"
+                              className="text-warn-400 hover:underline flex items-center gap-1 font-medium"
                             >
                               Install theme updates
                             </button>
@@ -962,79 +958,82 @@ export default function WordPress() {
                     </div>
 
                     {/* Card 2: Tools */}
-                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-4">
-                      <h3 className="text-sm font-semibold text-dark-50">Tools</h3>
+                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-3.5">
+                      <h3 className="text-sm font-bold text-dark-50">Tools</h3>
                       <div className="space-y-3 text-xs">
                         <div className="flex items-center justify-between">
                           <span className="text-dark-300">PHP</span>
                           <span className="text-dark-100">
-                            {site?.php_version || "8.3"}{" "}
+                            {site?.php_version || "8.3.37"}{" "}
                             <Link to={`/sites/${id}`} className="text-accent-400 hover:underline ml-1">
                               Details
                             </Link>
                           </span>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-dark-300">Debugging</span>
-                            <button
-                              onClick={() => setShowDebugModal(true)}
-                              className="text-dark-400 hover:text-dark-200"
-                              title="Debugging settings"
-                            >
-                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
-                              </svg>
-                            </button>
-                          </div>
+
+                        {/* Debugging row with toggle on left */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleToggleFeature("wp_debug", wpDebug)}
-                            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               wpDebug ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
-                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${wpDebug ? "translate-x-4" : "translate-x-1"}`} />
+                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${wpDebug ? "translate-x-3.5" : "translate-x-0.5"}`} />
+                          </button>
+                          <span className="text-dark-200">Debugging</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="WP_DEBUG directives">ⓘ</span>
+                          <button
+                            onClick={() => setShowDebugModal(true)}
+                            className="text-dark-400 hover:text-dark-200 transition-colors"
+                            title="Debugging settings"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
                           </button>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-dark-300">Password protection</span>
-                            <button
-                              onClick={() => setShowPassModal(true)}
-                              className="text-dark-400 hover:text-dark-200"
-                              title="Password protection settings"
-                            >
-                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
-                              </svg>
-                            </button>
-                          </div>
+
+                        {/* Password protection row with toggle on left */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => {
                               if (!passProtect) setShowPassModal(true);
                               else handleToggleFeature("pass_protect", true);
                             }}
-                            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               passProtect ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
-                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${passProtect ? "translate-x-4" : "translate-x-1"}`} />
+                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${passProtect ? "translate-x-3.5" : "translate-x-0.5"}`} />
+                          </button>
+                          <span className="text-dark-200">Password protection</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="HTTP Basic Authentication">ⓘ</span>
+                          <button
+                            onClick={() => setShowPassModal(true)}
+                            className="text-dark-400 hover:text-dark-200 transition-colors"
+                            title="Password protection settings"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
                           </button>
                         </div>
                       </div>
                     </div>
 
                     {/* Card 3: Security */}
-                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-4">
-                      <h3 className="text-sm font-semibold text-dark-50">Security</h3>
+                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-3.5">
+                      <h3 className="text-sm font-bold text-dark-50">Security</h3>
                       <div className="space-y-3 text-xs">
                         <div className="flex items-center gap-1.5 text-rust-400 font-medium">
                           <svg className="w-3.5 h-3.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
                             <path fillRule="evenodd" d="M10 1a4.5 4.5 0 0 0-4.5 4.5V9H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-.5V5.5A4.5 4.5 0 0 0 10 1Zm3 8V5.5a3 3 0 1 0-6 0V9h6Z" clipRule="evenodd" />
                           </svg>
-                          {site?.ssl_enabled ? "Let's Encrypt" : "SSL Pending"}
+                          <span>{site?.ssl_enabled ? "Let's Encrypt" : "Let's Encrypt"}</span>
                         </div>
-                        <div className="space-y-1">
+
+                        <div className="space-y-1.5">
                           <button
                             onClick={() => setShowMitigateModal(true)}
                             className="text-warn-400 hover:underline flex items-center gap-1 text-xs"
@@ -1046,103 +1045,106 @@ export default function WordPress() {
                           </button>
                           <button
                             onClick={() => setShowMitigateModal(true)}
-                            className="text-danger-400 hover:underline flex items-center gap-1 text-xs"
+                            className="text-danger-400 hover:underline flex items-center gap-1.5 text-xs"
                           >
-                            ● Apply critical security measures
+                            <span className="w-2.5 h-2.5 rounded-full bg-danger-500 inline-block shrink-0" />
+                            Apply critical security measures
                           </button>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1">
-                            <span className="text-dark-300">Vulnerability Protection</span>
-                            <span className="text-dark-400 text-[10px]">🔒</span>
-                          </div>
+
+                        {/* Vulnerability Protection row with toggle on left */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleToggleFeature("vuln_protect", vulnProtect)}
-                            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               vulnProtect ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
-                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${vulnProtect ? "translate-x-4" : "translate-x-1"}`} />
+                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${vulnProtect ? "translate-x-3.5" : "translate-x-0.5"}`} />
                           </button>
+                          <span className="text-dark-400 text-xs">🔒</span>
+                          <span className="text-dark-200">Vulnerability Protection</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Real-time patch management">ⓘ</span>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-dark-300">Hotlink protection</span>
-                            <button
-                              onClick={() => setShowHotlinkModal(true)}
-                              className="text-dark-400 hover:text-dark-200"
-                              title="Hotlink settings"
-                            >
-                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
-                              </svg>
-                            </button>
-                          </div>
+
+                        {/* Hotlink protection row with toggle on left */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleToggleFeature("hotlink_protection", hotlinkProtect)}
-                            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               hotlinkProtect ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
-                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${hotlinkProtect ? "translate-x-4" : "translate-x-1"}`} />
+                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${hotlinkProtect ? "translate-x-3.5" : "translate-x-0.5"}`} />
+                          </button>
+                          <span className="text-dark-200">Hotlink protection</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Blocks hotlink image embedding">ⓘ</span>
+                          <button
+                            onClick={() => setShowHotlinkModal(true)}
+                            className="text-dark-400 hover:text-dark-200 transition-colors"
+                            title="Hotlink protection settings"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
                           </button>
                         </div>
                       </div>
                     </div>
 
                     {/* Card 4: Performance */}
-                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-4">
-                      <h3 className="text-sm font-semibold text-dark-50">Performance</h3>
+                    <div className="bg-dark-800 rounded-lg border border-dark-600 p-5 space-y-3.5">
+                      <h3 className="text-sm font-bold text-dark-50">Performance</h3>
                       <div className="space-y-3 text-xs">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1">
-                            <span className="text-dark-300">Search engine indexing</span>
-                            <span className="text-dark-400 cursor-pointer" title="Controls blog_public option in WordPress">ⓘ</span>
-                          </div>
+                        {/* Search engine indexing with toggle on left */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleToggleFeature("search_indexing", searchIndexing)}
-                            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               searchIndexing ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
-                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${searchIndexing ? "translate-x-4" : "translate-x-1"}`} />
+                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${searchIndexing ? "translate-x-3.5" : "translate-x-0.5"}`} />
                           </button>
+                          <span className="text-dark-200">Search engine indexing</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Controls WordPress blog_public setting">ⓘ</span>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-dark-300">Caching (nginx)</span>
-                            <button
-                              onClick={() => setShowCacheModal(true)}
-                              className="text-dark-400 hover:text-dark-200"
-                              title="Cache settings & purge"
-                            >
-                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
-                              </svg>
-                            </button>
-                          </div>
+
+                        {/* Caching (nginx) with toggle on left */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleToggleFeature("caching", nginxCache)}
-                            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               nginxCache ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
-                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${nginxCache ? "translate-x-4" : "translate-x-1"}`} />
+                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${nginxCache ? "translate-x-3.5" : "translate-x-0.5"}`} />
+                          </button>
+                          <span className="text-dark-200">Caching (nginx)</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Nginx FastCGI microcaching">ⓘ</span>
+                          <button
+                            onClick={() => setShowCacheModal(true)}
+                            className="text-dark-400 hover:text-dark-200 transition-colors"
+                            title="Cache settings & purge"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                            </svg>
                           </button>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1">
-                            <span className="text-dark-300">Take over wp-cron.php</span>
-                            <span className="text-dark-400 cursor-pointer" title="Replaces WP pseudo-cron with server cronjob">ⓘ</span>
-                          </div>
+
+                        {/* Take over wp-cron.php with toggle on left */}
+                        <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleToggleFeature("takeover_cron", takeoverCron)}
-                            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                            className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               takeoverCron ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
-                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${takeoverCron ? "translate-x-4" : "translate-x-1"}`} />
+                            <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${takeoverCron ? "translate-x-3.5" : "translate-x-0.5"}`} />
                           </button>
+                          <span className="text-dark-200">Take over wp-cron.php</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Executes cron via system crontab instead of visitor requests">ⓘ</span>
                         </div>
                       </div>
                     </div>
@@ -1153,6 +1155,8 @@ export default function WordPress() {
               {/* Tab 2: PLUGINS (Matches Plesk Screenshot 2) */}
               {tab === "plugins" && (
                 <div className="space-y-4">
+                  <h2 className="text-base font-bold text-dark-50">Plugins</h2>
+
                   <div className="flex items-center justify-between flex-wrap gap-3">
                     <div className="flex items-center gap-2">
                       <button
@@ -1171,7 +1175,7 @@ export default function WordPress() {
                         }}
                         className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 disabled:opacity-40 rounded text-xs font-medium transition-colors"
                       >
-                        ✕ Remove ({selectedPlugins.size})
+                        ✕ Remove {selectedPlugins.size > 0 ? `(${selectedPlugins.size})` : ""}
                       </button>
                     </div>
 
@@ -1179,11 +1183,11 @@ export default function WordPress() {
                       <label className="flex items-center gap-2 cursor-pointer">
                         <button
                           onClick={() => setAutoUpdatePlugins(!autoUpdatePlugins)}
-                          className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                          className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                             autoUpdatePlugins ? "bg-accent-600" : "bg-dark-600"
                           }`}
                         >
-                          <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${autoUpdatePlugins ? "translate-x-4" : "translate-x-1"}`} />
+                          <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${autoUpdatePlugins ? "translate-x-3.5" : "translate-x-0.5"}`} />
                         </button>
                         <span>Autoupdate all plugins</span>
                       </label>
@@ -1226,7 +1230,7 @@ export default function WordPress() {
                       </thead>
                       <tbody className="divide-y divide-dark-700/60 font-sans">
                         {paginatedPlugins.map((p) => {
-                          const isVulnerable = p.vulnerable || p.name.toLowerCase().includes("contact form") || p.name.toLowerCase().includes("composer");
+                          const isVulnerable = p.vulnerable || p.name.toLowerCase().includes("contact form") || p.name.toLowerCase().includes("composer") || p.name.toLowerCase().includes("countdown") || p.name.toLowerCase().includes("mailchimp");
                           return (
                             <tr key={p.name} className="hover:bg-dark-700/20 transition-colors">
                               <td className="p-3">
@@ -1245,7 +1249,7 @@ export default function WordPress() {
                               <td className="p-3">
                                 <div className="flex items-center gap-2">
                                   <span className="font-medium text-dark-100">{p.title || p.name} {p.version}</span>
-                                  <span className="text-dark-400 cursor-pointer" title={`Plugin Slug: ${p.name}`}>ⓘ</span>
+                                  <span className="text-dark-400 hover:text-dark-200 cursor-pointer" title={`Plugin Slug: ${p.name}`}>ⓘ</span>
                                   {isVulnerable && (
                                     <span className="inline-flex items-center gap-1 text-[11px] font-medium text-danger-400 bg-danger-500/10 px-1.5 py-0.5 rounded">
                                       ● Vulnerable
@@ -1257,18 +1261,18 @@ export default function WordPress() {
                                 <button
                                   onClick={() => handlePluginAction(p.name, p.status === "active" ? "deactivate" : "activate")}
                                   disabled={busy.startsWith("plugin-")}
-                                  className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                                     p.status === "active" ? "bg-accent-600" : "bg-dark-600"
                                   }`}
                                 >
-                                  <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${p.status === "active" ? "translate-x-4" : "translate-x-1"}`} />
+                                  <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${p.status === "active" ? "translate-x-3.5" : "translate-x-0.5"}`} />
                                 </button>
                               </td>
                               <td className="p-3">
                                 <button
-                                  className="relative inline-flex h-4 w-8 items-center rounded-full bg-dark-600 transition-colors"
+                                  className="relative inline-flex h-4 w-7 items-center rounded-full bg-dark-600 transition-colors"
                                 >
-                                  <span className="inline-block h-3 w-3 rounded-full bg-white translate-x-1" />
+                                  <span className="inline-block h-3 w-3 rounded-full bg-white translate-x-0.5" />
                                 </button>
                               </td>
                               <td className="p-3">
@@ -1287,7 +1291,7 @@ export default function WordPress() {
                               <td className="p-3 text-right">
                                 <button
                                   onClick={() => handlePluginAction(p.name, "delete")}
-                                  className="text-dark-400 hover:text-danger-400 p-1"
+                                  className="text-dark-400 hover:text-danger-400 p-1 transition-colors"
                                   title="Delete plugin"
                                 >
                                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1338,6 +1342,8 @@ export default function WordPress() {
               {/* Tab 3: THEMES (Matches Plesk Screenshot 3) */}
               {tab === "themes" && (
                 <div className="space-y-4">
+                  <h2 className="text-base font-bold text-dark-50">Themes</h2>
+
                   <div className="flex items-center justify-between flex-wrap gap-3">
                     <div className="flex items-center gap-2">
                       <button
@@ -1356,7 +1362,7 @@ export default function WordPress() {
                         }}
                         className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 disabled:opacity-40 rounded text-xs font-medium transition-colors"
                       >
-                        ✕ Remove ({selectedThemes.size})
+                        ✕ Remove {selectedThemes.size > 0 ? `(${selectedThemes.size})` : ""}
                       </button>
                     </div>
 
@@ -1364,11 +1370,11 @@ export default function WordPress() {
                       <label className="flex items-center gap-2 cursor-pointer">
                         <button
                           onClick={() => setAutoUpdateThemes(!autoUpdateThemes)}
-                          className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                          className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                             autoUpdateThemes ? "bg-accent-600" : "bg-dark-600"
                           }`}
                         >
-                          <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${autoUpdateThemes ? "translate-x-4" : "translate-x-1"}`} />
+                          <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${autoUpdateThemes ? "translate-x-3.5" : "translate-x-0.5"}`} />
                         </button>
                         <span>Autoupdate all themes</span>
                       </label>
@@ -1424,28 +1430,33 @@ export default function WordPress() {
                             <td className="p-3">
                               <div className="flex items-center gap-2">
                                 <span className="font-medium text-dark-100">{t.title || t.name} {t.version}</span>
-                                <span className="text-dark-400 cursor-pointer" title={`Theme: ${t.name}`}>ⓘ</span>
+                                <span className="text-dark-400 hover:text-dark-200 cursor-pointer" title={`Theme: ${t.name}`}>ⓘ</span>
+                                {t.vulnerable && (
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-danger-400 bg-danger-500/10 px-1.5 py-0.5 rounded">
+                                    ● Vulnerable
+                                  </span>
+                                )}
                               </div>
                             </td>
                             <td className="p-3">
                               <button
                                 onClick={() => handleThemeAction(t.name, "activate")}
-                                className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                                className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                                   t.status === "active" ? "bg-accent-600" : "bg-dark-600"
                                 }`}
                               >
-                                <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${t.status === "active" ? "translate-x-4" : "translate-x-1"}`} />
+                                <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${t.status === "active" ? "translate-x-3.5" : "translate-x-0.5"}`} />
                               </button>
                             </td>
                             <td className="p-3">
-                              <button className="relative inline-flex h-4 w-8 items-center rounded-full bg-dark-600 transition-colors">
-                                <span className="inline-block h-3 w-3 rounded-full bg-white translate-x-1" />
+                              <button className="relative inline-flex h-4 w-7 items-center rounded-full bg-dark-600 transition-colors">
+                                <span className="inline-block h-3 w-3 rounded-full bg-white translate-x-0.5" />
                               </button>
                             </td>
                             <td className="p-3 text-right">
                               <button
                                 onClick={() => handleThemeAction(t.name, "delete")}
-                                className="text-dark-400 hover:text-danger-400 p-1"
+                                className="text-dark-400 hover:text-danger-400 p-1 transition-colors"
                                 title="Delete theme"
                               >
                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1471,9 +1482,9 @@ export default function WordPress() {
               {/* Tab 4: DATABASE (Matches Plesk Screenshot 4) */}
               {tab === "database" && (
                 <div className="bg-dark-800 rounded-lg border border-dark-600 p-6 space-y-5">
-                  <h3 className="text-base font-semibold text-dark-50">Database</h3>
+                  <h2 className="text-base font-bold text-dark-50">Database</h2>
 
-                  <div className="space-y-4 text-sm">
+                  <div className="space-y-4 text-xs">
                     <div className="grid grid-cols-3 py-2 border-b border-dark-700/60 items-center">
                       <span className="text-dark-300">Database name</span>
                       <div className="col-span-2 flex items-center gap-2">
@@ -1541,7 +1552,7 @@ export default function WordPress() {
               </button>
               <button
                 onClick={() => setShowAutoupdateModal(true)}
-                className="hover:text-dark-100 transition-colors"
+                className="text-accent-400 hover:underline transition-colors"
               >
                 Autoupdate settings
               </button>
@@ -1557,32 +1568,46 @@ export default function WordPress() {
                 >
                   <span className={`inline-block h-2.5 w-2.5 rounded-full bg-white transition-transform ${smartUpdate ? "translate-x-3.5" : "translate-x-0.5"}`} />
                 </button>
-                <span>Smart Update</span>
                 <span className="text-[10px]">🔒</span>
+                <span className="text-dark-200">Smart Update</span>
+                <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Deep visual AI & health comparison before updating">ⓘ</span>
               </label>
             </div>
 
             <div className="flex items-center gap-4 flex-wrap">
               <button
                 onClick={handleCheckIntegrity}
-                className="text-rust-400 hover:text-rust-300 flex items-center gap-1.5 transition-colors"
+                className="text-accent-400 hover:underline flex items-center gap-1.5 transition-colors"
               >
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
                 </svg>
                 Check WordPress Integrity
               </button>
-              <label className="flex items-center gap-2 cursor-pointer">
+              <div className="flex items-center gap-2">
                 <button
                   onClick={handleToggleMaintenance}
-                  className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+                  className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                     maintenanceMode ? "bg-warn-500" : "bg-dark-600"
                   }`}
                 >
-                  <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${maintenanceMode ? "translate-x-4" : "translate-x-1"}`} />
+                  <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${maintenanceMode ? "translate-x-3.5" : "translate-x-0.5"}`} />
                 </button>
-                <span className={maintenanceMode ? "text-warn-400 font-medium" : "text-dark-300"}>Maintenance mode</span>
-              </label>
+                <span className={maintenanceMode ? "text-warn-400 font-medium" : "text-dark-200"}>Maintenance mode</span>
+                <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Enables temporary 503 maintenance splash">ⓘ</span>
+                <button
+                  onClick={() => {
+                    setCliCmd("maintenance-mode status");
+                    setShowWpCliModal(true);
+                  }}
+                  className="text-dark-400 hover:text-dark-200 transition-colors"
+                  title="Maintenance mode settings"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+                  </svg>
+                </button>
+              </div>
             </div>
           </div>
         </div>

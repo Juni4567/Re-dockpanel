@@ -4,6 +4,16 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.248.1] - 2026-11-23
+
+### Refinement: Exact Plesk Visual Alignment for WordPress Toolkit
+- **Pixel-Identical Layout & Positioning:**
+  - Placed the persistent left sidebar (website screenshot thumbnail with refresh button, WP Toolkit access card, Log in button, Setup credentials link, Admin username, and Manage domain link) directly level with the top of the right column, matching Plesk Screenshots 1, 2, 3, and 4.
+  - Aligned Site Title, inline pencil edit icon `✎`, and `Visit Site ↗` in the top header row of the right column.
+  - Placed the 4 navigation tabs (`Dashboard`, `Plugins`, `Themes`, `Database`) directly underneath the site title with a continuous horizontal dividing line.
+  - Realigned all feature toggles in `Tools`, `Security`, `Performance`, and the bottom bar so the toggle switch is positioned on the left, followed by the label, circular info icon `ⓘ`, and settings slider icon `🎛` (for Debugging, Password protection, Hotlink protection, Caching, and Maintenance mode).
+  - Maintained persistent bottom bar across all tabs containing Refresh Updates, Autoupdate settings link, Smart Update toggle, Check WordPress Integrity link, and Maintenance mode toggle with settings icon.
+
 ## [2.248.0] - 2026-11-23
 
 ### Major: Plesk-Identical WordPress Toolkit UI, Deep Linking, and Resilient Favicons/Screenshots
