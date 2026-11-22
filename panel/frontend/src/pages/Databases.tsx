@@ -2676,7 +2676,6 @@ export default function Databases() {
               </div>
             );
           })()}
-        </div>
 
           {/* Password reset success */}
           {pwResetSuccess && (
