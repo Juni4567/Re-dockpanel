@@ -1688,6 +1688,35 @@ pub async fn download_dump(
         .map_err(|e| internal_error("build download response", e))?)
 }
 
+/// DELETE /api/databases/{id}/dumps/{filename} — Delete dump file from disk.
+pub async fn delete_dump(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path((id, filename)): Path<(Uuid, String)>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let (name, _engine, _password, _port, _site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+
+    let clean_filename = filename.trim();
+    if clean_filename.contains("..") || clean_filename.contains('/') || clean_filename.contains('\\') {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid filename"));
+    }
+
+    let file_path = format!("/var/backups/dockpanel/databases/{name}/{clean_filename}");
+    if tokio::fs::metadata(&file_path).await.is_err() {
+        return Err(err(StatusCode::NOT_FOUND, "Dump file not found on disk"));
+    }
+
+    tokio::fs::remove_file(&file_path)
+        .await
+        .map_err(|e| internal_error("delete dump file", e))?;
+
+    Ok(axum::Json(serde_json::json!({
+        "success": true,
+        "filename": clean_filename
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_reserved_db_name;

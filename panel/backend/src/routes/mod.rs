@@ -1222,6 +1222,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/databases/{id}/export", post(databases::export))
         .route("/api/databases/{id}/upload-dump", post(databases::upload_dump).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)))
         .route("/api/databases/{id}/dumps/{filename}/download", get(databases::download_dump))
+        .route("/api/databases/{id}/dumps/{filename}", delete(databases::delete_dump))
         // Compose Stacks
         .route("/api/stacks", get(stacks::list).post(stacks::create))
         .route("/api/stacks/{id}", get(stacks::get_one).put(stacks::update).delete(stacks::remove))
