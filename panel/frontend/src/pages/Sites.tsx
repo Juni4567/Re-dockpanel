@@ -8,6 +8,7 @@ import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
 import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
 import SiteThumbnail from "../components/SiteThumbnail";
+import SiteFavicon from "../components/SiteFavicon";
 import { useAuth } from "../context/AuthContext";
 
 interface SiteMetrics {
@@ -551,12 +552,7 @@ export default function Sites() {
                           <div>
                             <div className="flex items-start justify-between gap-2 mb-3">
                               <div className="flex items-center gap-2 min-w-0">
-                                <img
-                                  src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
-                                  alt=""
-                                  className="w-4 h-4 rounded-sm flex-shrink-0"
-                                  onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
-                                />
+                                <SiteFavicon domain={site.domain} />
                                 <Link
                                   to={`/sites/${site.id}`}
                                   className="text-sm font-semibold text-rust-400 hover:text-rust-300 font-mono truncate"
@@ -702,12 +698,7 @@ export default function Sites() {
                         <tr key={site.id} className="hover:bg-dark-700/30 transition-colors">
                           <td className="px-5 py-4">
                             <div className="flex items-center gap-3">
-                              <img
-                                src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
-                                alt=""
-                                className="w-4 h-4 rounded-sm flex-shrink-0"
-                                onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
-                              />
+                              <SiteFavicon domain={site.domain} />
                               <SiteThumbnail domain={site.domain} className="w-10 h-7 rounded border border-dark-600 hidden sm:block shrink-0" />
                               <div className="min-w-0">
                                 <div className="flex items-center gap-1.5">

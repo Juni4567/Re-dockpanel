@@ -5,6 +5,7 @@ import { api, ApiError } from "../api";
 import { Link } from "react-router-dom";
 import { timeAgo } from "../utils/format";
 import SiteThumbnail from "../components/SiteThumbnail";
+import SiteFavicon from "../components/SiteFavicon";
 import { showGlobalNotification } from "../context/NotificationContext";
 import ConfirmDialog from "../components/ConfirmDialog";
 
@@ -1517,12 +1518,7 @@ export default function WordPressToolkit() {
                           </td>
                           <td className="p-3">
                             <div className="flex items-center gap-2.5">
-                              <img
-                                src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
-                                alt=""
-                                className="w-4 h-4 rounded-sm shrink-0"
-                                onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
-                              />
+                              <SiteFavicon domain={site.domain} />
                               <SiteThumbnail domain={site.domain} className="w-8 h-6 rounded border border-dark-600 shrink-0" />
                               <Link
                                 to={`/sites/${site.site_id}/wordpress`}
@@ -1617,12 +1613,7 @@ export default function WordPressToolkit() {
                         />
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 mb-1">
-                            <img
-                              src={`https://www.google.com/s2/favicons?domain=${site.domain}&sz=32`}
-                              alt=""
-                              className="w-4 h-4 rounded-sm shrink-0"
-                              onError={(e) => { (e.target as HTMLElement).style.display = "none"; }}
-                            />
+                            <SiteFavicon domain={site.domain} />
                             <h3 className="text-sm font-semibold text-dark-50 truncate font-mono">
                               {site.domain}
                             </h3>

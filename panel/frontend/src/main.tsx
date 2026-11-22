@@ -1,6 +1,7 @@
-import { StrictMode, Suspense, lazy, Component, type ReactNode } from "react";
+import { StrictMode, Suspense, lazy, Component, useEffect, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { api } from "./api";
 import { AuthProvider } from "./context/AuthContext";
 import { ServerProvider } from "./context/ServerContext";
 import { BrandingProvider } from "./context/BrandingContext";
@@ -119,6 +120,63 @@ const ContainerPolicies = lazyRetry(() => import("./pages/ContainerPolicies"));
 const System = lazyRetry(() => import("./pages/System"));
 const Telemetry = lazyRetry(() => import("./pages/Telemetry"));
 
+function FilesRedirect() {
+  const { domainOrId } = useParams<{ domainOrId: string }>();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!domainOrId) {
+      navigate("/sites", { replace: true });
+      return;
+    }
+    api.get<Array<{ id: string; domain: string }>>("/sites").then((sites) => {
+      const match = sites.find(
+        (s) => s.id === domainOrId || s.domain.toLowerCase() === domainOrId.toLowerCase()
+      );
+      if (match) {
+        navigate(`/sites/${match.id}/files`, { replace: true });
+      } else {
+        navigate("/sites", { replace: true });
+      }
+    }).catch(() => {
+      navigate("/sites", { replace: true });
+    });
+  }, [domainOrId, navigate]);
+
+  return (
+    <div className="flex items-center justify-center h-screen bg-dark-900">
+      <div className="w-6 h-6 border-2 border-dark-600 border-t-rust-500 rounded-full animate-spin" />
+    </div>
+  );
+}
+
+function BackupsRedirect() {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const siteId = searchParams.get("site");
+
+  useEffect(() => {
+    if (siteId) {
+      navigate(`/sites/${siteId}/backups`, { replace: true });
+      return;
+    }
+    api.get<Array<{ id: string }>>("/sites").then((sites) => {
+      if (sites.length > 0) {
+        navigate(`/sites/${sites[0].id}/backups`, { replace: true });
+      } else {
+        navigate("/sites", { replace: true });
+      }
+    }).catch(() => {
+      navigate("/sites", { replace: true });
+    });
+  }, [siteId, navigate]);
+
+  return (
+    <div className="flex items-center justify-center h-screen bg-dark-900">
+      <div className="w-6 h-6 border-2 border-dark-600 border-t-rust-500 rounded-full animate-spin" />
+    </div>
+  );
+}
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <BrandingProvider>
@@ -140,7 +198,10 @@ createRoot(document.getElementById("root")!).render(
               <Route path="/sites" element={<Sites />} />
               <Route path="/sites/:id" element={<SiteDetail />} />
               <Route path="/sites/:id/files" element={<Files />} />
+              <Route path="/files/:domainOrId" element={<FilesRedirect />} />
+              <Route path="/files" element={<Navigate to="/sites" replace />} />
               <Route path="/sites/:id/backups" element={<Backups />} />
+              <Route path="/backups" element={<BackupsRedirect />} />
               <Route path="/sites/:id/crons" element={<Crons />} />
               <Route path="/sites/:id/deploy" element={<Deploy />} />
               <Route path="/sites/:id/wordpress" element={<WordPress />} />

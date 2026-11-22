@@ -5,28 +5,39 @@ interface SiteThumbnailProps {
   className?: string;
   w?: number;
   alt?: string;
+  showRefresh?: boolean;
 }
 
 export default function SiteThumbnail({
   domain,
   className = "w-12 h-8",
-  w = 400,
+  w = 600,
   alt,
+  showRefresh = false,
 }: SiteThumbnailProps) {
-  const [stage, setStage] = useState<"microlink" | "thum" | "favicon" | "placeholder">("microlink");
+  const [stage, setStage] = useState<"thum" | "mshots" | "favicon" | "placeholder">("thum");
   const [loaded, setLoaded] = useState(false);
+  const [cacheBuster, setCacheBuster] = useState(Date.now());
 
-  const cleanDomain = domain.trim().toLowerCase();
-  const microlinkUrl = `https://api.microlink.io?url=https://${cleanDomain}&screenshot=true&meta=false&embed=screenshot.url`;
-  const thumUrl = `https://image.thum.io/get/width/${w}/crop/200/noanimate/https://${cleanDomain}`;
+  const cleanDomain = domain.trim().toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, "");
+  const thumUrl = `https://image.thum.io/get/width/${w}/crop/400/noanimate/https://${cleanDomain}?t=${cacheBuster}`;
+  const mshotsUrl = `https://s0.wp.com/mshots/v1/https%3A%2F%2F${cleanDomain}?w=${w}&t=${cacheBuster}`;
   const faviconUrl = `https://www.google.com/s2/favicons?domain=${cleanDomain}&sz=128`;
 
-  const handleMicrolinkError = () => {
+  const handleRefresh = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
     setLoaded(false);
     setStage("thum");
+    setCacheBuster(Date.now());
   };
 
   const handleThumError = () => {
+    setLoaded(false);
+    setStage("mshots");
+  };
+
+  const handleMshotsError = () => {
     setLoaded(false);
     setStage("favicon");
   };
@@ -35,7 +46,19 @@ export default function SiteThumbnail({
     setStage("placeholder");
   };
 
-  const initial = cleanDomain.replace(/^(https?:\/\/)?(www\.)?/, "").charAt(0).toUpperCase() || "W";
+  const initial = cleanDomain.charAt(0).toUpperCase() || "W";
+
+  const refreshBtn = showRefresh ? (
+    <button
+      onClick={handleRefresh}
+      className="absolute bottom-2 right-2 p-1.5 bg-dark-900/80 hover:bg-dark-900 text-white rounded shadow-md opacity-80 hover:opacity-100 transition-opacity z-10"
+      title="Refresh thumbnail preview"
+    >
+      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+      </svg>
+    </button>
+  ) : null;
 
   if (stage === "placeholder") {
     return (
@@ -43,7 +66,8 @@ export default function SiteThumbnail({
         className={`rounded border border-dark-600/60 bg-gradient-to-br from-dark-800 to-dark-900 shrink-0 overflow-hidden relative shadow-xs flex items-center justify-center font-bold text-dark-400 select-none ${className}`}
         title={`${domain}`}
       >
-        <span className="text-sm font-mono uppercase">{initial}</span>
+        <span className="text-xl font-mono uppercase">{initial}</span>
+        {refreshBtn}
       </div>
     );
   }
@@ -59,18 +83,19 @@ export default function SiteThumbnail({
           alt={alt || `${domain} favicon`}
           loading="lazy"
           onError={handleFaviconError}
-          className="w-5 h-5 object-contain"
+          className="w-10 h-10 object-contain"
         />
+        {refreshBtn}
       </div>
     );
   }
 
-  const currentUrl = stage === "microlink" ? microlinkUrl : thumUrl;
-  const errorHandler = stage === "microlink" ? handleMicrolinkError : handleThumError;
+  const currentUrl = stage === "thum" ? thumUrl : mshotsUrl;
+  const errorHandler = stage === "thum" ? handleMshotsError : handleFaviconError;
 
   return (
     <div
-      className={`rounded border border-dark-600/60 bg-dark-800/90 shrink-0 overflow-hidden relative shadow-xs flex items-center justify-center ${className}`}
+      className={`rounded border border-dark-600/60 bg-dark-800/90 shrink-0 overflow-hidden relative shadow-xs flex items-center justify-center group ${className}`}
       title={`${domain} live preview`}
     >
       {!loaded && (
@@ -91,6 +116,7 @@ export default function SiteThumbnail({
           loaded ? "opacity-100 scale-100" : "opacity-0 scale-95"
         }`}
       />
+      {refreshBtn}
     </div>
   );
 }

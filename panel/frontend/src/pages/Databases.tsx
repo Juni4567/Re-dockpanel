@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, FormEvent, ChangeEvent } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import { useAuth } from "../context/AuthContext";
@@ -2123,8 +2124,17 @@ export default function Databases() {
   const [credentials, setCredentials] = useState<Credentials | null>(null);
   const [credentialsLoading, setCredentialsLoading] = useState(false);
   const [copied, setCopied] = useState("");
-  const [search, setSearch] = useState("");
+  const [searchParams] = useSearchParams();
+  const searchParam = searchParams.get("search") || "";
+  const autoOpenParam = searchParams.get("autoOpen") === "true";
+  const [search, setSearch] = useState(searchParam);
   const [displayCount, setDisplayCount] = useState(25);
+
+  useEffect(() => {
+    if (searchParam) {
+      setSearch(searchParam);
+    }
+  }, [searchParam]);
 
   // Advanced Database Manager & Lethal Confirmation states
   const [manageDb, setManageDb] = useState<{ db: Database; tab?: ManagerTab } | null>(null);
@@ -2167,6 +2177,17 @@ export default function Databases() {
     fetchData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin]);
+
+  useEffect(() => {
+    if (autoOpenParam && searchParam && databases.length > 0) {
+      const match = databases.find(
+        (db) => db.name.toLowerCase() === searchParam.toLowerCase()
+      );
+      if (match) {
+        setManageDb({ db: match, tab: "browse" });
+      }
+    }
+  }, [autoOpenParam, searchParam, databases]);
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();

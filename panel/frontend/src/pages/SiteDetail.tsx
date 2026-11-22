@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
+import { useParams, useNavigate, Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import { statusColors, runtimeLabelsDetailed as runtimeLabels } from "../constants";
@@ -359,6 +359,23 @@ export default function SiteDetail() {
       .then((d) => setAliases(d.aliases || []))
       .catch(() => {});
   };
+
+  const [searchParams] = useSearchParams();
+
+  useEffect(() => {
+    const tab = searchParams.get("tab");
+    if (tab === "staging") {
+      setTimeout(() => {
+        document.getElementById("staging-section")?.scrollIntoView({ behavior: "smooth" });
+      }, 300);
+    } else if (tab === "logs") {
+      setShowAccessLogs(true);
+      loadLogs("access");
+      setTimeout(() => {
+        document.getElementById("logs-section")?.scrollIntoView({ behavior: "smooth" });
+      }, 300);
+    }
+  }, [searchParams]);
 
   const loadLogs = async (type: "access" | "error") => {
     setLogsLoading(true);
@@ -2448,7 +2465,7 @@ export default function SiteDetail() {
 
       {/* Staging Environment */}
       {site.status === "active" && !site.parent_site_id && (
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
+        <div id="staging-section" className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
           <div className="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
             <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Staging Environment</h2>
             {staging?.exists && staging.site && (
@@ -3005,7 +3022,7 @@ export default function SiteDetail() {
 
       {/* Access Logs */}
       {site.status === "active" && (
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
+        <div id="logs-section" className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
           <button onClick={() => { setShowAccessLogs(!showAccessLogs); if (!showAccessLogs) loadLogs(logType === "php" ? "access" : logType as "access" | "error"); }}
             className="w-full px-5 py-4 flex items-center justify-between hover:bg-dark-700/30 transition-colors">
             <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Access Logs</h2>

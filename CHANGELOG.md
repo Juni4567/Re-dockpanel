@@ -4,6 +4,48 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.248.0] - 2026-11-23
+
+### Major: Plesk-Identical WordPress Toolkit UI, Deep Linking, and Resilient Favicons/Screenshots
+
+#### 1. Plesk-Identical Persistent 2-Column WordPress Toolkit Layout
+- **Persistent Left Sidebar Across All Tabs:**
+  - Preserved the site screenshot thumbnail (with manual refresh button `showRefresh={true}` and live cache-buster), "WP Toolkit access" card, "Log in" button (cyan/blue direct wp-admin access), "Setup" credentials button, admin username, and "Manage domain" link across all 4 navigation tabs (`Dashboard`, `Plugins`, `Themes`, `Database`).
+- **Dashboard Tab Enhancements:**
+  - Header with inline editable site title (via pencil icon).
+  - Quick action toolbar: `File Manager` (deep linked to `/sites/{id}/files`), `Copy Data` (modal), `Clone` (deep linked to `/sites/{id}?tab=staging`), `Back Up / Restore` (deep linked to `/sites/{id}/backups`), `Logs` (deep linked to `/sites/{id}?tab=logs`), and `WP-CLI` (interactive console modal).
+  - 4 status and control cards: Updates (with "Install plugin updates" and "Install theme updates"), Tools (PHP version with Details link, Debugging toggle + settings modal, Password protection toggle + settings modal), Security (Let's Encrypt status, Mitigate vulnerabilities modal, Apply critical security measures, Vulnerability Protection toggle, Hotlink protection toggle + settings modal), Performance (Search engine indexing toggle, Caching (nginx) toggle + cache purge modal, Take over wp-cron.php toggle).
+- **Plugins Tab (Matching Plesk Screenshot 2):**
+  - Action toolbar with `+ Install` (slug input and popular recommendations modal), `✕ Remove` (bulk delete selected plugins), `Autoupdate all plugins` toggle switch, and instant real-time search filter.
+  - Interactive table displaying Plugin Name, Version, ⓘ Slug tooltip, Vulnerable status badges, Active toggle switch (activating/deactivating via WP-CLI), Autoupdate toggle switch, "Updates" link, and Delete icon button with pagination controls.
+- **Themes Tab (Matching Plesk Screenshot 3):**
+  - Action toolbar with `+ Install` theme modal, `✕ Remove`, `Autoupdate all themes` toggle switch, and search filter.
+  - Table with theme name, version, ⓘ tooltip, single-active theme radio/toggle switch, autoupdate toggle switch, and delete icon button.
+- **Database Tab (Matching Plesk Screenshot 4):**
+  - Displays Database name with direct deep link `[open in Database Manager]` to `/databases?search={db_name}&autoOpen=true`.
+  - Displays Database table prefix, Database server host, and Database user name with `[change]` modal to update database credentials.
+- **Persistent Bottom Bar Across All Tabs:**
+  - Refresh Updates button, Autoupdate settings modal link, 🔒 Smart Update toggle with health check rollback, 🔗 Check WordPress Integrity modal trigger, and Maintenance mode toggle.
+
+#### 2. Deep Linking and Routing Resolution
+- **File Manager Alias Routes (`/files/:domainOrId` and `/files`):**
+  - Resolves any domain or ID provided in `/files/:domainOrId` directly to the corresponding site's `/sites/{id}/files` route.
+- **Backups Universal Route (`/backups`):**
+  - Reads `?site={id}` query parameter and routes directly to `/sites/{id}/backups`, preventing 404 errors.
+- **Staging / Clone & Logs Deep Links:**
+  - `SiteDetail.tsx` automatically scrolls to the Staging Environment when `?tab=staging` is requested.
+  - `SiteDetail.tsx` automatically expands the Access Logs panel and fetches the log stream when `?tab=logs` is requested.
+- **Database Manager Deep Linking:**
+  - `Databases.tsx` automatically reads `search` and `autoOpen` URL query parameters, automatically filtering the database table and opening the Advanced Database Manager.
+
+#### 3. Live Favicons & Website Screenshots Resolution
+- **Fixed Server Nginx CSP:**
+  - Updated `/etc/nginx/sites-enabled/dockpanel-panel.conf` Content Security Policy header from `img-src 'self' data: blob:;` to `img-src 'self' data: blob: https:;`, unblocking browser requests for all external images.
+- **Resilient Multi-Tier `SiteFavicon` Component:**
+  - First queries Google S2 Favicon API (`https://www.google.com/s2/favicons?domain={domain}&sz=64`), automatically falls back to DuckDuckGo Favicon API, and defaults to an SVG monogram avatar, eliminating hidden/blank favicons.
+- **Multi-Tier `SiteThumbnail` Component:**
+  - Multi-source pipeline (`image.thum.io` -> `WordPress.com mshots` -> Google Favicon -> Monogram SVG avatar) with manual refresh icon button and timestamp cache-buster.
+
 ## [2.247.0] - 2026-11-22
 
 ### Major: Complete Functional Implementation of All WordPress Toolkit Features & Live Screenshots / Favicons
