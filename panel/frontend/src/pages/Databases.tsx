@@ -654,7 +654,6 @@ function AdvancedDatabaseManager({
         await api.post(`/databases/${database.id}/upload-dump`, {
           filename: file.name,
           content: base64Content,
-          content_base64: base64Content,
           auto_import: autoImportUpload,
         });
 

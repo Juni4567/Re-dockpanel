@@ -1477,8 +1477,8 @@ pub async fn import(
 pub struct UploadDumpRequest {
     #[serde(alias = "file_name", alias = "name")]
     pub filename: String,
-    #[serde(alias = "content_base64", alias = "base64", alias = "data")]
-    pub content: String,
+    pub content: Option<String>,
+    pub content_base64: Option<String>,
     #[serde(default, alias = "autoImport")]
     pub auto_import: Option<bool>,
 }
@@ -1527,7 +1527,10 @@ pub async fn upload_dump(
         return Err(err(StatusCode::BAD_REQUEST, "Invalid filename"));
     }
 
-    let trimmed_content = body.content.trim().replace(['\r', '\n', ' '], "");
+    let raw_content_str = body.content.as_deref()
+        .or(body.content_base64.as_deref())
+        .unwrap_or_default();
+    let trimmed_content = raw_content_str.trim().replace(['\r', '\n', ' '], "");
     let decoded_bytes = base64::engine::general_purpose::STANDARD
         .decode(&trimmed_content)
         .or_else(|_| {
