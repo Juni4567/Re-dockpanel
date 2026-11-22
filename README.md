@@ -67,6 +67,31 @@ This fork (`Re-dockpanel`) includes key production improvements, bug fixes, and 
 ### 6. 🔄 Automated Build & Deploy Pipeline
 - Automated `./deploy.sh all` script that pulls from `Juni4567/Re-dockpanel`, builds Vite frontend assets, compiles Rust release binaries (`dockpanel-api` and `dockpanel-agent`), and performs rolling service restarts.
 
+### 7. 🧰 Plesk-Style WordPress Toolkit (4-Tab Overhaul)
+- **4 Dedicated Management Tabs**:
+  - **Dashboard**: Live website screenshot preview with zoom modal, 1-click `/wp-admin` login, credential setup, core/plugin/theme update alerts, PHP details, debugging toggle, password protection, Let's Encrypt status, security mitigations, nginx caching, and WordPress integrity checker.
+  - **Plugins Tab**: Full plugin inventory with activation toggles, autoupdate toggles, vulnerability warnings, one-click updates, and delete actions.
+  - **Themes Tab**: Theme library with active theme badge, activation toggles, and autoupdate controls.
+  - **Database Tab**: Direct 1-click link to Database Manager, table prefix inspection, database user, and server connection info.
+- **Top-Level Scan**: Discover WordPress installations across the entire server with a single click.
+
+### 8. 🗄️ Built-in SQL Management Studio & Browser
+- **Robust SQL Import Pipeline**: Streaming sed filter regexes automatically handle phpMyAdmin and standard mysqldump exports (stripping privileged `CREATE DATABASE`/`USE` and injecting `DROP TABLE IF EXISTS`), restoring multi-gigabyte databases reliably.
+- **Inline Cell Editing**: Double-click any table cell in the Browse view to edit values inline with keyboard shortcuts (`Enter` to save, `Esc` to cancel).
+- **Disk Usage & Direct Navigation**: Database list displays container disk sizing (`MB`/`GB`) and database names link directly to the data browser.
+- **Engine Consistency**: Accurate labeling of `MariaDB 11` (MySQL-compatible) and `PostgreSQL 16` across all views.
+
+### 9. 🌐 Enhanced Sites Listing & Quick Actions
+- **Live Metrics**: Real-time disk usage and monthly traffic estimation per site.
+- **Server Path Location**: Direct filesystem address display (`/var/www/{domain}/public`).
+- **Quick Action Icons**: Dedicated 1-click navigation icons to **File Manager**, **Mail**, and **Database**.
+- **Domain Utilities**: Copy domain button with animated feedback, external link to open in new tab, and dynamic favicon resolution via Google Favicon service.
+
+### 10. 🔒 Custom Panel Domain & Automatic Let's Encrypt SSL
+- Reconfigure the panel to run securely on a custom domain (e.g. `panel.yourdomain.com`).
+- Integrated Certbot automation issues and renews Let's Encrypt SSL certificates.
+- Seamless dual-port SNI routing: port 80 automatic HTTP→HTTPS redirect, standard port 443 HTTPS access, and port 8443 direct IP fallback.
+
 ---
 
 ## Upstream Attribution
@@ -144,9 +169,21 @@ found, including what is still broken.
 </details>
 
 <details>
-<summary><strong>Databases</strong> — MySQL/PostgreSQL, SQL browser, schema viewer, scheduled backups</summary>
+<summary><strong>WordPress Toolkit</strong> — Plesk-style dashboard, live preview, plugins, themes, database tools, security and performance toggles</summary>
+
+![WordPress Toolkit](.github/screenshots/dp-wp-toolkit.png)
+</details>
+
+<details>
+<summary><strong>Databases</strong> — MariaDB 11 / PostgreSQL 16, container disk usage, direct browser access</summary>
 
 ![Databases](.github/screenshots/dp-databases.png)
+</details>
+
+<details>
+<summary><strong>Database Studio & Browser</strong> — Data browser, double-click inline cell editing, SQL console, structure, robust import/export</summary>
+
+![Database Studio](.github/screenshots/dp-database-manager.png)
 </details>
 
 <details>

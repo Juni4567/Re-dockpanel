@@ -36,16 +36,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Non-WP Site Filtering:** Filtered out non-WordPress websites from WordPress Toolkit.
 - **Search & View Controls:** Added search input, sorting (Domain, Version, Vulns, Updates), and Grid vs Table view toggle.
 
-#### 3. Database Listing & Deletion Fix (`Databases.tsx`)
+#### 3. Database Manager & Import Overhaul (`Databases.tsx`, `database_backup.rs`)
+- **422 Dump Upload Fix**: Resolved serde `duplicate field 'content'` rejection by decoupling `content` and `content_base64` in `UploadDumpRequest` and frontend payload, ensuring uploads of large `.sql` files never fail at the deserialization stage.
+- **Robust SQL Import Stream Pipeline**: Integrated streaming sed regex filters to automatically sanitize dumps from phpMyAdmin and Plesk:
+  - Strips privileged statements (`CREATE DATABASE`, `CREATE SCHEMA`, `ALTER DATABASE`, `USE`) that trigger tenant `ERROR 1044: Access denied`.
+  - Automatically prepends `DROP TABLE IF EXISTS <table>;` before every `CREATE TABLE <table>` to prevent `ERROR 1050: Table already exists` and duplicate primary key errors.
+  - Adds `--force` and `--init-command="SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0; SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';"` to MariaDB client invocations.
+  - Fixes pipeline exit evaluation so client stream termination SIGPIPE is ignored and container execution status is authoritative.
+- **Double-Click Inline Cell Editing**: Allows double-clicking any cell in the Browse view to edit values in-place with keyboard navigation (`Enter` to save, `Esc` to cancel, action buttons).
+- **Disk Usage Column & API**: Added `/api/databases/sizes` endpoint and agent `all_database_sizes()` measuring container anonymous volumes (`du -sb`) to display database sizes (`MB`/`GB`) in table and grid views.
+- **Direct Navigation**: Database names in the table view now link directly to the data browser.
+- **Engine Consistency**: Accurately labels `MariaDB 11` (MySQL-compatible) and `PostgreSQL 16` across all views, eliminating engine confusion.
 - **Deletion Bug Fix:** Fixed bug where deletion confirmation dialog was blocked by obsolete state guard; databases now delete reliably.
 - **Docker 404 Resiliency:** Agent handles Docker 404 (already cleaned container) gracefully so database deletion is never blocked.
 - **Clean Action Layout:** Replaced cluttered 8-button layout with a primary **Manage** button (opening Database Manager with Browse, Structure, SQL Console, and Import/Export tabs), secondary **Connect** button, and a clean `...` dropdown menu for secondary actions (`SQL Console`, `Table Structure`, `Import / Export`, `Reset Password`, `Delete Database`).
 - **Search, Sorting & View Modes:** Added search bar, sorting (Name, Engine, Port, Created), and Table vs Grid view toggle.
 
 #### 4. DockPanel Domain & Automatic Let's Encrypt SSL
+- **Dual-Port SNI Routing**: Configures the panel domain to listen on both standard HTTPS port 443 and port 8443 with specific IP bindings, plus an automatic HTTP port 80 redirect. This completely prevents requests to the panel domain from falling back to other vhosts on the server (e.g. `drhinakhan.com`).
 - **Panel Domain Management:** Added backend & agent routes `GET /api/settings/panel-domain` and `POST /api/settings/panel-domain` to reconfigure Nginx `server_name`, issue Let's Encrypt SSL certificates via `certbot`, configure HTTPS redirect, and update `base_url`.
 - **Settings Card:** Added dedicated "Panel Domain & SSL" card in Settings > General showing current domain, SSL status, server public IP with copy button, DNS A-record setup instructions, domain configuration form, and CLI fallback command.
 - **Initial Setup Field:** Added optional "Panel Domain" field during initial administrator setup (`/setup`).
+
+#### 5. Security & CSP Configuration
+- **Allowed Thumbnail & Favicon Domains**: Updated Nginx Content-Security-Policy (CSP) `img-src` header to whitelist `https://www.google.com`, `https://image.thum.io`, and `https://s0.wp.com`, allowing website screenshot thumbnails and favicons to display crisply without browser security blocks.
 
 #### 5. Build Performance Optimization
 - **ThinLTO & Codegen Units:** Optimized Cargo release profiles in `agent/Cargo.toml` and `backend/Cargo.toml` (`lto = "thin"`, `codegen-units = 16`, `opt-level = 3`), slashing release build times from ~7 minutes to ~40 seconds.
