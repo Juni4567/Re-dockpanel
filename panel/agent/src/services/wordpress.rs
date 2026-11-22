@@ -923,11 +923,46 @@ pub async fn maintenance(domain: &str, enabled: bool) -> Result<(), String> {
 
 /// Verify WordPress core checksums.
 pub async fn verify_integrity(domain: &str) -> Result<serde_json::Value, String> {
-    let core_res = wp(domain, &["core", "verify-checksums", "--format=json"]).await;
+    let core_res = wp(domain, &["core", "verify-checksums"]).await;
     let core_clean = core_res.is_ok();
-    let issues: Vec<serde_json::Value> = match &core_res {
-        Ok(out) => serde_json::from_str(out).unwrap_or_default(),
-        Err(err) => vec![serde_json::json!({ "file": "WordPress Core", "status": "Verification notice", "message": err })],
+    let mut issues: Vec<serde_json::Value> = Vec::new();
+    match &core_res {
+        Ok(_) => {},
+        Err(err) => {
+            for line in err.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("Warning:") {
+                    let msg = trimmed.trim_start_matches("Warning:").trim();
+                    let (status, file) = if msg.starts_with("File doesn't exist:") {
+                        ("Missing file", msg.trim_start_matches("File doesn't exist:").trim())
+                    } else if msg.starts_with("File should not exist:") {
+                        ("Unexpected file", msg.trim_start_matches("File should not exist:").trim())
+                    } else if msg.starts_with("File doesn't verify against checksum:") {
+                        ("Checksum mismatch", msg.trim_start_matches("File doesn't verify against checksum:").trim())
+                    } else {
+                        ("Notice", msg)
+                    };
+                    issues.push(serde_json::json!({
+                        "file": file,
+                        "status": status,
+                        "message": msg,
+                    }));
+                } else if trimmed.starts_with("Error:") && !trimmed.contains("doesn't verify against checksums") {
+                    issues.push(serde_json::json!({
+                        "file": "WordPress Core",
+                        "status": "Error",
+                        "message": trimmed.trim_start_matches("Error:").trim(),
+                    }));
+                }
+            }
+            if issues.is_empty() {
+                issues.push(serde_json::json!({
+                    "file": "WordPress Core",
+                    "status": "Verification notice",
+                    "message": err,
+                }));
+            }
+        }
     };
     Ok(serde_json::json!({
         "clean": core_clean && issues.is_empty(),
