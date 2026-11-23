@@ -156,14 +156,14 @@ pub async fn info(domain: &str) -> Result<serde_json::Value, String> {
 /// List plugins with status and update info.
 /// Note: plugin list requires loading plugins to get accurate status.
 pub async fn plugins(domain: &str) -> Result<serde_json::Value, String> {
-    let out = wp_with_plugins(domain, &["plugin", "list", "--format=json"]).await?;
+    let out = wp_with_plugins(domain, &["plugin", "list", "--fields=name,title,status,update,version,auto_update", "--format=json"]).await?;
     serde_json::from_str(&out).map_err(|e| format!("Parse error: {e}"))
 }
 
 /// List themes with status and update info.
 /// Note: theme list requires loading themes to get accurate status.
 pub async fn themes(domain: &str) -> Result<serde_json::Value, String> {
-    let out = wp_with_plugins(domain, &["theme", "list", "--format=json"]).await?;
+    let out = wp_with_plugins(domain, &["theme", "list", "--fields=name,title,status,update,version,auto_update", "--format=json"]).await?;
     serde_json::from_str(&out).map_err(|e| format!("Parse error: {e}"))
 }
 
@@ -213,6 +213,12 @@ fn is_valid_wp_slug(name: &str) -> bool {
 
 /// Plugin action: activate, deactivate, update, delete, install.
 pub async fn plugin_action(domain: &str, name: &str, action: &str) -> Result<String, String> {
+    if action == "enable-all-autoupdate" {
+        return wp(domain, &["plugin", "auto-updates", "enable", "--all"]).await;
+    }
+    if action == "disable-all-autoupdate" {
+        return wp(domain, &["plugin", "auto-updates", "disable", "--all"]).await;
+    }
     if !is_valid_wp_slug(name) {
         return Err("Invalid plugin name. Only alphanumeric, hyphens, and underscores allowed.".into());
     }
@@ -221,6 +227,8 @@ pub async fn plugin_action(domain: &str, name: &str, action: &str) -> Result<Str
             wp(domain, &["plugin", action, name]).await?
         }
         "install" => wp(domain, &["plugin", "install", name]).await?,
+        "enable-autoupdate" => wp(domain, &["plugin", "auto-updates", "enable", name]).await?,
+        "disable-autoupdate" => wp(domain, &["plugin", "auto-updates", "disable", name]).await?,
         _ => return Err(format!("Unknown action: {action}")),
     };
     if matches!(action, "install" | "update") {
@@ -233,14 +241,22 @@ pub async fn plugin_action(domain: &str, name: &str, action: &str) -> Result<Str
     Ok(result)
 }
 
-/// Theme action: activate, update, delete, install.
+/// Theme action: activate, update, delete, install, autoupdates.
 pub async fn theme_action(domain: &str, name: &str, action: &str) -> Result<String, String> {
+    if action == "enable-all-autoupdate" {
+        return wp(domain, &["theme", "auto-updates", "enable", "--all"]).await;
+    }
+    if action == "disable-all-autoupdate" {
+        return wp(domain, &["theme", "auto-updates", "disable", "--all"]).await;
+    }
     if !is_valid_wp_slug(name) {
         return Err("Invalid theme name. Only alphanumeric, hyphens, and underscores allowed.".into());
     }
     let result = match action {
         "activate" | "update" | "delete" => wp(domain, &["theme", action, name]).await?,
         "install" => wp(domain, &["theme", "install", name]).await?,
+        "enable-autoupdate" => wp(domain, &["theme", "auto-updates", "enable", name]).await?,
+        "disable-autoupdate" => wp(domain, &["theme", "auto-updates", "disable", name]).await?,
         _ => return Err(format!("Unknown action: {action}")),
     };
     if matches!(action, "install" | "update") {

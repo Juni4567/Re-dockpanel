@@ -4,6 +4,23 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.248.4] - 2026-11-23
+
+### Refinement: Complete Plesk WordPress Toolkit Layout, Interactive Autoupdates, & High-Res Thumbnails
+- **Plesk-Identical Plugins & Themes Tabs (Screenshots 2 & 3):**
+  - Updated WP-CLI listing commands in `agent/src/services/wordpress.rs` to query `--fields=name,title,status,update,version,auto_update --format=json`, restoring full human-readable plugin and theme titles.
+  - Implemented interactive per-item `Autoupdate` toggle switches in both Plugins and Themes tables, communicating directly with WP-CLI (`wp plugin auto-updates enable/disable <slug>` and `wp theme auto-updates enable/disable <slug>`).
+  - Implemented top-level `Autoupdate all plugins` and `Autoupdate all themes` switches that trigger bulk WP-CLI policy toggles across the entire installation (`--all`).
+  - Added streamlined filter search bars with funnel iconography in both Plugins and Themes tabs.
+  - Styled plugin vulnerability badges to match Plesk: warning triangle `⚠️ Vulnerable` for standard advisories and solid dot `🔴 Vulnerable` for critical patches.
+  - Added clean Plesk-style pagination controls (`← [ 1 ] → of N`).
+  - Hid delete action for active themes, preventing accidental deletion of the active WordPress theme.
+- **Plesk-Identical Database Tab (Screenshot 4):**
+  - Formatted Database properties into clean, bordered key-value rows matching Plesk Screenshot 4: Database name with direct `[open in Database Manager]` deep link, Database table prefix, Database user name with `[change]` password modal, and Database server host.
+- **Resilient Screenshot Thumbnails & Favicons:**
+  - Added high-resolution Headless Chrome screenshot generation via Microlink API (`api.microlink.io`) with smooth fallback progression (Microlink → Thum.io → Unavatar → Google Favicon → Domain-seeded gradient monogram).
+  - Enhanced Favicon pipeline with Unavatar and direct `/favicon.ico` detection, eliminating 404 errors for unindexed, newly created, and private websites.
+
 ## [2.248.3] - 2026-11-23
 
 ### Bug Fixes: Functional Nginx Password Protection & Terminal Error Resilience

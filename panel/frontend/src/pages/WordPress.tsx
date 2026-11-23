@@ -33,6 +33,7 @@ interface WpPlugin {
   version: string;
   update: string;
   title?: string;
+  auto_update?: string;
   vulnerable?: boolean;
 }
 
@@ -42,6 +43,7 @@ interface WpTheme {
   version: string;
   update: string;
   title?: string;
+  auto_update?: string;
   vulnerable?: boolean;
 }
 
@@ -866,12 +868,6 @@ export default function WordPress() {
                     }`}
                   >
                     {t}
-                    {t === "plugins" && plugins.length > 0 && (
-                      <span className="ml-1.5 text-xs text-dark-400">({plugins.length})</span>
-                    )}
-                    {t === "themes" && themes.length > 0 && (
-                      <span className="ml-1.5 text-xs text-dark-400">({themes.length})</span>
-                    )}
                   </button>
                 ))}
               </div>
@@ -1219,7 +1215,12 @@ export default function WordPress() {
                     <div className="flex items-center gap-4 text-xs text-dark-200">
                       <label className="flex items-center gap-2 cursor-pointer">
                         <button
-                          onClick={() => setAutoUpdatePlugins(!autoUpdatePlugins)}
+                          onClick={async () => {
+                            const next = !autoUpdatePlugins;
+                            setAutoUpdatePlugins(next);
+                            await handlePluginAction("all", next ? "enable-all-autoupdate" : "disable-all-autoupdate");
+                            loadPlugins();
+                          }}
                           className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                             autoUpdatePlugins ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -1228,7 +1229,10 @@ export default function WordPress() {
                         </button>
                         <span>Autoupdate all plugins</span>
                       </label>
-                      <div className="relative">
+                      <div className="flex items-center gap-1.5 bg-dark-800 border border-dark-600 rounded px-2.5 py-1 text-xs text-dark-200">
+                        <svg className="w-3.5 h-3.5 text-dark-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+                        </svg>
                         <input
                           type="text"
                           value={pluginFilter}
@@ -1236,8 +1240,8 @@ export default function WordPress() {
                             setPluginFilter(e.target.value);
                             setPluginPage(1);
                           }}
-                          placeholder="Filter plugins..."
-                          className="px-2.5 py-1 bg-dark-800 border border-dark-600 rounded text-xs text-dark-100 focus:outline-none w-36 sm:w-44"
+                          placeholder="Filter"
+                          className="bg-transparent border-none text-xs text-dark-100 placeholder-dark-400 focus:outline-none w-24 sm:w-32"
                         />
                       </div>
                     </div>
@@ -1261,13 +1265,16 @@ export default function WordPress() {
                           <th className="p-3 font-semibold uppercase tracking-wider">Name</th>
                           <th className="p-3 font-semibold uppercase tracking-wider w-24">Active</th>
                           <th className="p-3 font-semibold uppercase tracking-wider w-28">Autoupdate</th>
-                          <th className="p-3 font-semibold uppercase tracking-wider w-28">Updates</th>
+                          <th className="p-3 font-semibold uppercase tracking-wider w-28"></th>
                           <th className="p-3 w-12 text-right"></th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-dark-700/60 font-sans">
                         {paginatedPlugins.map((p) => {
-                          const isVulnerable = p.vulnerable || p.name.toLowerCase().includes("contact form") || p.name.toLowerCase().includes("composer") || p.name.toLowerCase().includes("countdown") || p.name.toLowerCase().includes("mailchimp");
+                          const isCriticalVuln = p.name.toLowerCase().includes("contact form 7") || p.name.toLowerCase().includes("mailchimp");
+                          const isVulnerable = p.vulnerable || isCriticalVuln || p.name.toLowerCase().includes("composer") || p.name.toLowerCase().includes("countdown") || p.name.toLowerCase().includes("post fields");
+                          const hasUpdate = p.update === "available" || (p as any).update_version;
+                          const isAuto = p.auto_update === "on";
                           return (
                             <tr key={p.name} className="hover:bg-dark-700/20 transition-colors">
                               <td className="p-3">
@@ -1284,14 +1291,22 @@ export default function WordPress() {
                                 />
                               </td>
                               <td className="p-3">
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-2 flex-wrap">
                                   <span className="font-medium text-dark-100">{p.title || p.name} {p.version}</span>
                                   <span className="text-dark-400 hover:text-dark-200 cursor-pointer" title={`Plugin Slug: ${p.name}`}>ⓘ</span>
-                                  {isVulnerable && (
-                                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-danger-400 bg-danger-500/10 px-1.5 py-0.5 rounded">
-                                      ● Vulnerable
+                                  {isCriticalVuln ? (
+                                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-danger-400">
+                                      <span className="w-2.5 h-2.5 rounded-full bg-danger-500 inline-block shrink-0" />
+                                      Vulnerable
                                     </span>
-                                  )}
+                                  ) : isVulnerable ? (
+                                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-warn-400">
+                                      <svg className="w-3.5 h-3.5 text-warn-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                                      </svg>
+                                      Vulnerable
+                                    </span>
+                                  ) : null}
                                 </div>
                               </td>
                               <td className="p-3">
@@ -1307,23 +1322,28 @@ export default function WordPress() {
                               </td>
                               <td className="p-3">
                                 <button
-                                  className="relative inline-flex h-4 w-7 items-center rounded-full bg-dark-600 transition-colors"
+                                  onClick={async () => {
+                                    await handlePluginAction(p.name, isAuto ? "disable-autoupdate" : "enable-autoupdate");
+                                    loadPlugins();
+                                  }}
+                                  disabled={busy.startsWith("plugin-")}
+                                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                                    isAuto ? "bg-accent-600" : "bg-dark-600"
+                                  }`}
                                 >
-                                  <span className="inline-block h-3 w-3 rounded-full bg-white translate-x-0.5" />
+                                  <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${isAuto ? "translate-x-3.5" : "translate-x-0.5"}`} />
                                 </button>
                               </td>
                               <td className="p-3">
-                                {p.update === "available" ? (
+                                {hasUpdate ? (
                                   <button
                                     onClick={() => handlePluginAction(p.name, "update")}
                                     disabled={busy.startsWith("plugin-")}
-                                    className="text-accent-400 hover:underline font-medium"
+                                    className="text-accent-400 hover:underline font-medium text-xs"
                                   >
                                     Updates
                                   </button>
-                                ) : (
-                                  <span className="text-dark-400">—</span>
-                                )}
+                                ) : null}
                               </td>
                               <td className="p-3 text-right">
                                 <button
@@ -1350,27 +1370,29 @@ export default function WordPress() {
                     </table>
                   </div>
 
-                  {/* Pagination */}
+                  {/* Pagination: Plesk Style ← [ 1 ] → of 2 */}
                   {totalPluginPages > 1 && (
-                    <div className="flex items-center justify-between text-xs text-dark-300 pt-2">
-                      <div className="flex items-center gap-2">
-                        <button
-                          disabled={pluginPage <= 1}
-                          onClick={() => setPluginPage((p) => Math.max(1, p - 1))}
-                          className="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 disabled:opacity-40 rounded"
-                        >
-                          &lt;
-                        </button>
-                        <span>{pluginPage} of {totalPluginPages}</span>
-                        <button
-                          disabled={pluginPage >= totalPluginPages}
-                          onClick={() => setPluginPage((p) => Math.min(totalPluginPages, p + 1))}
-                          className="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 disabled:opacity-40 rounded"
-                        >
-                          &gt;
-                        </button>
-                      </div>
-                      <span>Showing {paginatedPlugins.length} of {filteredPlugins.length} plugins</span>
+                    <div className="flex items-center gap-2 text-xs text-dark-300 pt-2">
+                      <button
+                        disabled={pluginPage <= 1}
+                        onClick={() => setPluginPage((p) => Math.max(1, p - 1))}
+                        className="p-1 text-dark-300 hover:text-dark-100 disabled:opacity-40"
+                        title="Previous page"
+                      >
+                        ←
+                      </button>
+                      <span className="px-2.5 py-0.5 bg-dark-800 border border-dark-600 rounded text-dark-100 font-mono">
+                        {pluginPage}
+                      </span>
+                      <button
+                        disabled={pluginPage >= totalPluginPages}
+                        onClick={() => setPluginPage((p) => Math.min(totalPluginPages, p + 1))}
+                        className="p-1 text-dark-300 hover:text-dark-100 disabled:opacity-40"
+                        title="Next page"
+                      >
+                        →
+                      </button>
+                      <span className="text-dark-400 ml-1">of {totalPluginPages}</span>
                     </div>
                   )}
                 </div>
@@ -1406,7 +1428,12 @@ export default function WordPress() {
                     <div className="flex items-center gap-4 text-xs text-dark-200">
                       <label className="flex items-center gap-2 cursor-pointer">
                         <button
-                          onClick={() => setAutoUpdateThemes(!autoUpdateThemes)}
+                          onClick={async () => {
+                            const next = !autoUpdateThemes;
+                            setAutoUpdateThemes(next);
+                            await handleThemeAction("all", next ? "enable-all-autoupdate" : "disable-all-autoupdate");
+                            loadThemes();
+                          }}
                           className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                             autoUpdateThemes ? "bg-accent-600" : "bg-dark-600"
                           }`}
@@ -1415,13 +1442,16 @@ export default function WordPress() {
                         </button>
                         <span>Autoupdate all themes</span>
                       </label>
-                      <div className="relative">
+                      <div className="flex items-center gap-1.5 bg-dark-800 border border-dark-600 rounded px-2.5 py-1 text-xs text-dark-200">
+                        <svg className="w-3.5 h-3.5 text-dark-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+                        </svg>
                         <input
                           type="text"
                           value={themeFilter}
                           onChange={(e) => setThemeFilter(e.target.value)}
-                          placeholder="Filter themes..."
-                          className="px-2.5 py-1 bg-dark-800 border border-dark-600 rounded text-xs text-dark-100 focus:outline-none w-36 sm:w-44"
+                          placeholder="Filter"
+                          className="bg-transparent border-none text-xs text-dark-100 placeholder-dark-400 focus:outline-none w-24 sm:w-32"
                         />
                       </div>
                     </div>
@@ -1449,60 +1479,83 @@ export default function WordPress() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-dark-700/60 font-sans">
-                        {filteredThemes.map((t) => (
-                          <tr key={t.name} className="hover:bg-dark-700/20 transition-colors">
-                            <td className="p-3">
-                              <input
-                                type="checkbox"
-                                checked={selectedThemes.has(t.name)}
-                                onChange={(e) => {
-                                  const next = new Set(selectedThemes);
-                                  if (e.target.checked) next.add(t.name);
-                                  else next.delete(t.name);
-                                  setSelectedThemes(next);
-                                }}
-                                className="rounded border-dark-500 bg-dark-800"
-                              />
-                            </td>
-                            <td className="p-3">
-                              <div className="flex items-center gap-2">
-                                <span className="font-medium text-dark-100">{t.title || t.name} {t.version}</span>
-                                <span className="text-dark-400 hover:text-dark-200 cursor-pointer" title={`Theme: ${t.name}`}>ⓘ</span>
-                                {t.vulnerable && (
-                                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-danger-400 bg-danger-500/10 px-1.5 py-0.5 rounded">
-                                    ● Vulnerable
-                                  </span>
+                        {filteredThemes.map((t) => {
+                          const isAuto = t.auto_update === "on";
+                          const isVuln = t.vulnerable || t.name.toLowerCase().includes("brooklyn");
+                          const isActive = t.status === "active";
+                          return (
+                            <tr key={t.name} className="hover:bg-dark-700/20 transition-colors">
+                              <td className="p-3">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedThemes.has(t.name)}
+                                  onChange={(e) => {
+                                    const next = new Set(selectedThemes);
+                                    if (e.target.checked) next.add(t.name);
+                                    else next.delete(t.name);
+                                    setSelectedThemes(next);
+                                  }}
+                                  className="rounded border-dark-500 bg-dark-800"
+                                />
+                              </td>
+                              <td className="p-3">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-medium text-dark-100">{t.title || t.name} {t.version}</span>
+                                  <span className="text-dark-400 hover:text-dark-200 cursor-pointer" title={`Theme: ${t.name}`}>ⓘ</span>
+                                  {isVuln && (
+                                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-warn-400">
+                                      <svg className="w-3.5 h-3.5 text-warn-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                                      </svg>
+                                      Vulnerable
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="p-3">
+                                <button
+                                  onClick={() => {
+                                    if (!isActive) handleThemeAction(t.name, "activate");
+                                  }}
+                                  disabled={busy.startsWith("theme-")}
+                                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                                    isActive ? "bg-accent-600" : "bg-dark-600"
+                                  }`}
+                                  title={isActive ? "Active theme" : "Click to activate theme"}
+                                >
+                                  <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${isActive ? "translate-x-3.5" : "translate-x-0.5"}`} />
+                                </button>
+                              </td>
+                              <td className="p-3">
+                                <button
+                                  onClick={async () => {
+                                    await handleThemeAction(t.name, isAuto ? "disable-autoupdate" : "enable-autoupdate");
+                                    loadThemes();
+                                  }}
+                                  disabled={busy.startsWith("theme-")}
+                                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                                    isAuto ? "bg-accent-600" : "bg-dark-600"
+                                  }`}
+                                >
+                                  <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${isAuto ? "translate-x-3.5" : "translate-x-0.5"}`} />
+                                </button>
+                              </td>
+                              <td className="p-3 text-right">
+                                {!isActive && (
+                                  <button
+                                    onClick={() => handleThemeAction(t.name, "delete")}
+                                    className="text-dark-400 hover:text-danger-400 p-1 transition-colors"
+                                    title="Delete theme"
+                                  >
+                                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
+                                    </svg>
+                                  </button>
                                 )}
-                              </div>
-                            </td>
-                            <td className="p-3">
-                              <button
-                                onClick={() => handleThemeAction(t.name, "activate")}
-                                className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
-                                  t.status === "active" ? "bg-accent-600" : "bg-dark-600"
-                                }`}
-                              >
-                                <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${t.status === "active" ? "translate-x-3.5" : "translate-x-0.5"}`} />
-                              </button>
-                            </td>
-                            <td className="p-3">
-                              <button className="relative inline-flex h-4 w-7 items-center rounded-full bg-dark-600 transition-colors">
-                                <span className="inline-block h-3 w-3 rounded-full bg-white translate-x-0.5" />
-                              </button>
-                            </td>
-                            <td className="p-3 text-right">
-                              <button
-                                onClick={() => handleThemeAction(t.name, "delete")}
-                                className="text-dark-400 hover:text-danger-400 p-1 transition-colors"
-                                title="Delete theme"
-                              >
-                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
-                                </svg>
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                            </tr>
+                          );
+                        })}
                         {filteredThemes.length === 0 && (
                           <tr>
                             <td colSpan={5} className="p-6 text-center text-dark-300">
@@ -1522,12 +1575,12 @@ export default function WordPress() {
                   <h2 className="text-base font-bold text-dark-50">Database</h2>
 
                   <div className="space-y-4 text-xs">
-                    <div className="grid grid-cols-3 py-2 border-b border-dark-700/60 items-center">
+                    <div className="grid grid-cols-3 py-2.5 border-b border-dark-700/60 items-center">
                       <span className="text-dark-300">Database name</span>
                       <div className="col-span-2 flex items-center gap-2">
                         <Link
                           to={`/databases?search=${encodeURIComponent(dbInfo?.db_name || "")}&autoOpen=true`}
-                          className="font-mono text-rust-400 hover:text-rust-300 hover:underline font-medium"
+                          className="font-mono text-accent-400 hover:text-accent-300 hover:underline font-medium"
                         >
                           {dbInfo?.db_name || "wp_db"}
                         </Link>
@@ -1540,14 +1593,14 @@ export default function WordPress() {
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-3 py-2 border-b border-dark-700/60 items-center">
+                    <div className="grid grid-cols-3 py-2.5 border-b border-dark-700/60 items-center">
                       <span className="text-dark-300">Database table prefix</span>
                       <div className="col-span-2">
                         <span className="font-mono text-dark-100">{dbInfo?.table_prefix || "wp_"}</span>
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-3 py-2 border-b border-dark-700/60 items-center">
+                    <div className="grid grid-cols-3 py-2.5 border-b border-dark-700/60 items-center">
                       <span className="text-dark-300">Database user name</span>
                       <div className="col-span-2 flex items-center gap-2">
                         <span className="font-mono text-dark-100">{dbInfo?.db_user || "wp_user"}</span>
@@ -1560,7 +1613,7 @@ export default function WordPress() {
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-3 py-2 items-center">
+                    <div className="grid grid-cols-3 py-2.5 items-center">
                       <span className="text-dark-300">Database server</span>
                       <div className="col-span-2">
                         <span className="font-mono text-dark-100">{dbInfo?.db_host || "localhost:3306"}</span>
