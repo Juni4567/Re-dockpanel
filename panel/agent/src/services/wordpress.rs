@@ -938,15 +938,25 @@ pub async fn toggle_feature(domain: &str, feature: &str, enabled: bool, params: 
                 }
 
                 // Verify and reload Nginx
-                crate::services::nginx::test_config().await?;
-                crate::services::nginx::reload().await?;
+                match crate::services::nginx::test_config().await {
+                    Ok(out) if out.success => {
+                        crate::services::nginx::reload().await?;
+                    }
+                    Ok(out) => return Err(format!("Nginx config test failed: {}", out.stderr)),
+                    Err(e) => return Err(format!("Failed to run nginx config test: {e}")),
+                }
             } else {
                 let _ = std::fs::remove_file(&htpasswd_file);
                 let _ = std::fs::remove_file(&legacy_htpasswd);
                 std::fs::write(&auth_file, "# Password protection disabled\nauth_basic off;\n").ok();
 
-                crate::services::nginx::test_config().await?;
-                crate::services::nginx::reload().await?;
+                match crate::services::nginx::test_config().await {
+                    Ok(out) if out.success => {
+                        crate::services::nginx::reload().await?;
+                    }
+                    Ok(out) => return Err(format!("Nginx config test failed: {}", out.stderr)),
+                    Err(e) => return Err(format!("Failed to run nginx config test: {e}")),
+                }
             }
         }
         "caching" => {
