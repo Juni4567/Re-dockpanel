@@ -112,6 +112,7 @@ export default function WordPress() {
   const [showInstallPluginModal, setShowInstallPluginModal] = useState(false);
   const [showInstallThemeModal, setShowInstallThemeModal] = useState(false);
   const [showDbUserModal, setShowDbUserModal] = useState(false);
+  const [showWpToolkitModal, setShowWpToolkitModal] = useState(false);
 
   // WP-CLI Console
   const [cliCmd, setCliCmd] = useState("core version");
@@ -327,8 +328,20 @@ export default function WordPress() {
   };
 
   // Toggle Features with Backend API
-  const handleToggleFeature = async (feature: string, currentVal: boolean, params?: Record<string, unknown>) => {
-    const nextVal = !currentVal;
+  const handleToggleFeature = async (feature: string, targetVal?: boolean, params?: Record<string, unknown>) => {
+    let nextVal: boolean;
+    if (typeof targetVal === "boolean") {
+      nextVal = targetVal;
+    } else {
+      if (feature === "wp_debug") nextVal = !wpDebug;
+      else if (feature === "search_indexing") nextVal = !searchIndexing;
+      else if (feature === "takeover_cron") nextVal = !takeoverCron;
+      else if (feature === "hotlink_protection") nextVal = !hotlinkProtect;
+      else if (feature === "pass_protect") nextVal = !passProtect;
+      else if (feature === "caching") nextVal = !nginxCache;
+      else if (feature === "vuln_protect") nextVal = !vulnProtect;
+      else nextVal = true;
+    }
     try {
       await api.post(`/sites/${id}/wordpress/toggle-feature`, {
         feature,
@@ -385,10 +398,11 @@ export default function WordPress() {
       const res = await api.post<{ ok: boolean; output: string }>(`/sites/${id}/wordpress/cli`, {
         command,
       });
-      const output = res.output || "Success: Command completed with no output.";
+      const isSuccess = res.ok !== false;
+      const output = res.output || (isSuccess ? "Success: Command completed with no output." : "Error: Command exited with error.");
       setCliHistory((prev) => [
         ...prev,
-        { cmd: command, output, time: new Date().toLocaleTimeString(), success: true },
+        { cmd: command, output, time: new Date().toLocaleTimeString(), success: isSuccess },
       ]);
       setCliCmd("");
     } catch (e) {
@@ -733,10 +747,7 @@ export default function WordPress() {
                   WP Toolkit access
                 </div>
                 <div
-                  onClick={() => {
-                    setCliCmd("plugin install wp-toolkit --activate");
-                    setShowWpCliModal(true);
-                  }}
+                  onClick={() => setShowWpToolkitModal(true)}
                   className="text-[11px] text-accent-400 hover:underline cursor-pointer"
                 >
                   Get WP Toolkit plugin for WordPress
@@ -1025,7 +1036,7 @@ export default function WordPress() {
                           <button
                             onClick={() => {
                               if (!passProtect) setShowPassModal(true);
-                              else handleToggleFeature("pass_protect", true);
+                              else handleToggleFeature("pass_protect", false);
                             }}
                             className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               passProtect ? "bg-accent-600" : "bg-dark-600"
@@ -2151,7 +2162,7 @@ export default function WordPress() {
               {passProtect ? (
                 <button
                   onClick={async () => {
-                    await handleToggleFeature("pass_protect", true);
+                    await handleToggleFeature("pass_protect", false);
                     setShowPassModal(false);
                   }}
                   className="px-3 py-1.5 bg-danger-500/20 text-danger-300 hover:bg-danger-500/30 rounded text-xs transition-colors"
@@ -2168,15 +2179,72 @@ export default function WordPress() {
                 </button>
                 <button
                   onClick={async () => {
-                    await handleToggleFeature("pass_protect", false, { user: passUser, pass: passPassword });
+                    await handleToggleFeature("pass_protect", true, { user: passUser, pass: passPassword });
                     setShowPassModal(false);
                   }}
                   disabled={!passPassword}
                   className="px-4 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors"
                 >
-                  Enable
+                  {passProtect ? "Update Password" : "Enable"}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* WP Toolkit Server Integration Modal */}
+      {showWpToolkitModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-md w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50 flex items-center gap-2">
+                <svg className="w-5 h-5 text-accent-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                WP Toolkit Server Integration
+              </h3>
+              <button onClick={() => setShowWpToolkitModal(false)} className="text-dark-400 hover:text-dark-100">✕</button>
+            </div>
+            <div className="space-y-3 text-xs text-dark-200 leading-relaxed">
+              <p>
+                <strong className="text-dark-50">DockPanel WP Toolkit</strong> manages WordPress directly at the server level via native WP-CLI and Nginx integrations without requiring third-party plugins installed on your WordPress site.
+              </p>
+              <div className="p-3 bg-dark-900 border border-dark-700 rounded space-y-1.5">
+                <div className="text-dark-100 font-semibold">Active Server-Side Capabilities:</div>
+                <div className="flex items-center gap-2 text-dark-300">
+                  <span className="text-rust-400">✓</span> 1-Click WordPress Core Reinstallation & Checksum Verification
+                </div>
+                <div className="flex items-center gap-2 text-dark-300">
+                  <span className="text-rust-400">✓</span> HTTP Basic Authentication (.htpasswd) & Hotlink Defense
+                </div>
+                <div className="flex items-center gap-2 text-dark-300">
+                  <span className="text-rust-400">✓</span> FastCGI Nginx Microcaching & WP-Cron Crontab Offloading
+                </div>
+                <div className="flex items-center gap-2 text-dark-300">
+                  <span className="text-rust-400">✓</span> Interactive WP-CLI Terminal Console
+                </div>
+              </div>
+              <p className="text-dark-400">
+                Because all operations are performed outside the PHP runtime, your site remains faster, more secure, and completely unbloated.
+              </p>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => {
+                  setShowWpToolkitModal(false);
+                  setShowWpCliModal(true);
+                }}
+                className="px-3.5 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium transition-colors"
+              >
+                Open WP-CLI Terminal
+              </button>
+              <button
+                onClick={() => setShowWpToolkitModal(false)}
+                className="px-4 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>

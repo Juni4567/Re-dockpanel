@@ -725,7 +725,8 @@ pub async fn db_info(domain: &str) -> Result<serde_json::Value, String> {
 }
 
 /// Run an arbitrary WP-CLI command in the site's directory safely.
-pub async fn run_cli(domain: &str, command: &str) -> Result<String, String> {
+/// Returns (success, output).
+pub async fn run_cli(domain: &str, command: &str) -> Result<(bool, String), String> {
     let clean = command.trim();
     let clean = clean.strip_prefix("wp ").unwrap_or(clean).trim();
     if clean.is_empty() {
@@ -738,15 +739,36 @@ pub async fn run_cli(domain: &str, command: &str) -> Result<String, String> {
         return Err("Command is empty".to_string());
     }
 
-    // Block dangerous flags or escapes
-    for part in &parts {
-        if *part == "--allow-root" || part.starts_with("--path=") {
-            continue;
-        }
-    }
-
+    ensure_cli().await?;
     let path = site_path(domain)?;
-    wp_at_root(&path, &parts, false).await
+    let mut cmd = safe_command(WP_CLI);
+    cmd.args(&parts)
+        .arg("--allow-root")
+        .arg(format!("--path={path}"));
+
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "WP-CLI command timed out (120s limit)".to_string())?
+    .map_err(|e| format!("Failed to execute WP-CLI: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+
+    let combined = if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+
+    Ok((out.status.success(), combined))
 }
 
 /// Get current feature status for Plesk-like WP Toolkit dashboard.
@@ -773,9 +795,17 @@ pub async fn get_features_status(domain: &str) -> Result<serde_json::Value, Stri
     let hotlink_flag = format!("/var/www/{domain}/.wp_hotlink");
     let hotlink_protect = std::path::Path::new(&hotlink_flag).exists();
 
-    // 6. Password protection (.htpasswd file)
-    let htpasswd_file = format!("/var/www/{domain}/.htpasswd");
-    let pass_protect = std::path::Path::new(&htpasswd_file).exists();
+    // 6. Password protection (check nginx auth config & htpasswd)
+    let htpasswd_file = format!("/etc/nginx/htpasswd/{domain}");
+    let legacy_file = format!("/var/www/{domain}/.htpasswd");
+    let auth_conf = format!("/etc/nginx/auth/{domain}.conf");
+    let auth_conf_active = std::fs::read_to_string(&auth_conf)
+        .map(|c| c.contains("auth_basic \"Restricted Access\""))
+        .unwrap_or(false);
+    let pass_protect = auth_conf_active
+        || (std::path::Path::new(&htpasswd_file).exists()
+            && std::fs::read_to_string(&htpasswd_file).map(|s| !s.trim().is_empty()).unwrap_or(false))
+        || std::path::Path::new(&legacy_file).exists();
 
     // 7. Caching
     let cache_flag = format!("/var/www/{domain}/.wp_nginx_cache");
@@ -861,7 +891,15 @@ pub async fn toggle_feature(domain: &str, feature: &str, enabled: bool, params: 
             }
         }
         "pass_protect" => {
-            let htpasswd_file = format!("/var/www/{domain}/.htpasswd");
+            let htpasswd_dir = "/etc/nginx/htpasswd";
+            let auth_conf_dir = "/etc/nginx/auth";
+            let _ = std::fs::create_dir_all(htpasswd_dir);
+            let _ = std::fs::create_dir_all(auth_conf_dir);
+
+            let htpasswd_file = format!("{htpasswd_dir}/{domain}");
+            let auth_file = format!("{auth_conf_dir}/{domain}.conf");
+            let legacy_htpasswd = format!("/var/www/{domain}/.htpasswd");
+
             if enabled {
                 let user = params.as_ref().and_then(|p| p.get("user")).and_then(|v| v.as_str()).unwrap_or("admin");
                 let pass = params.as_ref().and_then(|p| p.get("pass")).and_then(|v| v.as_str()).unwrap_or("admin");
@@ -872,9 +910,43 @@ pub async fn toggle_feature(domain: &str, feature: &str, enabled: bool, params: 
                     .map_err(|e| format!("Password hash failed: {e}"))?;
                 let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 let line = format!("{user}:{hash}\n");
-                std::fs::write(&htpasswd_file, line).map_err(|e| format!("Failed to write .htpasswd: {e}"))?;
+                std::fs::write(&htpasswd_file, &line).map_err(|e| format!("Failed to write {htpasswd_file}: {e}"))?;
+                let _ = safe_command("chmod").args(["644", &htpasswd_file]).output().await;
+                std::fs::write(&legacy_htpasswd, &line).ok();
+                let _ = safe_command("chmod").args(["644", &legacy_htpasswd]).output().await;
+
+                // Write the nginx auth file
+                let auth_content = format!(
+                    "auth_basic \"Restricted Access\";\nauth_basic_user_file {htpasswd_file};\n"
+                );
+                std::fs::write(&auth_file, auth_content).map_err(|e| format!("Failed to write {auth_file}: {e}"))?;
+
+                // Include in site's nginx config if not already included
+                let site_conf = format!("{}/{}.conf", crate::services::nginx::sites_dir(), domain);
+                let site_content = std::fs::read_to_string(&site_conf).unwrap_or_default();
+                let include_stmt = format!("include {auth_file};");
+                if !site_content.contains(&include_stmt) {
+                    if let Some(pos) = site_content.rfind('}') {
+                        let new_content = format!(
+                            "{}\n    {}\n{}",
+                            &site_content[..pos],
+                            include_stmt,
+                            &site_content[pos..]
+                        );
+                        std::fs::write(&site_conf, new_content).map_err(|e| format!("Failed to update site nginx config: {e}"))?;
+                    }
+                }
+
+                // Verify and reload Nginx
+                crate::services::nginx::test_config().await?;
+                crate::services::nginx::reload().await?;
             } else {
                 let _ = std::fs::remove_file(&htpasswd_file);
+                let _ = std::fs::remove_file(&legacy_htpasswd);
+                std::fs::write(&auth_file, "# Password protection disabled\nauth_basic off;\n").ok();
+
+                crate::services::nginx::test_config().await?;
+                crate::services::nginx::reload().await?;
             }
         }
         "caching" => {

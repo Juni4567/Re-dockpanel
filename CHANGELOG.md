@@ -4,6 +4,19 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.248.3] - 2026-11-23
+
+### Bug Fixes: Functional Nginx Password Protection & Terminal Error Resilience
+- **Functional WordPress Password Protection:**
+  - Fixed an issue where toggling password protection only created `/var/www/{domain}/.htpasswd` without configuring Nginx.
+  - Implemented full Nginx HTTP Basic Authentication lifecycle: writes `/etc/nginx/htpasswd/{domain}`, writes `/etc/nginx/auth/{domain}.conf` with `auth_basic "Restricted Access";`, includes it inside the site's Nginx HTTPS server block, tests configuration with `nginx -t`, and reloads Nginx.
+  - Gracefully disables protection by clearing the auth directives and reloading Nginx without breaking site configuration.
+  - Fixed toggle state resolution in `handleToggleFeature` to explicitly pass target booleans, preventing state flip-flop in the UI.
+- **Resilient WP-CLI Execution & Error Logging:**
+  - Fixed an issue where non-zero exit codes from WP-CLI (such as running non-existent plugin commands) triggered an agent HTTP 500 and backend 502 Bad Gateway with generic error reference (`Operation failed. Reference: ...`).
+  - Terminal CLI route now cleanly returns `200 OK` with combined standard output and standard error so the interactive terminal console displays the execution output directly in the UI.
+  - Replaced broken "Get WP Toolkit plugin for WordPress" CLI installation trigger with an informational modal explaining DockPanel's native zero-overhead server-side architecture.
+
 ## [2.248.2] - 2026-11-23
 
 ### Features & Security: 1-Click WordPress Core Reinstallation, Checksum Mismatch Alert & Sanitized Documentation

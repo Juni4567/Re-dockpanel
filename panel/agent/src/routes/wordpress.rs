@@ -623,10 +623,10 @@ async fn run_cli_route(
     Json(body): Json<CliRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_domain(&domain)?;
-    wordpress::run_cli(&domain, &body.command)
-        .await
-        .map(|out| Json(serde_json::json!({ "ok": true, "output": out })))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))))
+    match wordpress::run_cli(&domain, &body.command).await {
+        Ok((success, output)) => Ok(Json(serde_json::json!({ "ok": success, "output": output }))),
+        Err(e) => Ok(Json(serde_json::json!({ "ok": false, "output": e }))),
+    }
 }
 
 async fn features_status_route(
