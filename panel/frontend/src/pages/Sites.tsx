@@ -83,6 +83,9 @@ export default function Sites() {
   const [adminEmail, setAdminEmail] = useState("");
   const [adminUser, setAdminUser] = useState("admin");
   const [adminPassword, setAdminPassword] = useState("");
+  const [enableBackup, setEnableBackup] = useState(false);
+  const [backupFrequency, setBackupFrequency] = useState("daily");
+  const [backupRetention, setBackupRetention] = useState(7);
 
   const copyDomain = (d: string) => {
     navigator.clipboard.writeText(d);
@@ -144,6 +147,11 @@ export default function Sites() {
         if (adminUser) body.admin_user = adminUser;
         if (adminPassword) body.admin_password = adminPassword;
       }
+      body.enable_backup_schedule = enableBackup;
+      if (enableBackup) {
+        body.backup_frequency = backupFrequency;
+        body.backup_retention = backupRetention;
+      }
 
       const created = await api.post<Site>("/sites", body);
       setShowForm(false);
@@ -156,6 +164,9 @@ export default function Sites() {
       setAdminEmail("");
       setAdminUser("admin");
       setAdminPassword("");
+      setEnableBackup(false);
+      setBackupFrequency("daily");
+      setBackupRetention(7);
       fetchSites();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create site");
@@ -455,6 +466,63 @@ export default function Sites() {
               </div>
             </div>
           )}
+
+          {/* Scheduled Backups Option */}
+          <div className="bg-dark-850 p-4 rounded-lg border border-dark-600/70 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-sm font-medium text-dark-100 flex items-center gap-2">
+                  <svg className="w-4 h-4 text-rust-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                  </svg>
+                  Configure Scheduled Backups
+                </span>
+                <p className="text-xs text-dark-400 mt-0.5">
+                  Automatically take recurring backups of files and databases. Optional — leave disabled if not required.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEnableBackup(!enableBackup)}
+                className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                  enableBackup ? "bg-accent-600" : "bg-dark-600"
+                }`}
+              >
+                <span className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${enableBackup ? "translate-x-4" : "translate-x-0.5"}`} />
+              </button>
+            </div>
+
+            {enableBackup && (
+              <div className="pt-3 border-t border-dark-700/60 grid grid-cols-1 sm:grid-cols-2 gap-4 animate-fade-in text-xs">
+                <div>
+                  <label htmlFor="site-backup-frequency" className="block font-medium text-dark-200 mb-1">Backup Frequency</label>
+                  <select
+                    id="site-backup-frequency"
+                    value={backupFrequency}
+                    onChange={(e) => setBackupFrequency(e.target.value)}
+                    className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded-lg text-dark-100 outline-none focus:border-rust-500"
+                  >
+                    <option value="daily">Daily at 3:00 AM (Recommended)</option>
+                    <option value="hourly">Hourly</option>
+                    <option value="weekly">Weekly (Sundays at 3:00 AM)</option>
+                    <option value="monthly">Monthly (1st at 3:00 AM)</option>
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="site-backup-retention" className="block font-medium text-dark-200 mb-1">Retention Count (Max Backups Kept)</label>
+                  <input
+                    id="site-backup-retention"
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={backupRetention}
+                    onChange={(e) => setBackupRetention(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="w-full px-3 py-2 bg-dark-900 border border-dark-600 rounded-lg text-dark-100 outline-none focus:border-rust-500"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="flex items-center gap-3 pt-2">
             <button

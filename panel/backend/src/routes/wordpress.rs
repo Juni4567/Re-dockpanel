@@ -311,7 +311,17 @@ pub async fn plugin_action(
     Path((id, action)): Path<(Uuid, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    const ALLOWED_PLUGIN_ACTIONS: &[&str] = &["activate", "deactivate", "delete", "update"];
+    const ALLOWED_PLUGIN_ACTIONS: &[&str] = &[
+        "activate",
+        "deactivate",
+        "delete",
+        "update",
+        "install",
+        "enable-autoupdate",
+        "disable-autoupdate",
+        "enable-all-autoupdate",
+        "disable-all-autoupdate",
+    ];
     if !ALLOWED_PLUGIN_ACTIONS.contains(&action.as_str()) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid plugin action"));
     }
@@ -336,7 +346,16 @@ pub async fn theme_action(
     Path((id, action)): Path<(Uuid, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    const ALLOWED_THEME_ACTIONS: &[&str] = &["activate", "delete", "update"];
+    const ALLOWED_THEME_ACTIONS: &[&str] = &[
+        "activate",
+        "delete",
+        "update",
+        "install",
+        "enable-autoupdate",
+        "disable-autoupdate",
+        "enable-all-autoupdate",
+        "disable-all-autoupdate",
+    ];
     if !ALLOWED_THEME_ACTIONS.contains(&action.as_str()) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid theme action"));
     }

@@ -634,22 +634,28 @@ pub async fn rollback_from_snapshot(domain: &str, snapshot_path: &str) -> Result
 
 /// Run a health check on a WordPress site after update.
 pub async fn health_check(domain: &str) -> bool {
-    // Check if WordPress responds to wp-cli
+    let path = match site_path(domain) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        safe_command("sudo")
-            .args(["-u", "www-data", WP_CLI, "eval", "echo 'OK';",
-                   "--skip-plugins", "--skip-themes", "--allow-root",
-                   &format!("--path={}", site_path(domain).unwrap_or_default())])
+        safe_command(WP_CLI)
+            .args([
+                "core",
+                "is-installed",
+                "--skip-plugins",
+                "--skip-themes",
+                "--allow-root",
+                &format!("--path={path}"),
+            ])
             .kill_on_drop(true)
-            .output()
-    ).await;
+            .output(),
+    )
+    .await;
 
     match result {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            out.status.success() && stdout.contains("OK")
-        }
+        Ok(Ok(out)) => out.status.success(),
         _ => false,
     }
 }

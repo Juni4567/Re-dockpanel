@@ -115,6 +115,12 @@ export default function WordPress() {
   const [showInstallThemeModal, setShowInstallThemeModal] = useState(false);
   const [showDbUserModal, setShowDbUserModal] = useState(false);
   const [showWpToolkitModal, setShowWpToolkitModal] = useState(false);
+  const [showPluginUpdatesModal, setShowPluginUpdatesModal] = useState(false);
+  const [showThemeUpdatesModal, setShowThemeUpdatesModal] = useState(false);
+  const [selectedPluginUpdates, setSelectedPluginUpdates] = useState<Set<string>>(new Set());
+  const [selectedThemeUpdates, setSelectedThemeUpdates] = useState<Set<string>>(new Set());
+  const [batchUpdating, setBatchUpdating] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; item: string }>({ current: 0, total: 0, item: "" });
 
   // WP-CLI Console
   const [cliCmd, setCliCmd] = useState("core version");
@@ -327,6 +333,72 @@ export default function WordPress() {
     } finally {
       setBusy("");
     }
+  };
+
+  // Open Plugin Updates Selection Modal
+  const openPluginUpdatesModal = () => {
+    const updatable = plugins.filter(
+      (p) => p.update === "available" || p.vulnerable || (p as any).update_version
+    );
+    const candidates = updatable.length > 0 ? updatable : plugins;
+    setSelectedPluginUpdates(new Set(candidates.map((p) => p.name)));
+    setShowPluginUpdatesModal(true);
+  };
+
+  // Open Theme Updates Selection Modal
+  const openThemeUpdatesModal = () => {
+    const updatable = themes.filter(
+      (t) => t.update === "available" || t.vulnerable || (t as any).update_version
+    );
+    const candidates = updatable.length > 0 ? updatable : themes;
+    setSelectedThemeUpdates(new Set(candidates.map((t) => t.name)));
+    setShowThemeUpdatesModal(true);
+  };
+
+  // Execute batch plugin update on selected plugins
+  const handleRunBatchPluginUpdates = async () => {
+    const items = Array.from(selectedPluginUpdates);
+    if (items.length === 0) return;
+    setBatchUpdating(true);
+    let successCount = 0;
+    for (let i = 0; i < items.length; i++) {
+      const name = items[i];
+      setBatchProgress({ current: i + 1, total: items.length, item: name });
+      try {
+        await api.post(`/sites/${id}/wordpress/plugin/update`, { name });
+        successCount++;
+      } catch (e) {
+        showGlobalNotification("error", `Failed to update plugin ${name}: ${e instanceof Error ? e.message : "Error"}`);
+      }
+    }
+    setBatchUpdating(false);
+    setShowPluginUpdatesModal(false);
+    showGlobalNotification("success", `Updated ${successCount} of ${items.length} plugins`);
+    loadPlugins();
+    loadData();
+  };
+
+  // Execute batch theme update on selected themes
+  const handleRunBatchThemeUpdates = async () => {
+    const items = Array.from(selectedThemeUpdates);
+    if (items.length === 0) return;
+    setBatchUpdating(true);
+    let successCount = 0;
+    for (let i = 0; i < items.length; i++) {
+      const name = items[i];
+      setBatchProgress({ current: i + 1, total: items.length, item: name });
+      try {
+        await api.post(`/sites/${id}/wordpress/theme/update`, { name });
+        successCount++;
+      } catch (e) {
+        showGlobalNotification("error", `Failed to update theme ${name}: ${e instanceof Error ? e.message : "Error"}`);
+      }
+    }
+    setBatchUpdating(false);
+    setShowThemeUpdatesModal(false);
+    showGlobalNotification("success", `Updated ${successCount} of ${items.length} themes`);
+    loadThemes();
+    loadData();
   };
 
   // Toggle Features with Backend API
@@ -962,7 +1034,7 @@ export default function WordPress() {
                           <span className="text-dark-300">Plugins</span>
                           {plugins.some((p) => p.update === "available") || plugins.some((p) => p.vulnerable) ? (
                             <button
-                              onClick={() => handleUpdate("plugins")}
+                              onClick={openPluginUpdatesModal}
                               className="text-warn-400 hover:underline flex items-center gap-1 font-medium"
                             >
                               <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -976,11 +1048,14 @@ export default function WordPress() {
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="text-dark-300">Themes</span>
-                          {themes.some((t) => t.update === "available") ? (
+                          {themes.some((t) => t.update === "available") || themes.some((t) => t.vulnerable) ? (
                             <button
-                              onClick={() => handleUpdate("themes")}
+                              onClick={openThemeUpdatesModal}
                               className="text-warn-400 hover:underline flex items-center gap-1 font-medium"
                             >
+                              <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                              </svg>
                               Install theme updates
                             </button>
                           ) : (
@@ -1475,6 +1550,7 @@ export default function WordPress() {
                           <th className="p-3 font-semibold uppercase tracking-wider">Name</th>
                           <th className="p-3 font-semibold uppercase tracking-wider w-24">Active</th>
                           <th className="p-3 font-semibold uppercase tracking-wider w-28">Autoupdate</th>
+                          <th className="p-3 font-semibold uppercase tracking-wider w-24"></th>
                           <th className="p-3 w-12 text-right"></th>
                         </tr>
                       </thead>
@@ -1483,6 +1559,7 @@ export default function WordPress() {
                           const isAuto = t.auto_update === "on";
                           const isVuln = t.vulnerable || t.name.toLowerCase().includes("brooklyn");
                           const isActive = t.status === "active";
+                          const hasUpdate = t.update === "available" || (t as any).update_version;
                           return (
                             <tr key={t.name} className="hover:bg-dark-700/20 transition-colors">
                               <td className="p-3">
@@ -1540,6 +1617,17 @@ export default function WordPress() {
                                   <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${isAuto ? "translate-x-3.5" : "translate-x-0.5"}`} />
                                 </button>
                               </td>
+                              <td className="p-3">
+                                {hasUpdate ? (
+                                  <button
+                                    onClick={() => handleThemeAction(t.name, "update")}
+                                    disabled={busy.startsWith("theme-")}
+                                    className="text-accent-400 hover:underline font-medium text-xs"
+                                  >
+                                    Updates
+                                  </button>
+                                ) : null}
+                              </td>
                               <td className="p-3 text-right">
                                 {!isActive && (
                                   <button
@@ -1558,7 +1646,7 @@ export default function WordPress() {
                         })}
                         {filteredThemes.length === 0 && (
                           <tr>
-                            <td colSpan={5} className="p-6 text-center text-dark-300">
+                            <td colSpan={6} className="p-6 text-center text-dark-300">
                               {themeFilter ? "No matching themes found" : "No WordPress themes installed"}
                             </td>
                           </tr>
@@ -2660,6 +2748,306 @@ export default function WordPress() {
                   {changingDbPass ? "Updating..." : "Update Password"}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Install Plugin Updates Selection Modal */}
+      {showPluginUpdatesModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-xl w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50 flex items-center gap-2">
+                <svg className="w-5 h-5 text-warn-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Install Plugin Updates
+              </h3>
+              <button
+                onClick={() => !batchUpdating && setShowPluginUpdatesModal(false)}
+                disabled={batchUpdating}
+                className="text-dark-400 hover:text-dark-100 disabled:opacity-40"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="text-xs text-dark-300">
+              Select which plugins to update. All plugins requiring updates or security patches are selected by default.
+            </p>
+
+            {batchUpdating && (
+              <div className="p-3 bg-dark-900 border border-dark-700 rounded-lg space-y-2">
+                <div className="flex items-center justify-between text-xs text-dark-200">
+                  <span className="flex items-center gap-2 font-medium">
+                    <span className="w-3.5 h-3.5 border-2 border-rust-500/30 border-t-rust-500 rounded-full animate-spin" />
+                    Updating ({batchProgress.current} of {batchProgress.total}): {batchProgress.item}
+                  </span>
+                  <span className="font-mono text-dark-400">
+                    {Math.round((batchProgress.current / (batchProgress.total || 1)) * 100)}%
+                  </span>
+                </div>
+                <div className="w-full bg-dark-800 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="bg-rust-500 h-full transition-all duration-300 rounded-full"
+                    style={{ width: `${Math.round((batchProgress.current / (batchProgress.total || 1)) * 100)}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Plugin candidate list */}
+            {(() => {
+              const updatable = plugins.filter(
+                (p) => p.update === "available" || p.vulnerable || (p as any).update_version
+              );
+              const displayList = updatable.length > 0 ? updatable : plugins;
+              const allChecked = displayList.length > 0 && displayList.every((p) => selectedPluginUpdates.has(p.name));
+              return (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-xs text-dark-300 px-1">
+                    <label className="flex items-center gap-2 cursor-pointer font-medium select-none">
+                      <input
+                        type="checkbox"
+                        checked={allChecked}
+                        disabled={batchUpdating}
+                        onChange={(e) => {
+                          if (e.target.checked) setSelectedPluginUpdates(new Set(displayList.map((p) => p.name)));
+                          else setSelectedPluginUpdates(new Set());
+                        }}
+                        className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                      />
+                      <span>Select All ({selectedPluginUpdates.size} of {displayList.length})</span>
+                    </label>
+                    <span className="text-dark-400 text-[11px]">
+                      {displayList.filter((p) => p.vulnerable).length} vulnerable
+                    </span>
+                  </div>
+
+                  <div className="max-h-60 overflow-y-auto space-y-1.5 border border-dark-700 rounded-lg p-2 bg-dark-900/60 divide-y divide-dark-800">
+                    {displayList.map((p) => {
+                      const isChecked = selectedPluginUpdates.has(p.name);
+                      const isVuln = p.vulnerable || p.name.toLowerCase().includes("contact form") || p.name.toLowerCase().includes("composer") || p.name.toLowerCase().includes("mailchimp");
+                      return (
+                        <label
+                          key={p.name}
+                          className={`flex items-center justify-between p-2 rounded cursor-pointer transition-colors ${
+                            isChecked ? "bg-dark-800/80" : "hover:bg-dark-800/40"
+                          }`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              disabled={batchUpdating}
+                              onChange={(e) => {
+                                const next = new Set(selectedPluginUpdates);
+                                if (e.target.checked) next.add(p.name);
+                                else next.delete(p.name);
+                                setSelectedPluginUpdates(next);
+                              }}
+                              className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                            />
+                            <div>
+                              <div className="text-xs font-medium text-dark-100 flex items-center gap-2">
+                                <span>{p.title || p.name}</span>
+                                {isVuln && (
+                                  <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-danger-500/15 text-danger-400 font-medium">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-danger-500" />
+                                    Vulnerable
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-dark-400 font-mono">
+                                slug: {p.name}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="text-right text-xs">
+                            <span className="font-mono text-dark-300">v{p.version}</span>
+                            {(p as any).update_version && (
+                              <span className="text-accent-400 font-mono ml-1.5">→ v{(p as any).update_version}</span>
+                            )}
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowPluginUpdatesModal(false)}
+                disabled={batchUpdating}
+                className="px-4 py-2 bg-dark-700 hover:bg-dark-600 text-dark-200 rounded text-xs transition-colors disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleRunBatchPluginUpdates}
+                disabled={batchUpdating || selectedPluginUpdates.size === 0}
+                className="px-5 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors flex items-center gap-2"
+              >
+                {batchUpdating ? (
+                  <>
+                    <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    Updating Selected...
+                  </>
+                ) : (
+                  `Update Selected (${selectedPluginUpdates.size})`
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Install Theme Updates Selection Modal */}
+      {showThemeUpdatesModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 max-w-xl w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold text-dark-50 flex items-center gap-2">
+                <svg className="w-5 h-5 text-warn-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Install Theme Updates
+              </h3>
+              <button
+                onClick={() => !batchUpdating && setShowThemeUpdatesModal(false)}
+                disabled={batchUpdating}
+                className="text-dark-400 hover:text-dark-100 disabled:opacity-40"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="text-xs text-dark-300">
+              Select which themes to update. All themes requiring updates or security patches are selected by default.
+            </p>
+
+            {batchUpdating && (
+              <div className="p-3 bg-dark-900 border border-dark-700 rounded-lg space-y-2">
+                <div className="flex items-center justify-between text-xs text-dark-200">
+                  <span className="flex items-center gap-2 font-medium">
+                    <span className="w-3.5 h-3.5 border-2 border-rust-500/30 border-t-rust-500 rounded-full animate-spin" />
+                    Updating ({batchProgress.current} of {batchProgress.total}): {batchProgress.item}
+                  </span>
+                  <span className="font-mono text-dark-400">
+                    {Math.round((batchProgress.current / (batchProgress.total || 1)) * 100)}%
+                  </span>
+                </div>
+                <div className="w-full bg-dark-800 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="bg-rust-500 h-full transition-all duration-300 rounded-full"
+                    style={{ width: `${Math.round((batchProgress.current / (batchProgress.total || 1)) * 100)}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Theme candidate list */}
+            {(() => {
+              const updatable = themes.filter(
+                (t) => t.update === "available" || t.vulnerable || (t as any).update_version
+              );
+              const displayList = updatable.length > 0 ? updatable : themes;
+              const allChecked = displayList.length > 0 && displayList.every((t) => selectedThemeUpdates.has(t.name));
+              return (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-xs text-dark-300 px-1">
+                    <label className="flex items-center gap-2 cursor-pointer font-medium select-none">
+                      <input
+                        type="checkbox"
+                        checked={allChecked}
+                        disabled={batchUpdating}
+                        onChange={(e) => {
+                          if (e.target.checked) setSelectedThemeUpdates(new Set(displayList.map((t) => t.name)));
+                          else setSelectedThemeUpdates(new Set());
+                        }}
+                        className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                      />
+                      <span>Select All ({selectedThemeUpdates.size} of {displayList.length})</span>
+                    </label>
+                    <span className="text-dark-400 text-[11px]">
+                      {displayList.filter((t) => t.vulnerable).length} vulnerable
+                    </span>
+                  </div>
+
+                  <div className="max-h-60 overflow-y-auto space-y-1.5 border border-dark-700 rounded-lg p-2 bg-dark-900/60 divide-y divide-dark-800">
+                    {displayList.map((t) => {
+                      const isChecked = selectedThemeUpdates.has(t.name);
+                      const isVuln = t.vulnerable || t.name.toLowerCase().includes("brooklyn");
+                      return (
+                        <label
+                          key={t.name}
+                          className={`flex items-center justify-between p-2 rounded cursor-pointer transition-colors ${
+                            isChecked ? "bg-dark-800/80" : "hover:bg-dark-800/40"
+                          }`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              disabled={batchUpdating}
+                              onChange={(e) => {
+                                const next = new Set(selectedThemeUpdates);
+                                if (e.target.checked) next.add(t.name);
+                                else next.delete(t.name);
+                                setSelectedThemeUpdates(next);
+                              }}
+                              className="rounded border-dark-500 bg-dark-800 text-rust-500"
+                            />
+                            <div>
+                              <div className="text-xs font-medium text-dark-100 flex items-center gap-2">
+                                <span>{t.title || t.name}</span>
+                                {isVuln && (
+                                  <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-warn-500/15 text-warn-400 font-medium">
+                                    Vulnerable
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-dark-400 font-mono">
+                                slug: {t.name}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="text-right text-xs">
+                            <span className="font-mono text-dark-300">v{t.version}</span>
+                            {(t as any).update_version && (
+                              <span className="text-accent-400 font-mono ml-1.5">→ v{(t as any).update_version}</span>
+                            )}
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-dark-700">
+              <button
+                onClick={() => setShowThemeUpdatesModal(false)}
+                disabled={batchUpdating}
+                className="px-4 py-2 bg-dark-700 hover:bg-dark-600 text-dark-200 rounded text-xs transition-colors disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleRunBatchThemeUpdates}
+                disabled={batchUpdating || selectedThemeUpdates.size === 0}
+                className="px-5 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium disabled:opacity-50 transition-colors flex items-center gap-2"
+              >
+                {batchUpdating ? (
+                  <>
+                    <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    Updating Selected...
+                  </>
+                ) : (
+                  `Update Selected (${selectedThemeUpdates.size})`
+                )}
+              </button>
             </div>
           </div>
         </div>

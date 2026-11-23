@@ -4,6 +4,22 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.248.5] - 2026-11-23
+
+### Features & Fixes: Interactive Plugin & Theme Updates Modals & User-Configurable Scheduled Backups
+- **Interactive Batch Plugin & Theme Updates Modal:**
+  - Replaced immediate unprompted updates on "Install plugin updates" and "Install theme updates" with interactive selection modals displaying all update-eligible and vulnerable items.
+  - Pre-selected all candidates by default with "Select All" toggle, current vs. new version indicator, and security vulnerability advisories.
+  - Added real-time progress feedback with animated spinner, percentage tracker, and active item status during batch execution.
+  - Added direct `Updates` action link in Themes table rows matching Plesk WP Toolkit layout (Screenshot 3).
+  - Fixed pre-update health check in `agent/src/services/wordpress.rs`: replaced quote-escaped `wp eval` command with fast, native `wp core is-installed --skip-plugins --skip-themes --allow-root`, completely resolving `Site failed pre-update health check` error (`Reference: a9865a24-4201-4e5e-bfca-91f0e2f988b6`).
+  - Expanded allowed actions in backend `wordpress::plugin_action` and `wordpress::theme_action` (`install`, `enable-autoupdate`, `disable-autoupdate`, `enable-all-autoupdate`, `disable-all-autoupdate`), unblocking direct autoupdate and installation APIs.
+- **User-Configurable Scheduled Backups on Site Creation:**
+  - Disabled unconditional creation of daily backup schedules on new site provisioning.
+  - Added an optional "Configure Scheduled Backups" toggle to the Create Site form in `Sites.tsx`.
+  - When enabled, allows the user to choose custom backup frequency (`daily`, `hourly`, `weekly`, `monthly`) and custom retention count (1-100).
+  - Backend `POST /api/sites` respects user selection and only provisions a row in `backup_schedules` when explicitly opted in.
+
 ## [2.248.4] - 2026-11-23
 
 ### Refinement: Complete Plesk WordPress Toolkit Layout, Interactive Autoupdates, & High-Res Thumbnails

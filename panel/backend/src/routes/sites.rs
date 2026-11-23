@@ -210,6 +210,10 @@ pub struct CreateSiteRequest {
     pub admin_email: Option<String>,
     pub admin_user: Option<String>,
     pub admin_password: Option<String>,
+    // Optional scheduled backups
+    pub enable_backup_schedule: Option<bool>,
+    pub backup_frequency: Option<String>,
+    pub backup_retention: Option<i32>,
 }
 
 /// GET /api/sites — List all sites for the current user.
@@ -736,16 +740,28 @@ pub async fn create(
             // new users. Users can create monitors manually when ready.
             // See: https://github.com/ovexro/dockpanel/issues/XX
 
-            // Auto-create backup schedule for every new site (daily 3 AM, 7 retention)
-            {
+            // Configure backup schedule only if user explicitly opted in
+            if body.enable_backup_schedule == Some(true) {
                 let backup_db = state.db.clone();
                 let backup_site_id = site.id;
+                let schedule_cron = match body.backup_frequency.as_deref() {
+                    Some("hourly") => "0 * * * *".to_string(),
+                    Some("weekly") => "0 3 * * 0".to_string(),
+                    Some("monthly") => "0 3 1 * *".to_string(),
+                    _ => "0 3 * * *".to_string(), // daily 3 AM
+                };
+                let retention = body.backup_retention.unwrap_or(7).clamp(1, 100);
                 tokio::spawn(async move {
                     let _ = sqlx::query(
                         "INSERT INTO backup_schedules (site_id, schedule, retention_count, enabled) \
-                         VALUES ($1, '0 3 * * *', 7, true) ON CONFLICT (site_id) DO NOTHING"
-                    ).bind(backup_site_id).execute(&backup_db).await;
-                    tracing::info!("Auto-backup: created daily schedule for new site");
+                         VALUES ($1, $2, $3, true) ON CONFLICT (site_id) DO UPDATE SET schedule = $2, retention_count = $3, enabled = true"
+                    )
+                    .bind(backup_site_id)
+                    .bind(schedule_cron)
+                    .bind(retention)
+                    .execute(&backup_db)
+                    .await;
+                    tracing::info!("Scheduled backup configured for site {}", backup_site_id);
                 });
             }
 
