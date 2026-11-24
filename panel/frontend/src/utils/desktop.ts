@@ -40,6 +40,78 @@ export function getDesktopSitePath(domain: string): string {
 }
 
 /**
+ * Invokes a Tauri command via window.__TAURI__ with graceful fallback.
+ */
+export async function invokeDesktop(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
+  if (typeof window !== "undefined") {
+    const tauri = (window as any).__TAURI__;
+    if (tauri) {
+      if (typeof tauri.invoke === "function") {
+        return await tauri.invoke(cmd, args);
+      }
+      if (tauri.core && typeof tauri.core.invoke === "function") {
+        return await tauri.core.invoke(cmd, args);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Opens a local site folder in Windows File Explorer via Tauri WSL UNC path.
+ */
+export async function openDesktopFolder(domain: string): Promise<boolean> {
+  const path = getDesktopSitePath(domain);
+  try {
+    const tauri = typeof window !== "undefined" ? (window as any).__TAURI__ : undefined;
+    if (!tauri) {
+      console.log(`[Desktop Fallback] Open folder: ${path}`);
+      return true;
+    }
+    await invokeDesktop("open_folder", { path });
+    return true;
+  } catch (primaryErr) {
+    try {
+      await invokeDesktop("open_site_folder", { path });
+      return true;
+    } catch {
+      console.warn("Failed to open folder in desktop environment:", primaryErr);
+      return false;
+    }
+  }
+}
+
+/**
+ * Opens a local site in VS Code via Tauri WSL UNC path.
+ */
+export async function openDesktopVSCode(domain: string): Promise<boolean> {
+  const path = getDesktopSitePath(domain);
+  try {
+    const tauri = typeof window !== "undefined" ? (window as any).__TAURI__ : undefined;
+    if (!tauri) {
+      console.log(`[Desktop Fallback] Open VS Code: ${path}`);
+      return true;
+    }
+    await invokeDesktop("open_vscode", { path });
+    return true;
+  } catch (err) {
+    console.warn("Failed to open VS Code in desktop environment:", err);
+    return false;
+  }
+}
+
+/**
+ * Formats a local domain name ensuring the desired suffix (.test or .local) is present
+ * without accidental duplication.
+ */
+export function formatDesktopDomain(name: string, suffix: string = ".test"): string {
+  const trimmed = name.trim();
+  if (!trimmed) return "";
+  const base = trimmed.replace(/\.(test|local)$/i, "");
+  return `${base}${suffix}`;
+}
+
+/**
  * Navigation paths that only make sense on a multi-tenant or internet-facing VPS
  * and are pruned from local desktop navigation:
  * - DNS (local hosts helper handles .test/.local)

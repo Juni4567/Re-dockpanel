@@ -9,6 +9,8 @@ import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
 import SiteThumbnail from "../components/SiteThumbnail";
 import SiteFavicon from "../components/SiteFavicon";
+import DesktopSiteActions from "../components/DesktopSiteActions";
+import { isDesktopApp, formatDesktopDomain } from "../utils/desktop";
 import { useAuth } from "../context/AuthContext";
 
 interface SiteMetrics {
@@ -72,6 +74,7 @@ export default function Sites() {
 
   // Form state
   const [domain, setDomain] = useState("");
+  const [domainSuffix, setDomainSuffix] = useState<".test" | ".local">(".test");
   const [runtime, setRuntime] = useState("static");
   const [proxyPort, setProxyPort] = useState("");
   const [phpVersion, setPhpVersion] = useState("8.3");
@@ -93,13 +96,15 @@ export default function Sites() {
     setTimeout(() => setCopiedDomain(null), 2000);
   };
 
+  const effectiveDomain = isDesktopApp() ? formatDesktopDomain(domain, domainSuffix) : domain;
+
   // Preflight the domain as it is typed. Nothing here BLOCKS creation — a site
   // is perfectly valid before its DNS exists, and the brief is explicit that a
   // not-yet-propagated record must not be presented as an error. The point is
   // that the user learns about the prerequisite here, rather than discovering it
   // later when SSL silently fails to appear.
   const { prereq: dnsPrereq, checking: dnsChecking, recheck: recheckDns } =
-    useDnsPrereq(showForm ? domain : "");
+    useDnsPrereq(showForm ? effectiveDomain : "");
 
   const fetchSites = () => {
     api
@@ -131,7 +136,8 @@ export default function Sites() {
     try {
       const effectiveRuntime = cms ? "php" : runtime;
       const effectivePreset = cms || phpPreset;
-      const body: Record<string, unknown> = { domain, runtime: effectiveRuntime };
+      const effectiveDomainToCreate = isDesktopApp() ? formatDesktopDomain(domain, domainSuffix) : domain;
+      const body: Record<string, unknown> = { domain: effectiveDomainToCreate, runtime: effectiveRuntime };
       if (effectiveRuntime === "proxy") body.proxy_port = parseInt(proxyPort);
       if (effectiveRuntime === "node" || effectiveRuntime === "python") {
         body.app_command = appCommand;
@@ -157,6 +163,7 @@ export default function Sites() {
       setShowForm(false);
       setProvisioningSiteId(created.id);
       setDomain("");
+      setDomainSuffix(".test");
       setRuntime("static");
       setProxyPort("");
       setCms("");
@@ -302,16 +309,69 @@ export default function Sites() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label htmlFor="site-domain" className="block text-sm font-medium text-dark-100 mb-1">Domain</label>
-              <input
-                id="site-domain"
-                type="text"
-                value={domain}
-                onChange={(e) => setDomain(e.target.value)}
-                required
-                placeholder="example.com"
-                className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm"
-              />
+              <div className="flex items-center justify-between mb-1">
+                <label htmlFor="site-domain" className="block text-sm font-medium text-dark-100">Domain</label>
+                {isDesktopApp() && (
+                  <div className="flex items-center gap-1 text-xs">
+                    <span className="text-dark-400">Suffix:</span>
+                    <button
+                      type="button"
+                      onClick={() => setDomainSuffix(".test")}
+                      className={`px-1.5 py-0.5 rounded font-mono transition-colors ${
+                        domainSuffix === ".test"
+                          ? "bg-rust-500 text-white font-medium"
+                          : "bg-dark-700 text-dark-300 hover:text-dark-100"
+                      }`}
+                    >
+                      .test
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDomainSuffix(".local")}
+                      className={`px-1.5 py-0.5 rounded font-mono transition-colors ${
+                        domainSuffix === ".local"
+                          ? "bg-rust-500 text-white font-medium"
+                          : "bg-dark-700 text-dark-300 hover:text-dark-100"
+                      }`}
+                    >
+                      .local
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div className="flex">
+                <input
+                  id="site-domain"
+                  type="text"
+                  value={domain}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val.endsWith(".test")) {
+                      setDomainSuffix(".test");
+                    } else if (val.endsWith(".local")) {
+                      setDomainSuffix(".local");
+                    }
+                    setDomain(val);
+                  }}
+                  required
+                  placeholder={isDesktopApp() ? "mysite" : "example.com"}
+                  className={`w-full px-3 py-2.5 border border-dark-500 ${
+                    isDesktopApp() ? "rounded-l-lg border-r-0" : "rounded-lg"
+                  } focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm`}
+                />
+                {isDesktopApp() && (
+                  <select
+                    id="site-domain-suffix"
+                    aria-label="Domain suffix"
+                    value={domainSuffix}
+                    onChange={(e) => setDomainSuffix(e.target.value as ".test" | ".local")}
+                    className="px-3 py-2.5 bg-dark-700 border border-dark-500 rounded-r-lg text-sm font-mono text-dark-100 outline-none focus:ring-2 focus:ring-accent-500 cursor-pointer"
+                  >
+                    <option value=".test">.test</option>
+                    <option value=".local">.local</option>
+                  </select>
+                )}
+              </div>
               <FieldHelp id="sites.create.domain" />
               <PrereqCallout
                 prereq={dnsPrereq}
@@ -718,6 +778,7 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
                                 </svg>
                               </Link>
+                              {isDesktopApp() && <DesktopSiteActions domain={site.domain} />}
                             </div>
                             <Link
                               to={`/sites/${site.id}`}
@@ -873,6 +934,7 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
                                 </svg>
                               </Link>
+                              {isDesktopApp() && <DesktopSiteActions domain={site.domain} />}
                             </div>
                           </td>
                           {allSites && (
