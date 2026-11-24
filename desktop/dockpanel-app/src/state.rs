@@ -317,8 +317,8 @@ impl AppState {
         }
         self.save_data();
 
-        // Register domain in Windows hosts file via Zero-UAC Host Helper named pipe
-        Self::notify_host_helper("add", &clean_domain, "127.0.0.1");
+        // Register domain in Windows hosts file (best-effort; never fail site creation on permission errors)
+        let _ = crate::hosts_manager::sync_domain_to_hosts(&clean_domain);
 
         site
     }
@@ -345,7 +345,7 @@ impl AppState {
             }
             self.remove_site_worker_port(&clean);
             self.save_data();
-            Self::notify_host_helper("remove", &dom, "127.0.0.1");
+            let _ = crate::hosts_manager::remove_domain_from_hosts(&dom);
             true
         } else {
             false
@@ -452,8 +452,8 @@ impl AppState {
         }
         self.save_data();
 
-        // Notify host helper
-        Self::notify_host_helper("add", &site.domain, "127.0.0.1");
+        // Sync domain in Windows hosts file (best-effort; never fail site startup on permission errors)
+        let _ = crate::hosts_manager::sync_domain_to_hosts(&site.domain);
 
         self.get_site(&site.id)
             .ok_or_else(|| "Failed to retrieve updated site".to_string())
@@ -509,7 +509,7 @@ impl AppState {
 
         for site in active_sites {
             self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
-            Self::notify_host_helper("add", &site.domain, "127.0.0.1");
+            let _ = crate::hosts_manager::sync_domain_to_hosts(&site.domain);
         }
     }
 
@@ -532,29 +532,6 @@ impl AppState {
         }
         let handle = crate::router::start_site_router(Arc::new(self.clone()), port);
         *handle_guard = Some(handle);
-    }
-
-    fn notify_host_helper(action: &str, domain: &str, ip: &str) {
-        #[cfg(windows)]
-        {
-            use std::io::Write;
-            let mut attempts = 0;
-            while attempts < 2 {
-                if let Ok(mut pipe) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(r"\\.\pipe\dockpanel-host-helper")
-                {
-                    let req = serde_json::json!({
-                        "action": action,
-                        "domain": domain,
-                        "ip": ip
-                    });
-                    let _ = writeln!(pipe, "{}", req);
-                    break;
-                }
-                attempts += 1;
-            }
-        }
     }
 }
 
@@ -668,6 +645,23 @@ mod tests {
         }
 
         let _ = state.stop_site(&site.id);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_site_delete_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_delete_test_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir, sites_dir);
+
+        let site = state.create_site("delete-test.local", Some("8.3"));
+        assert!(state.get_site(&site.id).is_some());
+
+        assert!(state.delete_site(&site.id));
+        assert!(state.get_site(&site.id).is_none());
+        assert!(!state.delete_site(&site.id));
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
