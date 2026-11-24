@@ -1,7 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import React from "react";
 import { renderToString } from "react-dom/server";
-import DesktopSiteActions from "../components/DesktopSiteActions";
+import DesktopSiteActions, {
+  toggleDesktopSiteStatus,
+} from "../components/DesktopSiteActions";
+import { api } from "../api";
 import {
   openDesktopFolder,
   openDesktopVSCode,
@@ -119,5 +122,61 @@ describe("DesktopSiteActions Component & Native OS Hooks", () => {
   it("handles empty or whitespace strings cleanly", () => {
     expect(formatDesktopDomain("")).toBe("");
     expect(formatDesktopDomain("   ")).toBe("");
+  });
+
+  it("renders Stop Site button when siteId is provided and status is active", () => {
+    (window as any).__TAURI__ = {};
+    const html = renderToString(
+      React.createElement(DesktopSiteActions, {
+        domain: "myproject.test",
+        siteId: "site-123",
+        status: "active",
+      })
+    );
+    expect(html).toContain("Stop Site");
+    expect(html).toContain("text-red-400");
+    expect(html).not.toContain("Start Site");
+  });
+
+  it("renders Start Site button when siteId is provided and status is stopped", () => {
+    (window as any).__TAURI__ = {};
+    const html = renderToString(
+      React.createElement(DesktopSiteActions, {
+        domain: "myproject.test",
+        siteId: "site-123",
+        status: "stopped",
+      })
+    );
+    expect(html).toContain("Start Site");
+    expect(html).toContain("text-emerald-400");
+    expect(html).not.toContain("Stop Site");
+  });
+
+  it("omits Start/Stop button when siteId is not provided", () => {
+    (window as any).__TAURI__ = {};
+    const html = renderToString(
+      React.createElement(DesktopSiteActions, {
+        domain: "myproject.test",
+      })
+    );
+    expect(html).not.toContain("Start Site");
+    expect(html).not.toContain("Stop Site");
+  });
+
+  it("calls /sites/:id/stop and /sites/:id/start via toggleDesktopSiteStatus", async () => {
+    const postSpy = vi
+      .spyOn(api, "post")
+      .mockResolvedValueOnce({ status: "stopped" })
+      .mockResolvedValueOnce({ status: "active" });
+
+    const stoppedStatus = await toggleDesktopSiteStatus("site-123", "active");
+    expect(postSpy).toHaveBeenNthCalledWith(1, "/sites/site-123/stop", {});
+    expect(stoppedStatus).toBe("stopped");
+
+    const activeStatus = await toggleDesktopSiteStatus("site-123", "stopped");
+    expect(postSpy).toHaveBeenNthCalledWith(2, "/sites/site-123/start", {});
+    expect(activeStatus).toBe("active");
+
+    postSpy.mockRestore();
   });
 });

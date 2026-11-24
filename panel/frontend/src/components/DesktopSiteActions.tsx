@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useState } from "react";
+import { api } from "../api";
 import {
   isDesktopApp,
   openDesktopFolder,
@@ -7,9 +8,53 @@ import {
 
 export interface DesktopSiteActionsProps {
   domain: string;
+  siteId?: string;
+  status?: string;
   className?: string;
   onOpenExplorer?: () => void;
   onOpenVSCode?: () => void;
+  onStatusChange?: (newStatus: string) => void;
+  onError?: (message: string) => void;
+}
+
+/**
+ * Lucide-style Play icon
+ */
+export function PlayIcon({ className = "w-4 h-4" }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polygon points="6 3 20 12 6 21 6 3" />
+    </svg>
+  );
+}
+
+/**
+ * Lucide-style Square (Stop) icon
+ */
+export function SquareIcon({ className = "w-4 h-4" }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect width="14" height="14" x="5" y="5" rx="2" />
+    </svg>
+  );
 }
 
 /**
@@ -54,16 +99,117 @@ export function CodeIcon({ className = "w-4 h-4" }: { className?: string }) {
 }
 
 /**
+ * Calls the desktop site lifecycle endpoint to start or stop a site and returns
+ * the resulting status string.
+ */
+export async function toggleDesktopSiteStatus(
+  siteId: string,
+  currentStatus?: string
+): Promise<string> {
+  const isRunning = currentStatus === "active";
+  const endpoint = isRunning ? `/sites/${siteId}/stop` : `/sites/${siteId}/start`;
+  const fallbackStatus = isRunning ? "stopped" : "active";
+  const resp = await api.post<{ status?: string }>(endpoint, {});
+  return resp?.status || fallbackStatus;
+}
+
+/**
+ * Stateful Start/Stop toggle button kept in its own component so parent
+ * DesktopSiteActions remains hook-free when returning null outside desktop mode.
+ */
+function SiteLifecycleToggle({
+  siteId,
+  status,
+  onStatusChange,
+  onError,
+}: {
+  siteId: string;
+  status?: string;
+  onStatusChange?: (newStatus: string) => void;
+  onError?: (message: string) => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const isRunning = status === "active";
+
+  const handleToggleStatus = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (loading) return;
+
+    setLoading(true);
+    try {
+      const nextStatus = await toggleDesktopSiteStatus(siteId, status);
+      onStatusChange?.(nextStatus);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : `Failed to ${isRunning ? "stop" : "start"} site`;
+      onError?.(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleToggleStatus}
+      disabled={loading}
+      className={`p-1.5 rounded hover:bg-dark-700 transition-colors disabled:opacity-50 ${
+        isRunning
+          ? "text-red-400 hover:text-red-300"
+          : "text-emerald-400 hover:text-emerald-300"
+      }`}
+      title={isRunning ? "Stop Site" : "Start Site"}
+      aria-label={isRunning ? "Stop Site" : "Start Site"}
+    >
+      {loading ? (
+        <svg
+          className="w-4 h-4 animate-spin"
+          fill="none"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+        >
+          <circle
+            className="opacity-25"
+            cx="12"
+            cy="12"
+            r="10"
+            stroke="currentColor"
+            strokeWidth="4"
+          />
+          <path
+            className="opacity-75"
+            fill="currentColor"
+            d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+          />
+        </svg>
+      ) : isRunning ? (
+        <SquareIcon className="w-4 h-4" />
+      ) : (
+        <PlayIcon className="w-4 h-4" />
+      )}
+    </button>
+  );
+}
+
+/**
  * DesktopSiteActions
  *
- * Renders native desktop quick actions ("Open in Explorer" and "Open in VS Code")
- * for a given site domain. Only renders when running in desktop mode (Tauri/Vite desktop).
+ * Renders native desktop quick actions ("Start/Stop Site", "Open in Explorer",
+ * and "Open in VS Code") for a given site. Only renders when running in desktop
+ * mode (Tauri/Vite desktop).
  */
 export default function DesktopSiteActions({
   domain,
+  siteId,
+  status,
   className = "",
   onOpenExplorer,
   onOpenVSCode,
+  onStatusChange,
+  onError,
 }: DesktopSiteActionsProps) {
   if (!isDesktopApp()) {
     return null;
@@ -85,6 +231,14 @@ export default function DesktopSiteActions({
 
   return (
     <div className={`inline-flex items-center gap-1 ${className}`}>
+      {siteId && (
+        <SiteLifecycleToggle
+          siteId={siteId}
+          status={status}
+          onStatusChange={onStatusChange}
+          onError={onError}
+        />
+      )}
       <button
         type="button"
         onClick={handleOpenExplorer}

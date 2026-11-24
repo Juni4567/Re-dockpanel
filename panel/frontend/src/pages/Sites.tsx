@@ -98,6 +98,30 @@ export default function Sites() {
     setTimeout(() => setCopiedDomain(null), 2000);
   };
 
+  const handleSiteStatusChange = (siteId: string, newStatus: string) => {
+    setSites((prev) =>
+      prev.map((s) => (s.id === siteId ? { ...s, status: newStatus } : s))
+    );
+  };
+
+  const renderStatusBadge = (site: Site) => {
+    const badge =
+      site.enabled === false
+        ? { classes: "bg-warn-500/10 text-warn-400", dot: "bg-warn-400", label: "disabled" }
+        : site.status === "active"
+        ? { classes: statusColors.active, dot: "bg-emerald-400", label: "Running" }
+        : site.status === "stopped"
+        ? { classes: statusColors.stopped, dot: "bg-dark-400", label: "Stopped" }
+        : { classes: statusColors[site.status] || "bg-dark-700 text-dark-200", dot: "bg-current", label: site.status };
+
+    return (
+      <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${badge.classes}`}>
+        <span className={`w-1.5 h-1.5 rounded-full ${badge.dot}`} />
+        {badge.label}
+      </span>
+    );
+  };
+
   const effectiveDomain = isDesktopApp() ? formatDesktopDomain(domain, domainSuffix) : domain;
 
   // Preflight the domain as it is typed. Nothing here BLOCKS creation — a site
@@ -727,6 +751,10 @@ export default function Sites() {
 
                             <div className="space-y-1.5 text-xs text-dark-200 mb-4">
                               <div className="flex items-center justify-between">
+                                <span className="text-dark-300">Status:</span>
+                                {renderStatusBadge(site)}
+                              </div>
+                              <div className="flex items-center justify-between">
                                 <span className="text-dark-300">Runtime:</span>
                                 <span className="font-mono text-dark-100">{runtimeLabels[site.runtime] || site.runtime}</span>
                               </div>
@@ -791,7 +819,13 @@ export default function Sites() {
                                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                                     </svg>
                                   </button>
-                                  <DesktopSiteActions domain={site.domain} />
+                                  <DesktopSiteActions
+                                    domain={site.domain}
+                                    siteId={site.id}
+                                    status={site.status}
+                                    onStatusChange={(newStatus) => handleSiteStatusChange(site.id, newStatus)}
+                                    onError={setError}
+                                  />
                                 </>
                               )}
                             </div>
@@ -904,11 +938,7 @@ export default function Sites() {
                           </td>
                           <td className="px-4 py-4 whitespace-nowrap">
                             <div className="flex items-center gap-1.5">
-                              <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${
-                                site.enabled === false ? "bg-warn-500/10 text-warn-400" : statusColors[site.status] || "bg-dark-700 text-dark-200"
-                              }`}>
-                                {site.enabled === false ? "disabled" : site.status}
-                              </span>
+                              {renderStatusBadge(site)}
                               {site.ssl_enabled ? (
                                 <span className="inline-flex items-center text-rust-400" title="SSL Active">
                                   <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
@@ -960,7 +990,13 @@ export default function Sites() {
                                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                                     </svg>
                                   </button>
-                                  <DesktopSiteActions domain={site.domain} />
+                                  <DesktopSiteActions
+                                    domain={site.domain}
+                                    siteId={site.id}
+                                    status={site.status}
+                                    onStatusChange={(newStatus) => handleSiteStatusChange(site.id, newStatus)}
+                                    onError={setError}
+                                  />
                                 </>
                               )}
                             </div>
