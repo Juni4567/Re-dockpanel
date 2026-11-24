@@ -4,6 +4,14 @@ version = "2.248.5"
 license = "AGPL-3.0-only"
 edition = "2024"
 
+[lib]
+name = "dockpanel_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dockpanel-api"
+path = "src/main.rs"
+
 [profile.release]
 strip = true
 lto = "thin"
@@ -49,7 +57,6 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 subtle = "2"
 rustls = "0.23"
 regex = "1"
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 # WebAuthn / Passkey support
 ciborium = "0.2"
 p256 = { version = "0.13", features = ["ecdsa"] }
@@ -59,3 +66,6 @@ hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 # Phase 4 W2: render runbook markdown into HTML for email payloads.
 pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }

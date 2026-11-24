@@ -8,7 +8,18 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::net::UnixStream;
+
+#[cfg(not(unix))]
+struct UnixStream;
+#[cfg(not(unix))]
+impl UnixStream {
+    async fn connect(_path: &str) -> Result<tokio::io::DuplexStream, std::io::Error> {
+        let (client, _server) = tokio::io::duplex(64);
+        Ok(client)
+    }
+}
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 

@@ -160,6 +160,138 @@ pub async fn setup(
     ))
 }
 
+/// Check if an IP address string is a local loopback address (127.0.0.1, ::1, localhost).
+pub fn is_loopback_ip(ip_str: &str) -> bool {
+    let s = ip_str.trim();
+    if s == "127.0.0.1" || s == "::1" || s == "localhost" {
+        return true;
+    }
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
+/// Extract client IP from request headers (prefers X-Real-IP, then X-Forwarded-For).
+pub fn extract_bootstrap_client_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-real-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+}
+
+/// Verify desktop bootstrap security constraints:
+/// 1. DESKTOP_MODE environment variable must be "true".
+/// 2. Client IP must be a loopback address.
+pub fn verify_desktop_bootstrap_guards(headers: &HeaderMap) -> Result<String, ApiError> {
+    let desktop_mode = std::env::var("DESKTOP_MODE").unwrap_or_default();
+    if desktop_mode != "true" {
+        return Err(err(StatusCode::FORBIDDEN, "Desktop mode is not enabled"));
+    }
+
+    let ip = extract_bootstrap_client_ip(headers).unwrap_or_else(|| "unknown".to_string());
+    if !is_loopback_ip(&ip) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "Desktop bootstrap only allowed from local loopback",
+        ));
+    }
+
+    Ok(ip)
+}
+
+/// POST /api/auth/desktop-bootstrap — Frictionless loopback authentication for desktop app.
+///
+/// Restricted to desktop mode (`DESKTOP_MODE=true`) and local loopback IP calls (`127.0.0.1` or `::1`).
+/// Returns an authenticated admin session token, cookie, and user payload.
+/// If no admin exists yet (e.g. freshly initialized micro-instance), automatically seeds the default
+/// local desktop admin user (`local@dockpanel.desktop`).
+pub async fn desktop_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, [(header::HeaderName, String); 1], Json<serde_json::Value>), ApiError> {
+    let ip = verify_desktop_bootstrap_guards(&headers)?;
+
+    // Query existing admin user, or auto-seed default local desktop admin if none exists
+    let admin_opt: Option<User> = sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE role = 'admin' ORDER BY created_at ASC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("query admin user", e))?;
+
+    let admin_user = match admin_opt {
+        Some(u) => u,
+        None => {
+            let salt = SaltString::generate(&mut OsRng);
+            let dummy_password = uuid::Uuid::new_v4().to_string();
+            let hash = Argon2::default()
+                .hash_password(dummy_password.as_bytes(), &salt)
+                .map_err(|e| internal_error("hash desktop admin password", e))?
+                .to_string();
+
+            let inserted: Option<User> = sqlx::query_as::<_, User>(
+                "INSERT INTO users (email, password_hash, role, email_verified) \
+                 SELECT $1, $2, 'admin', TRUE \
+                 WHERE NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin') \
+                 RETURNING *",
+            )
+            .bind("local@dockpanel.desktop")
+            .bind(&hash)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("seed desktop admin user", e))?;
+
+            match inserted {
+                Some(u) => {
+                    tracing::info!("Auto-seeded local desktop admin: {}", u.email);
+                    u
+                }
+                None => {
+                    sqlx::query_as::<_, User>(
+                        "SELECT * FROM users WHERE role = 'admin' ORDER BY created_at ASC LIMIT 1",
+                    )
+                    .fetch_one(&state.db)
+                    .await
+                    .map_err(|e| internal_error("fetch desktop admin user", e))?
+                }
+            }
+        }
+    };
+
+    let (token, cookie, jti) = issue_session_pub(&state, &admin_user, &headers)?;
+
+    // Record session
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let _ = sqlx::query(
+        "INSERT INTO user_sessions (user_id, jti, ip_address, user_agent) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(admin_user.id)
+    .bind(&jti)
+    .bind(&ip)
+    .bind(&user_agent)
+    .execute(&state.db)
+    .await;
+
+    Ok((
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({
+            "token": token,
+            "user": {
+                "id": admin_user.id,
+                "email": admin_user.email,
+                "role": admin_user.role,
+            }
+        })),
+    ))
+}
+
 /// POST /api/auth/login — Authenticate and return JWT in HttpOnly cookie.
 pub async fn login(
     State(state): State<AppState>,
@@ -2168,5 +2300,122 @@ mod login_credential_tests {
         assert!(Argon2::default()
             .verify_password(b"whatever-the-caller-typed", &parsed)
             .is_err());
+    }
+
+    // ── Desktop Bootstrap Tests ──
+
+    static TEST_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn test_is_loopback_ip_validates_correctly() {
+        assert!(is_loopback_ip("127.0.0.1"));
+        assert!(is_loopback_ip("127.0.0.2"));
+        assert!(is_loopback_ip("::1"));
+        assert!(is_loopback_ip("localhost"));
+        assert!(is_loopback_ip("  127.0.0.1  "));
+
+        assert!(!is_loopback_ip("192.168.1.1"));
+        assert!(!is_loopback_ip("10.0.0.1"));
+        assert!(!is_loopback_ip("8.8.8.8"));
+        assert!(!is_loopback_ip("unknown"));
+        assert!(!is_loopback_ip(""));
+    }
+
+    #[test]
+    fn test_verify_desktop_bootstrap_guards_rejected_when_desktop_mode_disabled() {
+        let _guard = test_env_lock();
+        unsafe { std::env::remove_var("DESKTOP_MODE"); }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+
+        let res = verify_desktop_bootstrap_guards(&headers);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1.0["error"], "Desktop mode is not enabled");
+    }
+
+    #[test]
+    fn test_verify_desktop_bootstrap_guards_rejected_when_non_loopback_ip() {
+        let _guard = test_env_lock();
+        unsafe { std::env::set_var("DESKTOP_MODE", "true"); }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "192.168.1.100".parse().unwrap());
+
+        let res = verify_desktop_bootstrap_guards(&headers);
+        unsafe { std::env::remove_var("DESKTOP_MODE"); }
+
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1.0["error"], "Desktop bootstrap only allowed from local loopback");
+    }
+
+    #[test]
+    fn test_verify_desktop_bootstrap_guards_rejected_when_ip_header_missing() {
+        let _guard = test_env_lock();
+        unsafe { std::env::set_var("DESKTOP_MODE", "true"); }
+
+        let headers = HeaderMap::new();
+        let res = verify_desktop_bootstrap_guards(&headers);
+        unsafe { std::env::remove_var("DESKTOP_MODE"); }
+
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1.0["error"], "Desktop bootstrap only allowed from local loopback");
+    }
+
+    #[test]
+    fn test_verify_desktop_bootstrap_guards_succeeds_for_ipv4_loopback() {
+        let _guard = test_env_lock();
+        unsafe { std::env::set_var("DESKTOP_MODE", "true"); }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+
+        let res = verify_desktop_bootstrap_guards(&headers);
+        unsafe { std::env::remove_var("DESKTOP_MODE"); }
+
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_verify_desktop_bootstrap_guards_succeeds_for_ipv6_loopback() {
+        let _guard = test_env_lock();
+        unsafe { std::env::set_var("DESKTOP_MODE", "true"); }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "::1".parse().unwrap());
+
+        let res = verify_desktop_bootstrap_guards(&headers);
+        unsafe { std::env::remove_var("DESKTOP_MODE"); }
+
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "::1");
+    }
+
+    #[test]
+    fn test_verify_desktop_bootstrap_guards_falls_back_to_x_forwarded_for() {
+        let _guard = test_env_lock();
+        unsafe { std::env::set_var("DESKTOP_MODE", "true"); }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "127.0.0.1, 10.0.0.1".parse().unwrap());
+
+        let res = verify_desktop_bootstrap_guards(&headers);
+        unsafe { std::env::remove_var("DESKTOP_MODE"); }
+
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "127.0.0.1");
     }
 }

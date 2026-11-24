@@ -2042,6 +2042,7 @@ pub fn classify_canary(path: &str) -> (CanaryState, Option<std::fs::Metadata>) {
 }
 
 async fn security_check_canary_files(pool: &PgPool) {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
     let canary_paths = CANARY_WATCH_PATHS;
@@ -2064,7 +2065,7 @@ async fn security_check_canary_files(pool: &PgPool) {
     let mut absent: Vec<&str> = Vec::new();
 
     for path in &canary_paths {
-        let meta = match classify_canary(path) {
+        let _meta = match classify_canary(path) {
             (CanaryState::Watching, Some(m)) => m,
             (state, _) => {
                 match state {
@@ -2081,8 +2082,15 @@ async fn security_check_canary_files(pool: &PgPool) {
         };
         examined += 1;
 
-        let atime = meta.atime();
-        let _mtime = meta.mtime();
+        #[cfg(unix)]
+        let atime = _meta.atime();
+        #[cfg(not(unix))]
+        let atime = 0i64;
+
+        #[cfg(unix)]
+        let _mtime = _meta.mtime();
+        #[cfg(not(unix))]
+        let _mtime = 0i64;
 
         // If accessed more recently than modified, someone read it
         // (mtime is set when we create it; atime changes on read)

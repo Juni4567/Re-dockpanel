@@ -1075,6 +1075,7 @@ pub fn router() -> Router<AppState> {
         // Auth
         .route("/api/auth/setup-status", get(auth::setup_status))
         .route("/api/auth/setup", post(auth::setup))
+        .route("/api/auth/desktop-bootstrap", post(auth::desktop_bootstrap))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
