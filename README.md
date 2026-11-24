@@ -92,6 +92,15 @@ This fork (`Re-dockpanel`) includes key production improvements, bug fixes, and 
 - Integrated Certbot automation issues and renews Let's Encrypt SSL certificates.
 - Seamless dual-port SNI routing: port 80 automatic HTTP→HTTPS redirect, standard port 443 HTTPS access, and port 8443 direct IP fallback.
 
+### 11. 🖥️ DockPanel Desktop (Local WordPress & PHP Development Environment)
+- **Tauri v2 + WSL2 Micro-Distro**: Native Windows workstation app providing exact Linux parity (Nginx, PHP 8.1–8.4 FPM, MariaDB, PostgreSQL, Mailpit) running directly inside native ext4 storage.
+- **Zero-UAC Local Domains**: Seamless `.test` and `.local` domain resolution via background Windows Named Pipe Host Helper (`dockpanel-host-helper`) without annoying Windows UAC popups.
+- **Locally-Trusted Green-Padlock HTTPS**: Out-of-the-box local Root CA (`mkcert`) wildcard SSL certificates for all local sites in Chrome, Edge, and Firefox.
+- **High-Speed ext4 Filesystem Access**: Direct access to site roots via Windows UNC paths (`\\wsl.localhost\dockpanel-desktop\var\www\<domain>`) with 1-click **"Open in Explorer"** and **"Open in VS Code"** dashboard actions.
+- **Bidirectional Live Server Synchronization**: Push to or pull from remote VPS servers with serialized PHP database domain rewriting and automated pre-flight remote safety snapshots.
+- **Offline Inno Setup Installer**: Standalone Windows installer bundling the micro-distro container archive, binaries, and local CA tools.
+- *For complete architecture, guides, and build steps, see [**docs/desktop/README.md**](docs/desktop/README.md).*
+
 ---
 
 ## Upstream Attribution
@@ -383,6 +392,7 @@ sudo bash /opt/dockpanel/scripts/uninstall.sh   # Remove
 
 ## Documentation
 
+- [DockPanel Desktop Guide](docs/desktop/README.md) — Local development environment with WSL2, zero-UAC domains, and live sync
 - [Live Docs](https://docs.dockpanel.dev) — Getting started, guides, configuration
 - [How DockPanel is tested](https://docs.dockpanel.dev/testing.html) — The fresh-VPS drills, what they found, and what is still broken
 - [FEATURES.md](FEATURES.md) — Complete feature manifest (60+ features, ~280 capabilities)
