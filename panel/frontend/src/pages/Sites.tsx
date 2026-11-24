@@ -10,6 +10,7 @@ import PhpVersionPicker from "../components/PhpVersionPicker";
 import SiteThumbnail from "../components/SiteThumbnail";
 import SiteFavicon from "../components/SiteFavicon";
 import DesktopSiteActions from "../components/DesktopSiteActions";
+import LiveSyncModal from "../components/LiveSyncModal";
 import { isDesktopApp, formatDesktopDomain } from "../utils/desktop";
 import { useAuth } from "../context/AuthContext";
 
@@ -71,6 +72,7 @@ export default function Sites() {
   const [transferEmail, setTransferEmail] = useState("");
   const [transferring, setTransferring] = useState(false);
   const [notice, setNotice] = useState("");
+  const [syncSite, setSyncSite] = useState<Site | null>(null);
 
   // Form state
   const [domain, setDomain] = useState("");
@@ -778,7 +780,20 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
                                 </svg>
                               </Link>
-                              {isDesktopApp() && <DesktopSiteActions domain={site.domain} />}
+                              {isDesktopApp() && (
+                                <>
+                                  <button
+                                    onClick={() => setSyncSite(site)}
+                                    className="p-1.5 rounded hover:bg-dark-700 text-dark-300 hover:text-dark-100 transition-colors"
+                                    title="Live Server Sync (Push / Pull)"
+                                  >
+                                    <svg className="w-4 h-4 text-accent-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                  </button>
+                                  <DesktopSiteActions domain={site.domain} />
+                                </>
+                              )}
                             </div>
                             <Link
                               to={`/sites/${site.id}`}
@@ -934,7 +949,20 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
                                 </svg>
                               </Link>
-                              {isDesktopApp() && <DesktopSiteActions domain={site.domain} />}
+                              {isDesktopApp() && (
+                                <>
+                                  <button
+                                    onClick={() => setSyncSite(site)}
+                                    className="p-1.5 rounded hover:bg-dark-700 text-dark-300 hover:text-dark-100 transition-colors"
+                                    title="Live Server Sync (Push / Pull)"
+                                  >
+                                    <svg className="w-4 h-4 text-accent-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                  </button>
+                                  <DesktopSiteActions domain={site.domain} />
+                                </>
+                              )}
                             </div>
                           </td>
                           {allSites && (
@@ -1029,6 +1057,13 @@ export default function Sites() {
             </div>
           </div>
         </div>
+      )}
+      {syncSite && (
+        <LiveSyncModal
+          site={syncSite}
+          isOpen={!!syncSite}
+          onClose={() => setSyncSite(null)}
+        />
       )}
       </div>
     </div>

@@ -22,6 +22,7 @@ pub mod files;
 pub mod incidents;
 pub mod git_deploys;
 pub mod logs;
+pub mod live_sync;
 pub mod mail;
 pub mod metrics;
 pub mod monitors;
@@ -1146,6 +1147,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/app/status", get(sites::app_status))
         .route("/api/sites/{id}/app/action", post(sites::app_action))
         .route("/api/sites/{id}/app/logs", get(sites::app_logs))
+        // Live server push/pull synchronization
+        .route("/api/sites/{id}/sync/preflight", post(live_sync::preflight))
+        .route("/api/sites/{id}/sync/pull", post(live_sync::pull))
+        .route("/api/sites/{id}/sync/push", post(live_sync::push))
         // PHP versions
         .route("/api/php/versions", get(sites::php_versions))
         .route("/api/php/install", post(sites::php_install))

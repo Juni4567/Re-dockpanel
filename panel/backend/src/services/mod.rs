@@ -12,6 +12,7 @@ pub mod chain_report;
 pub mod deploy_scheduler;
 pub mod domain_claim;
 pub mod drift;
+pub mod live_sync;
 pub mod drill_scheduler;
 pub mod traffic_accounting_scheduler;
 pub mod email;
