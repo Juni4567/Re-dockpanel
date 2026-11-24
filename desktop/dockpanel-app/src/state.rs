@@ -26,8 +26,120 @@ pub struct AppState {
     pub data: Arc<Mutex<AppData>>,
     pub router_config: Arc<Mutex<RouterConfig>>,
     pub worker_ports: Arc<Mutex<HashMap<String, u16>>>,
+    pub worker_processes: Arc<Mutex<HashMap<String, std::process::Child>>>,
+    pub router_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     config_dir: PathBuf,
     sites_dir: PathBuf,
+}
+
+/// Finds an available loopback TCP port.
+pub fn find_available_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok().map(|addr| addr.port()))
+}
+
+/// Finds a PHP CLI binary on the host machine.
+/// Searches:
+/// 1. C:\wamp64\bin\php\php*\php.exe (matching version_hint if supplied, or sorted descending by version)
+/// 2. PATH (using `where.exe php` on Windows or inspecting PATH env var)
+/// 3. Common Windows PHP paths (%USERPROFILE%\DockPanel\bin\php\php.exe, C:\php\php.exe, etc.)
+pub fn find_php_binary(version_hint: Option<&str>) -> Option<PathBuf> {
+    // 1. Check C:\wamp64\bin\php\
+    let wamp_php_dir = Path::new(r"C:\wamp64\bin\php");
+    if wamp_php_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(wamp_php_dir) {
+            let mut php_dirs: Vec<(String, PathBuf)> = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let exe = path.join("php.exe");
+                    if exe.is_file() {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        php_dirs.push((name, exe));
+                    }
+                }
+            }
+
+            // Sort descending by directory name (e.g. php8.3.0 > php8.2.13 > php7.4.33)
+            php_dirs.sort_by(|a, b| b.0.cmp(&a.0));
+
+            // If version_hint is given, check for matching directory name
+            if let Some(hint) = version_hint {
+                let clean_hint = hint.trim().to_lowercase();
+                if let Some((_, exe)) = php_dirs.iter().find(|(name, _)| {
+                    name.to_lowercase().contains(&clean_hint)
+                }) {
+                    return Some(exe.clone());
+                }
+            }
+
+            // Fallback to highest WampServer version
+            if let Some((_, exe)) = php_dirs.first() {
+                return Some(exe.clone());
+            }
+        }
+    }
+
+    // 2. Check PATH
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        if let Ok(output) = std::process::Command::new("where.exe")
+            .arg("php")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            if output.status.success() {
+                let out_str = String::from_utf8_lossy(&output.stdout);
+                for line in out_str.lines() {
+                    let trimmed = line.trim();
+                    let p = PathBuf::from(trimmed);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("php.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // 3. Common Windows PHP directories
+    let common_paths = [
+        PathBuf::from(r"C:\php\php.exe"),
+        PathBuf::from(r"C:\tools\php\php.exe"),
+    ];
+    for p in common_paths {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let p = PathBuf::from(user_profile)
+            .join("DockPanel")
+            .join("bin")
+            .join("php")
+            .join("php.exe");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    None
 }
 
 impl AppState {
@@ -51,6 +163,8 @@ impl AppState {
             data: Arc::new(Mutex::new(data)),
             router_config: Arc::new(Mutex::new(router_config)),
             worker_ports: Arc::new(Mutex::new(HashMap::new())),
+            worker_processes: Arc::new(Mutex::new(HashMap::new())),
+            router_handle: Arc::new(Mutex::new(None)),
             config_dir,
             sites_dir,
         }
@@ -222,12 +336,187 @@ impl AppState {
         };
 
         if let Some(dom) = domain {
+            let clean = dom.trim().to_lowercase();
+            if let Ok(mut procs) = self.worker_processes.lock() {
+                if let Some(mut child) = procs.remove(&clean) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            self.remove_site_worker_port(&clean);
             self.save_data();
             Self::notify_host_helper("remove", &dom, "127.0.0.1");
             true
         } else {
             false
         }
+    }
+
+    pub fn spawn_php_worker(
+        &self,
+        domain: &str,
+        doc_root: &str,
+        php_version: Option<&str>,
+    ) -> Option<u16> {
+        let clean = domain.trim().to_lowercase();
+
+        // Check if existing worker is still alive
+        {
+            let mut procs = self.worker_processes.lock().unwrap();
+            if let Some(child) = procs.get_mut(&clean) {
+                match child.try_wait() {
+                    Ok(None) => {
+                        // Still running
+                        if let Some(port) = self.get_site_worker_port(&clean) {
+                            return Some(port);
+                        }
+                    }
+                    _ => {
+                        procs.remove(&clean);
+                    }
+                }
+            }
+        }
+
+        let php_exe = find_php_binary(php_version)?;
+        let worker_port = find_available_loopback_port()?;
+
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
+        #[cfg(windows)]
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let mut cmd = std::process::Command::new(&php_exe);
+        cmd.args(["-S", &format!("127.0.0.1:{}", worker_port), "-t", doc_root])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+
+        match cmd.spawn() {
+            Ok(child) => {
+                self.worker_processes
+                    .lock()
+                    .unwrap()
+                    .insert(clean.clone(), child);
+                self.set_site_worker_port(&clean, worker_port);
+                Some(worker_port)
+            }
+            Err(e) => {
+                eprintln!("Failed to spawn PHP worker for {}: {}", clean, e);
+                None
+            }
+        }
+    }
+
+    pub fn start_site(&self, id_or_domain: &str) -> Result<LocalSite, String> {
+        let clean = id_or_domain.trim().to_lowercase();
+        let site = {
+            let data = self.data.lock().unwrap();
+            data.sites
+                .iter()
+                .find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean)
+                .cloned()
+        };
+
+        let site = match site {
+            Some(s) => s,
+            None => return Err(format!("Site '{}' not found", id_or_domain)),
+        };
+
+        // If site uses PHP, spawn or ensure worker is running
+        self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+
+        // Update status to active
+        {
+            let mut data = self.data.lock().unwrap();
+            if let Some(s) = data.sites.iter_mut().find(|s| s.id == site.id) {
+                s.status = "active".to_string();
+            }
+        }
+        self.save_data();
+
+        // Notify host helper
+        Self::notify_host_helper("add", &site.domain, "127.0.0.1");
+
+        self.get_site(&site.id)
+            .ok_or_else(|| "Failed to retrieve updated site".to_string())
+    }
+
+    pub fn stop_site(&self, id_or_domain: &str) -> Result<LocalSite, String> {
+        let clean = id_or_domain.trim().to_lowercase();
+        let site = {
+            let data = self.data.lock().unwrap();
+            data.sites
+                .iter()
+                .find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean)
+                .cloned()
+        };
+
+        let site = match site {
+            Some(s) => s,
+            None => return Err(format!("Site '{}' not found", id_or_domain)),
+        };
+
+        // Terminate child worker process if exists
+        {
+            let mut procs = self.worker_processes.lock().unwrap();
+            if let Some(mut child) = procs.remove(&site.domain.to_lowercase()) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        self.remove_site_worker_port(&site.domain);
+
+        // Update status to stopped
+        {
+            let mut data = self.data.lock().unwrap();
+            if let Some(s) = data.sites.iter_mut().find(|s| s.id == site.id) {
+                s.status = "stopped".to_string();
+            }
+        }
+        self.save_data();
+
+        self.get_site(&site.id)
+            .ok_or_else(|| "Failed to retrieve updated site".to_string())
+    }
+
+    pub fn reconcile_active_sites(&self) {
+        let active_sites: Vec<LocalSite> = {
+            let data = self.data.lock().unwrap();
+            data.sites
+                .iter()
+                .filter(|s| s.status.eq_ignore_ascii_case("active"))
+                .cloned()
+                .collect()
+        };
+
+        for site in active_sites {
+            self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+            Self::notify_host_helper("add", &site.domain, "127.0.0.1");
+        }
+    }
+
+    pub fn stop_all_workers(&self) {
+        if let Ok(mut procs) = self.worker_processes.lock() {
+            for (_dom, mut child) in procs.drain() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        if let Ok(mut ports) = self.worker_ports.lock() {
+            ports.clear();
+        }
+    }
+
+    pub fn restart_site_router(&self, port: u16) {
+        let mut handle_guard = self.router_handle.lock().unwrap();
+        if let Some(old_handle) = handle_guard.take() {
+            old_handle.abort();
+        }
+        let handle = crate::router::start_site_router(Arc::new(self.clone()), port);
+        *handle_guard = Some(handle);
     }
 
     fn notify_host_helper(action: &str, domain: &str, ip: &str) {
@@ -304,6 +593,67 @@ mod tests {
         assert_eq!(state.get_site_worker_port("mysite.test"), None);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_site_start_stop_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_lifecycle_test_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir, sites_dir);
+
+        let site = state.create_site("lifecycle-test.local", Some("8.3"));
+        assert_eq!(site.status, "active");
+
+        let stopped = state.stop_site(&site.id).expect("Should stop site");
+        assert_eq!(stopped.status, "stopped");
+        assert_eq!(state.get_site(&site.id).unwrap().status, "stopped");
+
+        let started = state.start_site(&site.id).expect("Should start site");
+        assert_eq!(started.status, "active");
+        assert_eq!(state.get_site(&site.id).unwrap().status, "active");
+
+        let _ = state.stop_site(&site.id);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_find_php_binary() {
+        let php = find_php_binary(Some("8.3"));
+        if let Some(path) = php {
+            assert!(path.exists());
+            assert!(path.to_string_lossy().to_lowercase().contains("php"));
+        }
+    }
+
+    #[test]
+    fn test_reconcile_active_sites() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_reconcile_test_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir, sites_dir);
+
+        let site = state.create_site("reconcile-test.local", Some("8.3"));
+        assert_eq!(site.status, "active");
+
+        // Stop worker manually without changing status
+        if let Ok(mut procs) = state.worker_processes.lock() {
+            if let Some(mut child) = procs.remove("reconcile-test.local") {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        state.remove_site_worker_port("reconcile-test.local");
+        assert_eq!(state.get_site_worker_port("reconcile-test.local"), None);
+
+        // Reconcile should restart the worker if PHP is present
+        state.reconcile_active_sites();
+        if find_php_binary(Some("8.3")).is_some() {
+            assert!(state.get_site_worker_port("reconcile-test.local").is_some());
+        }
+
+        let _ = state.stop_site(&site.id);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
