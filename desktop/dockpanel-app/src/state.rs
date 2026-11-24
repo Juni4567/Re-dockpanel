@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,9 +23,9 @@ pub struct AppData {
 
 #[derive(Clone)]
 pub struct AppState {
-    data: Arc<Mutex<AppData>>,
-    #[allow(dead_code)]
-    router_config: Arc<Mutex<RouterConfig>>,
+    pub data: Arc<Mutex<AppData>>,
+    pub router_config: Arc<Mutex<RouterConfig>>,
+    pub worker_ports: Arc<Mutex<HashMap<String, u16>>>,
     config_dir: PathBuf,
     sites_dir: PathBuf,
 }
@@ -49,6 +50,7 @@ impl AppState {
         Self {
             data: Arc::new(Mutex::new(data)),
             router_config: Arc::new(Mutex::new(router_config)),
+            worker_ports: Arc::new(Mutex::new(HashMap::new())),
             config_dir,
             sites_dir,
         }
@@ -110,13 +112,42 @@ impl AppState {
     }
 
     pub fn get_site(&self, id: &str) -> Option<LocalSite> {
+        let clean = id.trim().to_lowercase();
         self.data
             .lock()
             .unwrap()
             .sites
             .iter()
-            .find(|s| s.id == id || s.domain == id)
+            .find(|s| s.id == id || s.domain.to_lowercase() == clean)
             .cloned()
+    }
+
+    pub fn update_site_status(&self, id_or_domain: &str, status: &str) -> bool {
+        let clean = id_or_domain.trim().to_lowercase();
+        let mut data = self.data.lock().unwrap();
+        if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
+            s.status = status.to_string();
+            drop(data);
+            self.save_data();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_site_worker_port(&self, domain: &str) -> Option<u16> {
+        let clean = domain.trim().to_lowercase();
+        self.worker_ports.lock().unwrap().get(&clean).copied()
+    }
+
+    pub fn set_site_worker_port(&self, domain: &str, port: u16) {
+        let clean = domain.trim().to_lowercase();
+        self.worker_ports.lock().unwrap().insert(clean, port);
+    }
+
+    pub fn remove_site_worker_port(&self, domain: &str) {
+        let clean = domain.trim().to_lowercase();
+        self.worker_ports.lock().unwrap().remove(&clean);
     }
 
     pub fn create_site(&self, domain: &str, php_version: Option<&str>) -> LocalSite {
@@ -251,6 +282,26 @@ mod tests {
         let content = fs::read_to_string(file).unwrap();
         let loaded: RouterConfig = serde_json::from_str(&content).unwrap();
         assert_eq!(loaded.active_port, 8080);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_worker_port_state_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_worker_test_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir, sites_dir);
+
+        assert_eq!(state.get_site_worker_port("mysite.test"), None);
+
+        state.set_site_worker_port("mysite.test", 9001);
+        assert_eq!(state.get_site_worker_port("mysite.test"), Some(9001));
+        // Case-insensitive check
+        assert_eq!(state.get_site_worker_port("MYSITE.TEST"), Some(9001));
+
+        state.remove_site_worker_port("mysite.test");
+        assert_eq!(state.get_site_worker_port("mysite.test"), None);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

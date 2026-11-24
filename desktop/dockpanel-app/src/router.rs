@@ -1,4 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use axum::http::StatusCode;
+use axum::response::Response;
+use crate::state::AppState;
 
 fn default_port_80() -> u16 {
     80
@@ -189,6 +194,398 @@ pub fn check_port_status(port: u16) -> PortStatus {
     }
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+fn sanitize_path(raw_path: &str) -> PathBuf {
+    let mut safe = PathBuf::new();
+    let trimmed = raw_path.trim_start_matches('/');
+    for comp in Path::new(trimmed).components() {
+        if let std::path::Component::Normal(c) = comp {
+            safe.push(c);
+        }
+    }
+    safe
+}
+
+fn render_not_found_page(domain: &str) -> Response {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Domain Not Registered - DockPanel</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+        .card {{ background: #1e293b; padding: 2.5rem; border-radius: 1rem; border: 1px solid #334155; text-align: center; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+        h1 {{ color: #f87171; margin-top: 0; font-size: 1.5rem; }}
+        p {{ color: #94a3b8; font-size: 1rem; line-height: 1.6; }}
+        .domain {{ color: #e2e8f0; font-weight: 600; font-family: monospace; background: #0f172a; padding: 0.2rem 0.5rem; border-radius: 0.375rem; }}
+        .badge {{ background: #dc2626; color: white; padding: 0.35rem 0.75rem; border-radius: 9999px; font-size: 0.875rem; font-weight: 600; display: inline-block; margin-top: 1rem; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Domain not registered in DockPanel</h1>
+        <p>The domain <span class="domain">{domain}</span> is not mapped to any site in DockPanel Desktop.</p>
+        <span class="badge">404 Not Found</span>
+    </div>
+</body>
+</html>"#,
+        domain = html_escape(domain)
+    );
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(axum::body::Body::from(html))
+        .unwrap()
+}
+
+fn render_stopped_page(domain: &str) -> Response {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{domain} - Site is Stopped</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+        .card {{ background: #1e293b; padding: 2.5rem; border-radius: 1rem; border: 1px solid #334155; text-align: center; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+        h1 {{ color: #f59e0b; margin-top: 0; font-size: 1.8rem; word-break: break-all; }}
+        h2 {{ color: #fbbf24; font-size: 1.25rem; margin-top: 0.5rem; }}
+        p {{ color: #94a3b8; font-size: 1rem; line-height: 1.6; margin-top: 1rem; }}
+        .badge {{ background: #d97706; color: white; padding: 0.35rem 0.75rem; border-radius: 9999px; font-size: 0.875rem; font-weight: 600; display: inline-block; margin-top: 1rem; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>{domain}</h1>
+        <h2>Site is Stopped</h2>
+        <p>This site is currently stopped in DockPanel Desktop. Click <strong>Start Site</strong> in DockPanel to activate.</p>
+        <span class="badge">Stopped</span>
+    </div>
+</body>
+</html>"#,
+        domain = html_escape(domain)
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(axum::body::Body::from(html))
+        .unwrap()
+}
+
+fn render_error_page(status: StatusCode, title: &str, message: &str) -> Response {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title} - DockPanel</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+        .card {{ background: #1e293b; padding: 2.5rem; border-radius: 1rem; border: 1px solid #334155; text-align: center; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+        h1 {{ color: #f87171; margin-top: 0; font-size: 1.5rem; }}
+        p {{ color: #94a3b8; font-size: 1rem; line-height: 1.6; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>{title}</h1>
+        <p>{message}</p>
+    </div>
+</body>
+</html>"#,
+        title = html_escape(title),
+        message = html_escape(message)
+    );
+    Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(axum::body::Body::from(html))
+        .unwrap()
+}
+
+async fn proxy_to_worker(
+    worker_port: u16,
+    target_path_and_query: &str,
+    req: axum::extract::Request,
+) -> Response {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default()
+    });
+
+    let (parts, body) = req.into_parts();
+    let url = format!("http://127.0.0.1:{}{}", worker_port, target_path_and_query);
+
+    let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(axum::body::Body::from("Invalid HTTP method"))
+                .unwrap();
+        }
+    };
+
+    let mut builder = CLIENT.request(method, &url);
+
+    let original_host = parts
+        .headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    for (name, val) in parts.headers.iter() {
+        if name != axum::http::header::HOST && name != axum::http::header::CONNECTION {
+            if let (Ok(hname), Ok(hval)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+                reqwest::header::HeaderValue::from_bytes(val.as_bytes()),
+            ) {
+                builder = builder.header(hname, hval);
+            }
+        }
+    }
+
+    if let Some(host_str) = &original_host {
+        if let Ok(hval) = reqwest::header::HeaderValue::from_str(host_str) {
+            builder = builder.header(reqwest::header::HOST, hval.clone());
+            builder = builder.header("x-forwarded-host", hval);
+        }
+    }
+    builder = builder.header("x-forwarded-proto", "http");
+    builder = builder.header("x-forwarded-for", "127.0.0.1");
+
+    let body_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(axum::body::Body::from(format!("Failed to read request body: {}", e)))
+                .unwrap();
+        }
+    };
+
+    if !body_bytes.is_empty() {
+        builder = builder.body(body_bytes);
+    }
+
+    match builder.send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+            let mut res_builder = Response::builder().status(status);
+
+            for (k, v) in resp.headers().iter() {
+                if k != reqwest::header::TRANSFER_ENCODING && k != reqwest::header::CONNECTION {
+                    if let (Ok(hk), Ok(hv)) = (
+                        axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
+                        axum::http::HeaderValue::from_bytes(v.as_bytes()),
+                    ) {
+                        res_builder = res_builder.header(hk, hv);
+                    }
+                }
+            }
+
+            match resp.bytes().await {
+                Ok(bytes) => res_builder.body(axum::body::Body::from(bytes)).unwrap(),
+                Err(e) => Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(axum::body::Body::from(format!("Error reading worker response: {}", e)))
+                    .unwrap(),
+            }
+        }
+        Err(e) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(axum::body::Body::from(format!(
+                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1><p>Error connecting to PHP worker: {}</p></body></html>",
+                html_escape(&e.to_string())
+            )))
+            .unwrap(),
+    }
+}
+
+pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppState>) -> Response {
+    // 1. Extract Host header. Strip port if present.
+    let host_header = match req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()) {
+        Some(h) if !h.trim().is_empty() => h.trim(),
+        _ => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(axum::body::Body::from("Bad Request: Missing Host header"))
+                .unwrap();
+        }
+    };
+
+    let domain = host_header.split(':').next().unwrap_or(host_header).trim();
+
+    // 2. Lookup site in AppState::get_site
+    let site = match state.get_site(domain) {
+        Some(s) => s,
+        None => {
+            // 3. Domain not registered in DockPanel
+            return render_not_found_page(domain);
+        }
+    };
+
+    // 4. If site status is "stopped"
+    if site.status.eq_ignore_ascii_case("stopped") {
+        return render_stopped_page(&site.domain);
+    }
+
+    // 5. Site status is active (or other non-stopped)
+    let uri_path = req.uri().path().to_string();
+    let path_and_query_str = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| uri_path.clone());
+    let safe_rel = sanitize_path(&uri_path);
+    let doc_root = PathBuf::from(&site.document_root);
+    let target_path = doc_root.join(&safe_rel);
+
+    let worker_port = state.get_site_worker_port(&site.domain);
+
+    // If path points to an existing file in site.document_root
+    if target_path.is_file() {
+        let is_php = target_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("php"))
+            .unwrap_or(false);
+
+        if is_php {
+            if let Some(port) = worker_port {
+                return proxy_to_worker(port, &path_and_query_str, req).await;
+            } else {
+                return render_error_page(
+                    StatusCode::BAD_GATEWAY,
+                    "PHP Worker Not Running",
+                    &format!("PHP worker is not running for site '{}'. Start the site in DockPanel.", site.domain),
+                );
+            }
+        } else {
+            // Serve static file with appropriate Content-Type header
+            let mime = mime_guess::from_path(&target_path).first_or_octet_stream();
+            let content_type = if mime.as_ref() == "text/html" {
+                "text/html; charset=utf-8"
+            } else {
+                mime.as_ref()
+            };
+
+            return match std::fs::read(&target_path) {
+                Ok(content) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, content_type)
+                    .body(axum::body::Body::from(content))
+                    .unwrap(),
+                Err(_) => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("File not found"))
+                    .unwrap(),
+            };
+        }
+    }
+
+    // If path is a directory (or "/")
+    if target_path.is_dir() || uri_path == "/" {
+        let index_php = target_path.join("index.php");
+        let index_html = target_path.join("index.html");
+
+        if index_php.is_file() {
+            if let Some(port) = worker_port {
+                let base_dir = if safe_rel.as_os_str().is_empty() {
+                    "".to_string()
+                } else {
+                    format!("/{}", safe_rel.to_string_lossy().replace('\\', "/").trim_matches('/'))
+                };
+
+                let target_pq = match req.uri().query() {
+                    Some(q) => format!("{}/index.php?{}", base_dir, q),
+                    None => format!("{}/index.php", base_dir),
+                };
+
+                return proxy_to_worker(port, &target_pq, req).await;
+            } else {
+                return render_error_page(
+                    StatusCode::BAD_GATEWAY,
+                    "PHP Worker Not Running",
+                    &format!("PHP worker is not running for site '{}'. Start the site in DockPanel.", site.domain),
+                );
+            }
+        } else if index_html.is_file() {
+            return match std::fs::read(&index_html) {
+                Ok(content) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(axum::body::Body::from(content))
+                    .unwrap(),
+                Err(_) => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("File not found"))
+                    .unwrap(),
+            };
+        } else if let Some(port) = worker_port {
+            return proxy_to_worker(port, &path_and_query_str, req).await;
+        } else {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(axum::body::Body::from("<!DOCTYPE html><html><body><h1>404 Not Found</h1><p>No index.php or index.html found in directory.</p></body></html>"))
+                .unwrap();
+        }
+    }
+
+    // Path does not exist as file or directory on disk
+    if let Some(port) = worker_port {
+        proxy_to_worker(port, &path_and_query_str, req).await
+    } else {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(axum::body::Body::from("<!DOCTYPE html><html><body><h1>404 Not Found</h1><p>The requested file does not exist.</p></body></html>"))
+            .unwrap()
+    }
+}
+
+pub fn start_site_router(state: Arc<AppState>, port: u16) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let state_clone = state.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let s = state_clone.clone();
+            async move { handle_router_request(req, s).await }
+        });
+
+        let bind_result = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(l) => Ok(l),
+            Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", port)).await,
+        };
+
+        match bind_result {
+            Ok(listener) => {
+                let _ = axum::serve(listener, app).await;
+            }
+            Err(e) => {
+                eprintln!("Failed to bind site router on port {}: {}", port, e);
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +667,233 @@ Active Connections
         let default_deser: RouterConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(default_deser.preferred_port, 80);
         assert_eq!(default_deser.active_port, 80);
+    }
+
+    #[tokio::test]
+    async fn test_stopped_site_returns_holding_page() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_test_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+        let _site = state.create_site("test-stopped.test", Some("8.3"));
+        // Mark site as stopped
+        {
+            let mut data = state.data.lock().unwrap();
+            if let Some(s) = data.sites.iter_mut().find(|s| s.domain == "test-stopped.test") {
+                s.status = "stopped".to_string();
+            }
+        }
+
+        let req = axum::http::Request::builder()
+            .header("host", "test-stopped.test:8080")
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = handle_router_request(req, state).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(body_str.contains("Site is Stopped"));
+        assert!(body_str.contains("DockPanel Desktop"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_domain_not_registered_returns_404() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_404_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+
+        let req = axum::http::Request::builder()
+            .header("host", "unregistered-domain.test")
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = handle_router_request(req, state).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(body_str.contains("Domain not registered in DockPanel"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_missing_host_header_returns_400() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_400_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = handle_router_request(req, state).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_active_site_serves_static_file() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_static_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+        let site = state.create_site("my-static-site.test", Some("8.3"));
+
+        // Add a custom css file
+        let css_path = Path::new(&site.document_root).join("style.css");
+        std::fs::write(&css_path, "body { background: purple; }").unwrap();
+
+        // 1. Test index.html on "/"
+        let req1 = axum::http::Request::builder()
+            .header("host", "my-static-site.test:80")
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp1 = handle_router_request(req1, state.clone()).await;
+        assert_eq!(resp1.status(), axum::http::StatusCode::OK);
+        assert_eq!(resp1.headers().get("content-type").unwrap(), "text/html; charset=utf-8");
+        let b1 = axum::body::to_bytes(resp1.into_body(), 1024 * 64).await.unwrap();
+        assert!(String::from_utf8_lossy(&b1).contains("my-static-site.test"));
+
+        // 2. Test style.css on "/style.css"
+        let req2 = axum::http::Request::builder()
+            .header("host", "my-static-site.test")
+            .uri("/style.css")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp2 = handle_router_request(req2, state).await;
+        assert_eq!(resp2.status(), axum::http::StatusCode::OK);
+        assert_eq!(resp2.headers().get("content-type").unwrap(), "text/css");
+        let b2 = axum::body::to_bytes(resp2.into_body(), 1024 * 64).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&b2), "body { background: purple; }");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_active_site_proxies_to_php_worker() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_php_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+        let site = state.create_site("php-test.test", Some("8.3"));
+
+        // Create index.php in document root
+        let php_file = Path::new(&site.document_root).join("index.php");
+        std::fs::write(&php_file, "<?php echo 'Mock PHP'; ?>").unwrap();
+
+        // Spawn mock PHP worker
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_port = mock_listener.local_addr().unwrap().port();
+
+        let mock_server = tokio::spawn(async move {
+            let mock_app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
+                let path = req.uri().to_string();
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header("x-mock-php", "true")
+                    .body(axum::body::Body::from(format!("Hello from PHP Worker at {}", path)))
+                    .unwrap()
+            });
+            let _ = axum::serve(mock_listener, mock_app).await;
+        });
+
+        // Set worker port in state
+        state.set_site_worker_port("php-test.test", mock_port);
+
+        // Send request to "/"
+        let req = axum::http::Request::builder()
+            .header("host", "php-test.test")
+            .uri("/?page=about")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = handle_router_request(req, state.clone()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(resp.headers().get("x-mock-php").unwrap(), "true");
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+        let body_str = String::from_utf8_lossy(&b);
+        assert!(body_str.contains("Hello from PHP Worker at /index.php?page=about"));
+
+        mock_server.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_active_site_worker_not_running_returns_502() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_502_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+        let site = state.create_site("no-worker.test", Some("8.3"));
+
+        // Create index.php
+        let php_file = Path::new(&site.document_root).join("index.php");
+        std::fs::write(&php_file, "<?php echo 'No worker'; ?>").unwrap();
+
+        // Do NOT set worker port
+
+        let req = axum::http::Request::builder()
+            .header("host", "no-worker.test")
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = handle_router_request(req, state).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+        assert!(String::from_utf8_lossy(&b).contains("PHP Worker Not Running"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_site_router_e2e() {
+        use std::sync::Arc;
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_e2e_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+        let _site = state.create_site("e2e-site.test", Some("8.3"));
+
+        // Find available port
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let handle = start_site_router(state.clone(), port);
+        // Wait briefly for server to bind
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/", port))
+            .header("host", "e2e-site.test")
+            .send()
+            .await
+            .expect("Failed to send request to site router");
+
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("e2e-site.test"));
+        assert!(body.contains("DockPanel Desktop"));
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
