@@ -1,3 +1,5 @@
+import { isDesktopApp, isServerOnlyPath } from "../utils/desktop";
+
 export interface NavItem {
   to: string;
   label: string;
@@ -18,6 +20,8 @@ export interface NavItem {
    * behaviour we want.
    */
   resellerOnly?: boolean;
+  /** Server-only navigation item pruned in local desktop mode */
+  serverOnly?: boolean;
 }
 
 export interface NavGroup {
@@ -37,9 +41,12 @@ export interface NavGroup {
  * 403s. A decision inlined in two menus is a decision that drifts.
  */
 export function isNavVisible(
-  item: Pick<NavItem, "adminOnly" | "resellerVisible" | "resellerOnly">,
+  item: Pick<NavItem, "adminOnly" | "resellerVisible" | "resellerOnly" | "serverOnly"> & { to?: string },
   role: string,
 ): boolean {
+  if (isDesktopApp() && (item.serverOnly || (item.to && isServerOnlyPath(item.to)))) {
+    return false;
+  }
   // Ahead of the admin branch, because it is the one kind of row "admin sees
   // everything" gets wrong: a tenant-scoped page has nothing to show an account
   // that is not a tenant, and the handler behind it says so with a 403.
@@ -59,14 +66,14 @@ export function isNavVisible(
  */
 export function navFlagsFor(
   path: string,
-): Pick<NavItem, "adminOnly" | "resellerVisible" | "resellerOnly"> {
+): Pick<NavItem, "adminOnly" | "resellerVisible" | "resellerOnly" | "serverOnly"> & { to?: string } {
   const base = path.split("?")[0];
   for (const group of navGroups) {
     for (const item of group.items) {
       if (item.to === base) return item;
     }
   }
-  return {};
+  return { to: base, serverOnly: isServerOnlyPath(base) };
 }
 
 export const navGroups: NavGroup[] = [
@@ -87,22 +94,22 @@ export const navGroups: NavGroup[] = [
     key: "reseller",
     label: "Reseller",
     items: [
-      { to: "/reseller", label: "Reseller Panel", iconName: "reseller", resellerVisible: true, resellerOnly: true },
-      { to: "/reseller/users", label: "My Users", iconName: "users", resellerVisible: true, resellerOnly: true },
+      { to: "/reseller", label: "Reseller Panel", iconName: "reseller", resellerVisible: true, resellerOnly: true, serverOnly: true },
+      { to: "/reseller/users", label: "My Users", iconName: "users", resellerVisible: true, resellerOnly: true, serverOnly: true },
       // The admin's half of this group. Everything an admin can do to a reseller
       // lives behind /api/resellers, which had eight handlers and no screen at
       // all until v2.118.0 — so the only reseller-shaped control the panel
       // offered an admin was the role dropdown in Users, which sets the role
       // without creating a profile and produces an account whose own panel
       // answers 404. This row is the door those handlers never had.
-      { to: "/resellers", label: "Resellers", iconName: "reseller", adminOnly: true },
+      { to: "/resellers", label: "Resellers", iconName: "reseller", adminOnly: true, serverOnly: true },
     ],
   },
   {
     key: "operations",
     label: "Operations",
     items: [
-      { to: "/dns", label: "DNS", iconName: "dns", adminOnly: true },
+      { to: "/dns", label: "DNS", iconName: "dns", adminOnly: true, serverOnly: true },
       { to: "/cdn", label: "CDN", iconName: "dns", adminOnly: true },
       // Unrestricted since v2.103.0, and the flag's absence is the whole point.
       // The backend admits a mail domain to whoever owns the site of the same
@@ -115,7 +122,7 @@ export const navGroups: NavGroup[] = [
       // or the other. What the page SHOWS is decided in Mail.tsx, per caller.
       { to: "/mail", label: "Mail", iconName: "mail" },
       { to: "/backup-orchestrator", label: "Backup Manager", iconName: "backups", adminOnly: true },
-      { to: "/monitoring", label: "Monitoring", iconName: "monitoring" },
+      { to: "/monitoring", label: "Monitoring", iconName: "monitoring", serverOnly: true },
       { to: "/notifications", label: "Notifications", iconName: "notifications" },
       { to: "/logs", label: "Logs", iconName: "logs", adminOnly: true },
       { to: "/terminal", label: "Terminal", iconName: "terminal" },
@@ -125,12 +132,12 @@ export const navGroups: NavGroup[] = [
     key: "admin",
     label: "Admin",
     items: [
-      { to: "/servers", label: "Servers", iconName: "servers", adminOnly: true },
+      { to: "/servers", label: "Servers", iconName: "servers", adminOnly: true, serverOnly: true },
       { to: "/users", label: "Users", iconName: "users", adminOnly: true },
       { to: "/container-policies", label: "Container Policies", iconName: "servers", adminOnly: true },
       { to: "/integrations", label: "Integrations", iconName: "extensions", adminOnly: true },
       { to: "/secrets", label: "Secrets", iconName: "secrets", adminOnly: true },
-      { to: "/security", label: "Security", iconName: "security", adminOnly: true },
+      { to: "/security", label: "Security", iconName: "security", adminOnly: true, serverOnly: true },
       { to: "/system", label: "System", iconName: "servers", adminOnly: true },
       { to: "/telemetry", label: "Telemetry", iconName: "monitoring", adminOnly: true },
       { to: "/settings", label: "Settings", iconName: "settings", adminOnly: true },
