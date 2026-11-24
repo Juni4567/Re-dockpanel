@@ -4,6 +4,8 @@ panel/backend/target/
 panel/cli/target/
 panel/mcp/target/
 desktop/**/target/
+*.WebView2/
+*.exe
 
 # Node.js
 panel/frontend/node_modules/

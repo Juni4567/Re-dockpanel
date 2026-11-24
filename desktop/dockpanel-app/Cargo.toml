@@ -1,0 +1,23 @@
+[package]
+name = "dockpanel-app"
+version = "2.248.5"
+edition = "2021"
+description = "DockPanel Desktop - Native Pure Rust Windows Application"
+
+[dependencies]
+tao = "0.30"
+wry = "0.47"
+rust-embed = "8"
+mime_guess = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+
+[build-dependencies]
+winres = "0.1"
+
+[[bin]]
+name = "dockpanel"
+path = "src/main.rs"
