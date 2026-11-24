@@ -11,6 +11,10 @@ import SiteThumbnail from "../components/SiteThumbnail";
 import SiteFavicon from "../components/SiteFavicon";
 import DesktopSiteActions from "../components/DesktopSiteActions";
 import LiveSyncModal from "../components/LiveSyncModal";
+import PortConflictModal, {
+  PortConflictInfo,
+  buildSiteExternalUrl,
+} from "../components/PortConflictModal";
 import { isDesktopApp, formatDesktopDomain } from "../utils/desktop";
 import { useAuth } from "../context/AuthContext";
 
@@ -73,6 +77,8 @@ export default function Sites() {
   const [transferring, setTransferring] = useState(false);
   const [notice, setNotice] = useState("");
   const [syncSite, setSyncSite] = useState<Site | null>(null);
+  const [conflictInfo, setConflictInfo] = useState<PortConflictInfo | null>(null);
+  const [showPortModal, setShowPortModal] = useState(false);
 
   // Form state
   const [domain, setDomain] = useState("");
@@ -96,6 +102,10 @@ export default function Sites() {
     navigator.clipboard.writeText(d);
     setCopiedDomain(d);
     setTimeout(() => setCopiedDomain(null), 2000);
+  };
+
+  const getSiteExternalUrl = (site: Site) => {
+    return buildSiteExternalUrl(site.domain, conflictInfo?.active_port, site.ssl_enabled);
   };
 
   const handleSiteStatusChange = (siteId: string, newStatus: string) => {
@@ -146,6 +156,11 @@ export default function Sites() {
   };
 
   useEffect(fetchSites, [allSites]);
+
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    api.get<PortConflictInfo>("/system/ports/conflict").then(setConflictInfo).catch(() => {});
+  }, []);
 
   // The transfer recipient is picked, not typed. A free-text email could only
   // ever fail late — `transfer` answers 404 "No account with that email" — and
@@ -291,6 +306,29 @@ export default function Sites() {
       </div>
 
       <div className="p-6 lg:p-8">
+
+      {isDesktopApp() && conflictInfo?.in_use && (
+        <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <span className="p-2 bg-amber-500/20 text-amber-400 rounded-lg shrink-0" aria-hidden="true">⚠️</span>
+            <div>
+              <p className="text-sm font-medium text-amber-200">
+                Port {conflictInfo.preferred_port} in use by {conflictInfo.display_name || conflictInfo.process_name || "another app"}.
+              </p>
+              <p className="text-xs text-amber-400/80">
+                Sites are currently being served on port {conflictInfo.active_port}.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowPortModal(true)}
+            className="px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-semibold rounded-lg transition-colors shrink-0"
+          >
+            Change Port
+          </button>
+        </div>
+      )}
 
       {error && (
         <div role="alert" className="bg-danger-500/10 text-danger-400 text-sm px-4 py-3 rounded-lg border border-danger-500/20 mb-4">
@@ -732,7 +770,7 @@ export default function Sites() {
                                   )}
                                 </button>
                                 <a
-                                  href={site.ssl_enabled ? `https://${site.domain}` : `http://${site.domain}`}
+                                  href={getSiteExternalUrl(site)}
                                   target="_blank"
                                   rel="noopener noreferrer"
                                   className="p-1 rounded text-dark-300 hover:text-dark-100 hover:bg-dark-700 transition-colors"
@@ -902,7 +940,7 @@ export default function Sites() {
                                     )}
                                   </button>
                                   <a
-                                    href={site.ssl_enabled ? `https://${site.domain}` : `http://${site.domain}`}
+                                    href={getSiteExternalUrl(site)}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="p-1 rounded text-dark-300 hover:text-dark-100 hover:bg-dark-700 transition-colors"
@@ -1101,6 +1139,22 @@ export default function Sites() {
           onClose={() => setSyncSite(null)}
         />
       )}
+      <PortConflictModal
+        isOpen={showPortModal}
+        onClose={() => setShowPortModal(false)}
+        conflictInfo={conflictInfo}
+        onResolved={(newPort) =>
+          setConflictInfo((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  active_port: newPort,
+                  in_use: newPort === prev.preferred_port ? false : prev.in_use,
+                }
+              : null
+          )
+        }
+      />
       </div>
     </div>
   );
