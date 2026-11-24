@@ -151,20 +151,31 @@ async fn port_conflict_handler(
 ) -> Json<serde_json::Value> {
     let cfg = state.get_router_config();
     let port = query.port.unwrap_or(cfg.preferred_port);
-    let status = router::check_port_status(port);
+    let mut status = router::check_port_status(port);
 
-    let display_name = status.process_name.as_ref().map(|name| {
-        let lower = name.to_lowercase();
-        if lower.contains("httpd") || lower.contains("apache") {
-            "Apache HTTP Server (WampServer)".to_string()
-        } else if lower.contains("nginx") {
-            "Nginx Web Server".to_string()
-        } else if lower == "system" || status.pid == Some(4) {
-            "Windows HTTP.sys (IIS / System)".to_string()
-        } else {
-            name.clone()
-        }
-    });
+    let my_pid = std::process::id();
+    if status.pid == Some(my_pid) {
+        status.in_use = false;
+        status.process_name = None;
+        status.pid = None;
+    }
+
+    let display_name = if !status.in_use {
+        None
+    } else {
+        status.process_name.as_ref().map(|name| {
+            let lower = name.to_lowercase();
+            if lower.contains("httpd") || lower.contains("apache") {
+                "Apache HTTP Server (WampServer)".to_string()
+            } else if lower.contains("nginx") {
+                "Nginx Web Server".to_string()
+            } else if lower == "system" || status.pid == Some(4) {
+                "Windows HTTP.sys (IIS / System)".to_string()
+            } else {
+                name.clone()
+            }
+        })
+    };
 
     Json(serde_json::json!({
         "preferred_port": cfg.preferred_port,
@@ -192,6 +203,16 @@ async fn port_resolve_handler(
     match payload.action.as_str() {
         "use_port" => {
             let target_port = payload.port.unwrap_or(8080);
+            let active = state.get_router_config().active_port;
+
+            if target_port != active && !router::is_port_bindable(target_port) {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "message": "Port is already in use"
+                }))
+                .into_response();
+            }
+
             state.set_router_port(target_port);
             state.restart_site_router(target_port);
 
@@ -216,6 +237,19 @@ async fn port_resolve_handler(
                         .into_response();
                 }
             };
+
+            let my_pid = std::process::id();
+            if pid == my_pid || pid == 0 || pid == 4 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "message": "Cannot terminate current process or system process"
+                    })),
+                )
+                    .into_response();
+            }
+
             let port = payload.port.unwrap_or(80);
 
             #[cfg(windows)]
@@ -780,6 +814,50 @@ mod tests {
         assert_eq!(resolve_resp.status(), StatusCode::OK);
         assert_eq!(state.get_router_config().active_port, 8080);
 
+        // POST resolve use_port on an occupied port returns success: false
+        let occupied_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_port = occupied_listener.local_addr().unwrap().port();
+
+        let occ_resp = port_resolve_handler(
+            State(state.clone()),
+            Json(PortResolvePayload {
+                action: "use_port".to_string(),
+                port: Some(occupied_port),
+                pid: None,
+            }),
+        )
+        .await;
+        assert_eq!(occ_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(occ_resp.into_body(), 1024 * 64).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["success"], false);
+        assert!(val["message"].as_str().unwrap().contains("already in use"));
+        drop(occupied_listener);
+
+        // POST resolve stop_process self PID returns 400 Bad Request
+        let self_pid_resp = port_resolve_handler(
+            State(state.clone()),
+            Json(PortResolvePayload {
+                action: "stop_process".to_string(),
+                port: Some(80),
+                pid: Some(std::process::id()),
+            }),
+        )
+        .await;
+        assert_eq!(self_pid_resp.status(), StatusCode::BAD_REQUEST);
+
+        // POST resolve stop_process system PID 4 returns 400 Bad Request
+        let sys_pid_resp = port_resolve_handler(
+            State(state.clone()),
+            Json(PortResolvePayload {
+                action: "stop_process".to_string(),
+                port: Some(80),
+                pid: Some(4),
+            }),
+        )
+        .await;
+        assert_eq!(sys_pid_resp.status(), StatusCode::BAD_REQUEST);
+
         // POST resolve unknown action returns 400 Bad Request
         let bad_resp = port_resolve_handler(
             State(state.clone()),
@@ -791,6 +869,23 @@ mod tests {
         )
         .await;
         assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+        // When checking a port held by current process, port_conflict_handler reports in_use == false
+        let self_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let self_port = self_listener.local_addr().unwrap().port();
+        let self_status = router::check_port_status(self_port);
+        if self_status.pid == Some(std::process::id()) {
+            let conflict_self = port_conflict_handler(
+                State(state.clone()),
+                axum::extract::Query(PortConflictQuery {
+                    port: Some(self_port),
+                }),
+            )
+            .await;
+            assert_eq!(conflict_self["in_use"], false);
+            assert!(conflict_self["process_name"].is_null());
+        }
+        drop(self_listener);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

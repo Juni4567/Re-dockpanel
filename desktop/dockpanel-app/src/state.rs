@@ -369,12 +369,26 @@ impl AppState {
                         // Still running
                         if let Some(port) = self.get_site_worker_port(&clean) {
                             return Some(port);
+                        } else {
+                            // Inconsistent state: child running without worker port, kill it
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            procs.remove(&clean);
                         }
                     }
                     _ => {
                         procs.remove(&clean);
                     }
                 }
+            }
+        }
+
+        // If an entry still exists in worker_processes for the domain, kill and wait on it before spawning
+        {
+            let mut procs = self.worker_processes.lock().unwrap();
+            if let Some(mut old_child) = procs.remove(&clean) {
+                let _ = old_child.kill();
+                let _ = old_child.wait();
             }
         }
 
@@ -396,10 +410,11 @@ impl AppState {
 
         match cmd.spawn() {
             Ok(child) => {
-                self.worker_processes
-                    .lock()
-                    .unwrap()
-                    .insert(clean.clone(), child);
+                let mut procs = self.worker_processes.lock().unwrap();
+                if let Some(mut old_child) = procs.insert(clean.clone(), child) {
+                    let _ = old_child.kill();
+                    let _ = old_child.wait();
+                }
                 self.set_site_worker_port(&clean, worker_port);
                 Some(worker_port)
             }
