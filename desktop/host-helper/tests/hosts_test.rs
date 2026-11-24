@@ -2,6 +2,7 @@ use dockpanel_host_helper::hosts_manager;
 use dockpanel_host_helper::protocol::{HelperRequest, HelperResponse, HostEntryInfo};
 use dockpanel_host_helper::server;
 use std::io::Write;
+use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 #[test]
@@ -160,6 +161,115 @@ fn test_server_process_request_str() {
     // Verify removed
     let list_after = server::process_request_str(r#"{"action": "list"}"#, Some(temp_path));
     assert_eq!(list_after.entries.expect("entries present").len(), 0);
+}
+
+#[test]
+fn test_validation_rejects_crlf_injection() {
+    let mut temp = NamedTempFile::new().expect("create temp file");
+    temp.write_all(b"127.0.0.1 localhost\n").expect("write initial");
+    let temp_path = temp.path();
+
+    // CRLF in domain
+    let resp = server::process_request_str(
+        r#"{"action": "add", "domain": "evil.test\r\n192.168.1.1 hijacked.com", "ip": "127.0.0.1"}"#,
+        Some(temp_path),
+    );
+    assert!(!resp.success);
+    assert!(resp.error.is_some());
+    let err = resp.error.unwrap();
+    assert!(err.contains("prohibited characters") || err.contains("invalid"));
+
+    // Plain LF in domain
+    let resp_lf = server::process_request_str(
+        r#"{"action": "add", "domain": "evil.test\nhijacked.com", "ip": "127.0.0.1"}"#,
+        Some(temp_path),
+    );
+    assert!(!resp_lf.success);
+}
+
+#[test]
+fn test_validation_rejects_invalid_ip() {
+    let mut temp = NamedTempFile::new().expect("create temp file");
+    temp.write_all(b"127.0.0.1 localhost\n").expect("write initial");
+    let temp_path = temp.path();
+
+    let resp = server::process_request_str(
+        r#"{"action": "add", "domain": "site.test", "ip": "999.999.999.999"}"#,
+        Some(temp_path),
+    );
+    assert!(!resp.success);
+    assert!(resp.error.expect("error present").contains("Invalid IP address"));
+
+    let resp2 = server::process_request_str(
+        r#"{"action": "add", "domain": "site.test", "ip": "not_an_ip; rm -rf /"}"#,
+        Some(temp_path),
+    );
+    assert!(!resp2.success);
+}
+
+#[test]
+fn test_validation_rejects_domain_with_spaces() {
+    let mut temp = NamedTempFile::new().expect("create temp file");
+    temp.write_all(b"127.0.0.1 localhost\n").expect("write initial");
+    let temp_path = temp.path();
+
+    let resp = server::process_request_str(
+        r#"{"action": "add", "domain": "site test.local", "ip": "127.0.0.1"}"#,
+        Some(temp_path),
+    );
+    assert!(!resp.success);
+    assert!(resp.error.is_some());
+}
+
+#[test]
+fn test_validation_rejects_domain_with_hash_comment() {
+    let mut temp = NamedTempFile::new().expect("create temp file");
+    temp.write_all(b"127.0.0.1 localhost\n").expect("write initial");
+    let temp_path = temp.path();
+
+    let resp = server::process_request_str(
+        r#"{"action": "add", "domain": "site.test#comment", "ip": "127.0.0.1"}"#,
+        Some(temp_path),
+    );
+    assert!(!resp.success);
+    assert!(resp.error.is_some());
+
+    let resp_remove = server::process_request_str(
+        r#"{"action": "remove", "domain": "site.test#comment"}"#,
+        Some(temp_path),
+    );
+    assert!(!resp_remove.success);
+}
+
+#[tokio::test]
+async fn test_mutex_concurrency_control() {
+    let temp = NamedTempFile::new().expect("create temp file");
+    let temp_path = temp.path().to_path_buf();
+    std::fs::write(&temp_path, "127.0.0.1 localhost\n").expect("write initial");
+
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    let mut handles = Vec::new();
+
+    // Launch 10 concurrent requests mutating hosts file
+    for i in 0..10 {
+        let path = temp_path.clone();
+        let l = lock.clone();
+        handles.push(tokio::spawn(async move {
+            let json = format!(r#"{{"action": "add", "domain": "site-{i}.test", "ip": "127.0.0.1"}}"#);
+            server::process_request_str_async(&json, Some(&path), &l).await
+        }));
+    }
+
+    for h in handles {
+        let resp = h.await.expect("join task");
+        assert!(resp.success);
+    }
+
+    // Verify all 10 entries are recorded in hosts file without loss
+    let content = std::fs::read_to_string(&temp_path).expect("read hosts");
+    for i in 0..10 {
+        assert!(content.contains(&format!("site-{i}.test")));
+    }
 }
 
 #[cfg(windows)]

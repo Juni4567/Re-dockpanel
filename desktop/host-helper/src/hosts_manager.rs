@@ -1,9 +1,56 @@
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 
 pub const DOCKPANEL_TAG: &str = "# dockpanel-desktop";
 pub const DEFAULT_HOSTS_PATH: &str = r"C:\Windows\System32\drivers\etc\hosts";
 pub const DEFAULT_IP: &str = "127.0.0.1";
+
+pub fn validate_ip(ip: &str) -> Result<IpAddr, String> {
+    let trimmed = ip.trim();
+    if trimmed.is_empty() {
+        return Err("IP address cannot be empty".to_string());
+    }
+    trimmed
+        .parse::<IpAddr>()
+        .map_err(|e| format!("Invalid IP address format: {e}"))
+}
+
+pub fn validate_domain(domain: &str) -> Result<&str, String> {
+    let d = domain.trim();
+    if d.is_empty() {
+        return Err("Domain cannot be empty".to_string());
+    }
+    if d.len() > 253 {
+        return Err("Domain cannot exceed 253 characters".to_string());
+    }
+    // Reject newlines, comments, slashes, whitespace, null bytes
+    if d.contains(|c: char| {
+        c == '\r' || c == '\n' || c == '#' || c == '/' || c == '\\' || c == '\0' || c.is_whitespace()
+    }) {
+        return Err(
+            "Domain contains prohibited characters (newlines, comments, slashes, null bytes, or whitespace)"
+                .to_string(),
+        );
+    }
+    // Strictly only valid hostname characters: a-z, A-Z, 0-9, ., -
+    if !d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        return Err(
+            "Domain contains invalid characters; only letters, digits, '.', and '-' are allowed"
+                .to_string(),
+        );
+    }
+    // Labels cannot be empty and cannot start or end with a hyphen
+    for label in d.split('.') {
+        if label.is_empty() {
+            return Err("Domain cannot contain empty labels or consecutive/leading/trailing dots".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("Domain label cannot start or end with a hyphen".to_string());
+        }
+    }
+    Ok(d)
+}
 
 pub fn is_dockpanel_line(line: &str) -> bool {
     line.to_ascii_lowercase().contains(DOCKPANEL_TAG)
@@ -23,6 +70,10 @@ pub fn line_matches_domain(line: &str, domain: &str) -> bool {
 }
 
 pub fn add_entry(hosts_content: &str, domain: &str, ip: &str) -> String {
+    if validate_domain(domain).is_err() || validate_ip(ip).is_err() {
+        return hosts_content.to_string();
+    }
+
     let domain = domain.trim();
     let ip = ip.trim();
     let is_crlf = hosts_content.contains("\r\n");
@@ -56,6 +107,10 @@ pub fn add_entry(hosts_content: &str, domain: &str, ip: &str) -> String {
 }
 
 pub fn remove_entry(hosts_content: &str, domain: &str) -> String {
+    if validate_domain(domain).is_err() {
+        return hosts_content.to_string();
+    }
+
     let domain = domain.trim();
     let is_crlf = hosts_content.contains("\r\n");
     let newline = if is_crlf { "\r\n" } else { "\n" };
@@ -113,7 +168,6 @@ pub fn write_hosts_file_atomic(path: Option<&Path>, content: &str) -> std::io::R
         let temp_path = parent.join(format!(".hosts.tmp.{}", unique_suffix));
         fs::write(&temp_path, content)?;
         if let Err(_) = fs::rename(&temp_path, target) {
-            // Fallback if atomic rename across filesystems or locked fails
             fs::write(target, content)?;
             let _ = fs::remove_file(&temp_path);
         }
@@ -124,12 +178,16 @@ pub fn write_hosts_file_atomic(path: Option<&Path>, content: &str) -> std::io::R
 }
 
 pub fn add_host_entry(path: Option<&Path>, domain: &str, ip: &str) -> std::io::Result<()> {
+    validate_domain(domain).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let validated_ip = validate_ip(ip).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let ip_str = validated_ip.to_string();
     let current = read_hosts_file(path).unwrap_or_default();
-    let updated = add_entry(&current, domain, ip);
+    let updated = add_entry(&current, domain, &ip_str);
     write_hosts_file_atomic(path, &updated)
 }
 
 pub fn remove_host_entry(path: Option<&Path>, domain: &str) -> std::io::Result<()> {
+    validate_domain(domain).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let current = read_hosts_file(path)?;
     let updated = remove_entry(&current, domain);
     write_hosts_file_atomic(path, &updated)
