@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod hosts_manager;
+pub mod router;
 mod state;
 
 use axum::{

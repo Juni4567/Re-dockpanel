@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use crate::router::RouterConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalSite {
@@ -22,6 +23,8 @@ pub struct AppData {
 #[derive(Clone)]
 pub struct AppState {
     data: Arc<Mutex<AppData>>,
+    #[allow(dead_code)]
+    router_config: Arc<Mutex<RouterConfig>>,
     config_dir: PathBuf,
     sites_dir: PathBuf,
 }
@@ -34,18 +37,24 @@ impl AppState {
         let user_profile = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
         let sites_dir = PathBuf::from(user_profile).join("DockPanel").join("sites");
 
+        Self::new_with_dirs(config_dir, sites_dir)
+    }
+
+    pub fn new_with_dirs(config_dir: PathBuf, sites_dir: PathBuf) -> Self {
         let _ = fs::create_dir_all(&config_dir);
         let _ = fs::create_dir_all(&sites_dir);
 
         let data = Self::load_data(&config_dir);
+        let router_config = Self::load_router_config(&config_dir);
         Self {
             data: Arc::new(Mutex::new(data)),
+            router_config: Arc::new(Mutex::new(router_config)),
             config_dir,
             sites_dir,
         }
     }
 
-    fn load_data(config_dir: &PathBuf) -> AppData {
+    fn load_data(config_dir: &Path) -> AppData {
         let file = config_dir.join("sites.json");
         if let Ok(content) = fs::read_to_string(file) {
             serde_json::from_str(&content).unwrap_or_default()
@@ -61,6 +70,39 @@ impl AppState {
                 let _ = fs::write(file, json);
             }
         }
+    }
+
+    fn load_router_config(config_dir: &Path) -> RouterConfig {
+        let file = config_dir.join("router_config.json");
+        if let Ok(content) = fs::read_to_string(file) {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            RouterConfig::default()
+        }
+    }
+
+    #[allow(dead_code)]
+    fn save_router_config(&self) {
+        let file = self.config_dir.join("router_config.json");
+        if let Ok(cfg) = self.router_config.lock() {
+            if let Ok(json) = serde_json::to_string_pretty(&*cfg) {
+                let _ = fs::write(file, json);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_router_config(&self) -> RouterConfig {
+        self.router_config.lock().unwrap().clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn set_router_port(&self, port: u16) {
+        {
+            let mut cfg = self.router_config.lock().unwrap();
+            cfg.active_port = port;
+        }
+        self.save_router_config();
     }
 
     pub fn list_sites(&self) -> Vec<LocalSite> {
@@ -180,3 +222,37 @@ impl AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_router_config_state_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_test_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir.clone(), sites_dir);
+
+        // Default config
+        let cfg = state.get_router_config();
+        assert_eq!(cfg.preferred_port, 80);
+        assert_eq!(cfg.active_port, 80);
+
+        // Mutate port
+        state.set_router_port(8080);
+        let updated = state.get_router_config();
+        assert_eq!(updated.preferred_port, 80);
+        assert_eq!(updated.active_port, 8080);
+
+        // Check persisted file
+        let file = config_dir.join("router_config.json");
+        assert!(file.exists());
+        let content = fs::read_to_string(file).unwrap();
+        let loaded: RouterConfig = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.active_port, 8080);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}
+
