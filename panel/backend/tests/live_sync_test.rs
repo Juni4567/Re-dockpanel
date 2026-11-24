@@ -86,6 +86,19 @@ fn test_database_domain_rewrite_target_contains_source() {
 }
 
 #[test]
+fn test_database_domain_rewrite_serialized_target_contains_source_full_url() {
+    // Verified fix for Bug #1: Ensure single-pass replacement inside serialized string
+    // does not double-replace when target contains source domain
+    let sql = r#"s:19:"https://example.com"; INSERT INTO wp_options VALUES (1, 'siteurl', 'https://example.com', 'yes');"#;
+    let rewritten = rewrite_domains(sql, "https://example.com", "https://sub.example.com");
+    assert_eq!(
+        rewritten,
+        r#"s:23:"https://sub.example.com"; INSERT INTO wp_options VALUES (1, 'siteurl', 'https://sub.example.com', 'yes');"#
+    );
+    assert!(!rewritten.contains("sub.sub.example.com"));
+}
+
+#[test]
 fn test_database_domain_rewrite_multibyte_utf8() {
     // "münchen" contains 'ü' which is 2 UTF-8 bytes:
     // https:// (8) + münchen (8 bytes: m(1)+ü(2)+n(1)+c(1)+h(1)+e(1)+n(1)) + .de (3) = 19 bytes
@@ -131,6 +144,7 @@ fn test_sync_request_and_response_structures() {
         remote_site_found: true,
         remote_version: Some("2.248.5".to_string()),
         remote_domain: Some("example.com".to_string()),
+        remote_site_id: Some("site-uuid-99".to_string()),
         can_push: true,
         can_pull: true,
     };

@@ -13,6 +13,7 @@ interface PreflightStatus {
   success: boolean;
   message: string;
   remoteDomain?: string;
+  remoteSiteId?: string;
 }
 
 interface ProgressStep {
@@ -41,6 +42,7 @@ export default function LiveSyncModal({
       ? localStorage.getItem("dockpanel-sync-token") || ""
       : "";
   });
+  const [remoteSiteId, setRemoteSiteId] = useState<string | null>(null);
 
   const [syncDb, setSyncDb] = useState(true);
   const [syncFiles, setSyncFiles] = useState(true);
@@ -73,16 +75,23 @@ export default function LiveSyncModal({
         message: string;
         remote_site_found?: boolean;
         remote_domain?: string;
+        remote_site_id?: string;
       }>(`/sites/${site.id}/sync/preflight`, {
         remote_url: remoteUrl.trim(),
         api_token: apiToken.trim(),
+        remote_site_id: remoteSiteId || undefined,
       });
+
+      if (res.remote_site_id) {
+        setRemoteSiteId(res.remote_site_id);
+      }
 
       setPreflightStatus({
         checked: true,
         success: res.success,
         message: res.message,
         remoteDomain: res.remote_domain,
+        remoteSiteId: res.remote_site_id,
       });
 
       if (typeof localStorage !== "undefined") {
@@ -135,6 +144,7 @@ export default function LiveSyncModal({
         sync_db: syncDb,
         sync_files: syncFiles,
         dry_run: dryRun,
+        remote_site_id: remoteSiteId || undefined,
       });
 
       if (res.progress && res.progress.length > 0) {
@@ -298,7 +308,9 @@ export default function LiveSyncModal({
               >
                 {preflightStatus.success ? "✓" : "✕"}{" "}
                 {preflightStatus.remoteDomain
-                  ? `Connected (Remote: ${preflightStatus.remoteDomain})`
+                  ? `Connected (Remote: ${preflightStatus.remoteDomain}${
+                      preflightStatus.remoteSiteId ? ` / #${preflightStatus.remoteSiteId.slice(0, 8)}` : ""
+                    })`
                   : preflightStatus.message}
               </span>
             )}
