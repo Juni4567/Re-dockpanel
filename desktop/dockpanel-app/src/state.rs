@@ -27,7 +27,7 @@ pub struct AppState {
     pub router_config: Arc<Mutex<RouterConfig>>,
     pub worker_ports: Arc<Mutex<HashMap<String, u16>>>,
     pub worker_processes: Arc<Mutex<HashMap<String, std::process::Child>>>,
-    pub router_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    pub router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     config_dir: PathBuf,
     sites_dir: PathBuf,
 }
@@ -164,7 +164,7 @@ impl AppState {
             router_config: Arc::new(Mutex::new(router_config)),
             worker_ports: Arc::new(Mutex::new(HashMap::new())),
             worker_processes: Arc::new(Mutex::new(HashMap::new())),
-            router_handle: Arc::new(Mutex::new(None)),
+            router_handle: Arc::new(tokio::sync::Mutex::new(None)),
             config_dir,
             sites_dir,
         }
@@ -264,10 +264,14 @@ impl AppState {
         self.worker_ports.lock().unwrap().remove(&clean);
     }
 
-    pub fn create_site(&self, domain: &str, php_version: Option<&str>) -> LocalSite {
-        let clean_domain = domain.trim().to_lowercase();
+    pub fn create_site(&self, domain: &str, php_version: Option<&str>) -> Result<LocalSite, String> {
+        let validated = crate::hosts_manager::validate_domain(domain)?;
+        let clean_domain = validated.to_lowercase();
         let id = uuid::Uuid::new_v4().to_string();
         let site_dir = self.sites_dir.join(&clean_domain);
+        if site_dir.parent() != Some(self.sites_dir.as_path()) {
+            return Err("Invalid domain path".to_string());
+        }
         let _ = fs::create_dir_all(&site_dir);
 
         // Write starter index.html
@@ -320,7 +324,7 @@ impl AppState {
         // Register domain in Windows hosts file (best-effort; never fail site creation on permission errors)
         let _ = crate::hosts_manager::sync_domain_to_hosts(&clean_domain);
 
-        site
+        Ok(site)
     }
 
     pub fn delete_site(&self, id: &str) -> bool {
@@ -525,13 +529,20 @@ impl AppState {
         }
     }
 
-    pub fn restart_site_router(&self, port: u16) {
-        let mut handle_guard = self.router_handle.lock().unwrap();
+    pub async fn restart_site_router(&self, port: u16) -> bool {
+        let mut handle_guard = self.router_handle.lock().await;
         if let Some(old_handle) = handle_guard.take() {
             old_handle.abort();
+            let _ = old_handle.await;
         }
-        let handle = crate::router::start_site_router(Arc::new(self.clone()), port);
-        *handle_guard = Some(handle);
+        let (handle, rx) = crate::router::start_site_router_checked(Arc::new(self.clone()), port);
+        let bound = rx.await.unwrap_or(false);
+        if bound {
+            *handle_guard = Some(handle);
+        } else {
+            handle.abort();
+        }
+        bound
     }
 }
 
@@ -594,7 +605,7 @@ mod tests {
         let sites_dir = temp_dir.join("sites");
         let state = AppState::new_with_dirs(config_dir, sites_dir);
 
-        let site = state.create_site("lifecycle-test.local", Some("8.3"));
+        let site = state.create_site("lifecycle-test.local", Some("8.3")).unwrap();
         assert_eq!(site.status, "active");
 
         let stopped = state.stop_site(&site.id).expect("Should stop site");
@@ -625,7 +636,7 @@ mod tests {
         let sites_dir = temp_dir.join("sites");
         let state = AppState::new_with_dirs(config_dir, sites_dir);
 
-        let site = state.create_site("reconcile-test.local", Some("8.3"));
+        let site = state.create_site("reconcile-test.local", Some("8.3")).unwrap();
         assert_eq!(site.status, "active");
 
         // Stop worker manually without changing status
@@ -655,13 +666,53 @@ mod tests {
         let sites_dir = temp_dir.join("sites");
         let state = AppState::new_with_dirs(config_dir, sites_dir);
 
-        let site = state.create_site("delete-test.local", Some("8.3"));
+        let site = state.create_site("delete-test.local", Some("8.3")).unwrap();
         assert!(state.get_site(&site.id).is_some());
 
         assert!(state.delete_site(&site.id));
         assert!(state.get_site(&site.id).is_none());
         assert!(!state.delete_site(&site.id));
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_create_site_rejects_invalid_and_traversal_domains() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_domain_val_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir, sites_dir.clone());
+
+        for bad in ["../escape", "..\\escape", "foo/bar", "foo..bar", "", "bad domain.test", "-bad.test"] {
+            assert!(state.create_site(bad, Some("8.3")).is_err(), "Expected error for {}", bad);
+        }
+        assert!(state.list_sites().is_empty());
+        assert!(!temp_dir.join("escape").exists());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_site_router_returns_bind_status_and_releases_socket() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_router_restart_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir, sites_dir);
+
+        let p1 = find_available_loopback_port().unwrap();
+        assert!(state.restart_site_router(p1).await);
+
+        // Restarting onto the same port should cleanly release and rebind
+        assert!(state.restart_site_router(p1).await);
+
+        // Attempting to restart onto an occupied port should return false
+        let occ = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occ_port = occ.local_addr().unwrap().port();
+        assert!(!state.restart_site_router(occ_port).await);
+        drop(occ);
+
+        if let Some(h) = state.router_handle.lock().await.take() {
+            h.abort();
+        }
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

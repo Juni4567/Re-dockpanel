@@ -99,9 +99,17 @@ async fn create_site_handler(
 ) -> Response {
     let domain = payload.get("domain").and_then(|v| v.as_str()).unwrap_or("site.test");
     let php = payload.get("php_version").and_then(|v| v.as_str());
-    let site = state.create_site(domain, php);
-    let site = state.start_site(&site.id).unwrap_or(site);
-    Json(site).into_response()
+    match state.create_site(domain, php) {
+        Ok(site) => {
+            let site = state.start_site(&site.id).unwrap_or(site);
+            Json(site).into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+    }
 }
 
 async fn delete_site_handler(
@@ -205,7 +213,15 @@ async fn port_resolve_handler(
             let target_port = payload.port.unwrap_or(8080);
             let active = state.get_router_config().active_port;
 
-            if target_port != active && !router::is_port_bindable(target_port) {
+            if target_port == active {
+                return Json(serde_json::json!({
+                    "success": true,
+                    "active_port": target_port
+                }))
+                .into_response();
+            }
+
+            if !router::is_port_bindable(target_port) {
                 return Json(serde_json::json!({
                     "success": false,
                     "message": "Port is already in use"
@@ -213,15 +229,23 @@ async fn port_resolve_handler(
                 .into_response();
             }
 
-            state.set_router_port(target_port);
-            state.restart_site_router(target_port);
-
-            Json(serde_json::json!({
-                "success": true,
-                "active_port": target_port,
-                "message": format!("Switched router port to {}", target_port)
-            }))
-            .into_response()
+            if state.restart_site_router(target_port).await {
+                state.set_router_port(target_port);
+                Json(serde_json::json!({
+                    "success": true,
+                    "active_port": target_port,
+                    "message": format!("Switched router port to {}", target_port)
+                }))
+                .into_response()
+            } else {
+                let _ = state.restart_site_router(active).await;
+                Json(serde_json::json!({
+                    "success": false,
+                    "active_port": active,
+                    "message": format!("Failed to bind site router on port {}", target_port)
+                }))
+                .into_response()
+            }
         }
         "stop_process" => {
             let pid = match payload.pid {
@@ -251,6 +275,17 @@ async fn port_resolve_handler(
             }
 
             let port = payload.port.unwrap_or(80);
+            let current_status = router::check_port_status(port);
+            if current_status.pid != Some(pid) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "message": format!("PID {} does not own port {}", pid, port)
+                    })),
+                )
+                    .into_response();
+            }
 
             #[cfg(windows)]
             let success = {
@@ -272,14 +307,21 @@ async fn port_resolve_handler(
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 let status = router::check_port_status(port);
                 if !status.in_use {
-                    state.set_router_port(port);
-                    state.restart_site_router(port);
-                    Json(serde_json::json!({
-                        "success": true,
-                        "active_port": port,
-                        "message": format!("Successfully stopped conflicting process and bound port {}", port)
-                    }))
-                    .into_response()
+                    if state.restart_site_router(port).await {
+                        state.set_router_port(port);
+                        Json(serde_json::json!({
+                            "success": true,
+                            "active_port": port,
+                            "message": format!("Successfully stopped conflicting process and bound port {}", port)
+                        }))
+                        .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "success": false,
+                            "message": format!("Process was terminated but failed to bind port {}", port)
+                        }))
+                        .into_response()
+                    }
                 } else {
                     Json(serde_json::json!({
                         "success": false,
@@ -609,6 +651,40 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn select_startup_port_with<F>(cfg: &router::RouterConfig, mut is_bindable: F) -> u16
+where
+    F: FnMut(u16) -> bool,
+{
+    if is_bindable(cfg.preferred_port) {
+        return cfg.preferred_port;
+    }
+
+    if cfg.active_port != 0
+        && cfg.active_port != cfg.preferred_port
+        && is_bindable(cfg.active_port)
+    {
+        return cfg.active_port;
+    }
+
+    for candidate in [8080u16, 8443, 3000, 0] {
+        if is_bindable(candidate) {
+            if candidate == 0 {
+                if let Some(ephemeral) = std::net::TcpListener::bind(("0.0.0.0", 0))
+                    .or_else(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))
+                    .ok()
+                    .and_then(|l| l.local_addr().ok().map(|a| a.port()))
+                {
+                    return ephemeral;
+                }
+            } else {
+                return candidate;
+            }
+        }
+    }
+
+    8080
+}
+
 fn start_embedded_server(state: Arc<AppState>) -> u16 {
     let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
 
@@ -619,27 +695,30 @@ fn start_embedded_server(state: Arc<AppState>) -> u16 {
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async move {
-            // Check port 80 status. If occupied, auto-fallback active_port to 8080
-            let preferred_port = state.get_router_config().preferred_port;
-            let status = router::check_port_status(preferred_port);
-            let active_port = if status.in_use {
-                8080
-            } else {
-                preferred_port
-            };
+            // Honor preferred_port (80), then persisted active_port, then free alternatives
+            let cfg = state.get_router_config();
+            let mut active_port = select_startup_port_with(&cfg, router::is_port_bindable);
+            if !state.restart_site_router(active_port).await {
+                if let Some(fallback_port) = state::find_available_loopback_port() {
+                    if state.restart_site_router(fallback_port).await {
+                        active_port = fallback_port;
+                    }
+                }
+            }
             state.set_router_port(active_port);
-
-            // Start site router
-            state.restart_site_router(active_port);
-
-            // Reconcile and start PHP workers for all active sites
-            state.reconcile_active_sites();
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("Failed to bind loopback TCP listener");
             let port = listener.local_addr().unwrap().port();
             let _ = port_tx.send(port);
+
+            // Reconcile and start PHP workers for all active sites in the background
+            // so GUI window creation is not delayed.
+            let reconcile_state = state.clone();
+            tokio::task::spawn_blocking(move || {
+                reconcile_state.reconcile_active_sites();
+            });
 
             let api_routes = build_api_router(state.clone());
 
@@ -676,8 +755,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Auto-seed demo sites if empty
     if state.list_sites().is_empty() {
-        state.create_site("mytestdomain.local", Some("8.3"));
-        state.create_site("wordpress.test", Some("8.3"));
+        let _ = state.create_site("mytestdomain.local", Some("8.3"));
+        let _ = state.create_site("wordpress.test", Some("8.3"));
     }
 
     // Start in-memory embedded HTTP server
@@ -769,7 +848,7 @@ mod tests {
         let sites_dir = temp_dir.join("sites");
         let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir));
 
-        let site = state.create_site("api-lifecycle-test.local", Some("8.3"));
+        let site = state.create_site("api-lifecycle-test.local", Some("8.3")).unwrap();
 
         // Stop site via stop_site_handler
         let resp = stop_site_handler(State(state.clone()), Path(site.id.clone())).await;
@@ -783,6 +862,41 @@ mod tests {
 
         let _ = state.stop_site(&site.id);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_site_handler_rejects_invalid_domain() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_bad_site_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir));
+
+        let resp = create_site_handler(
+            State(state.clone()),
+            Json(serde_json::json!({ "domain": "../evil", "php_version": "8.3" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(state.list_sites().is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_select_startup_port_logic() {
+        let cfg = router::RouterConfig {
+            preferred_port: 80,
+            active_port: 8443,
+        };
+        // 1. Preferred port free -> chooses 80
+        assert_eq!(select_startup_port_with(&cfg, |p| p == 80), 80);
+        // 2. Preferred occupied, persisted active_port bindable -> keeps active_port
+        assert_eq!(select_startup_port_with(&cfg, |p| p == 8443 || p == 8080), 8443);
+        // 3. Both occupied -> probes [8080, 8443, 3000, 0] and picks first available
+        assert_eq!(select_startup_port_with(&cfg, |p| p == 3000), 3000);
+        // 4. All static alternatives occupied -> probes 0 and returns non-zero ephemeral port
+        let eph = select_startup_port_with(&cfg, |p| p == 0);
+        assert_ne!(eph, 0);
     }
 
     #[tokio::test]
@@ -801,18 +915,39 @@ mod tests {
         assert_eq!(conflict_json["preferred_port"], 80);
         assert!(conflict_json.get("alternatives").is_some());
 
+        // Pick a guaranteed free port for testing use_port & no-op guard
+        let free_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_port = free_probe.local_addr().unwrap().port();
+        drop(free_probe);
+
         // POST resolve use_port
         let resolve_resp = port_resolve_handler(
             State(state.clone()),
             Json(PortResolvePayload {
                 action: "use_port".to_string(),
-                port: Some(8080),
+                port: Some(free_port),
                 pid: None,
             }),
         )
         .await;
         assert_eq!(resolve_resp.status(), StatusCode::OK);
-        assert_eq!(state.get_router_config().active_port, 8080);
+        assert_eq!(state.get_router_config().active_port, free_port);
+
+        // No-op guard: calling use_port with already-active port succeeds without restart
+        let noop_resp = port_resolve_handler(
+            State(state.clone()),
+            Json(PortResolvePayload {
+                action: "use_port".to_string(),
+                port: Some(free_port),
+                pid: None,
+            }),
+        )
+        .await;
+        assert_eq!(noop_resp.status(), StatusCode::OK);
+        let noop_body = axum::body::to_bytes(noop_resp.into_body(), 1024 * 64).await.unwrap();
+        let noop_val: serde_json::Value = serde_json::from_slice(&noop_body).unwrap();
+        assert_eq!(noop_val["success"], true);
+        assert_eq!(noop_val["active_port"], free_port);
 
         // POST resolve use_port on an occupied port returns success: false
         let occupied_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -833,6 +968,18 @@ mod tests {
         assert_eq!(val["success"], false);
         assert!(val["message"].as_str().unwrap().contains("already in use"));
         drop(occupied_listener);
+
+        // POST resolve stop_process with mismatched PID returns 409 Conflict
+        let mismatch_resp = port_resolve_handler(
+            State(state.clone()),
+            Json(PortResolvePayload {
+                action: "stop_process".to_string(),
+                port: Some(free_port),
+                pid: Some(999_999),
+            }),
+        )
+        .await;
+        assert_eq!(mismatch_resp.status(), StatusCode::CONFLICT);
 
         // POST resolve stop_process self PID returns 400 Bad Request
         let self_pid_resp = port_resolve_handler(

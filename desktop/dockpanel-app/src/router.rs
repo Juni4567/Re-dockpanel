@@ -314,6 +314,19 @@ fn render_error_page(status: StatusCode, title: &str, message: &str) -> Response
         .unwrap()
 }
 
+fn is_hop_by_hop_or_framing_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
+}
+
 async fn proxy_to_worker(
     worker_port: u16,
     target_path_and_query: &str,
@@ -321,6 +334,8 @@ async fn proxy_to_worker(
 ) -> Response {
     static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default()
@@ -348,7 +363,7 @@ async fn proxy_to_worker(
         .map(|s| s.to_string());
 
     for (name, val) in parts.headers.iter() {
-        if name != axum::http::header::HOST && name != axum::http::header::CONNECTION {
+        if name != axum::http::header::HOST && !is_hop_by_hop_or_framing_header(name.as_str()) {
             if let (Ok(hname), Ok(hval)) = (
                 reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
                 reqwest::header::HeaderValue::from_bytes(val.as_bytes()),
@@ -562,28 +577,46 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
     }
 }
 
-pub fn start_site_router(state: Arc<AppState>, port: u16) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+pub fn start_site_router_checked(
+    state: Arc<AppState>,
+    port: u16,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<bool>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
         let state_clone = state.clone();
         let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
             let s = state_clone.clone();
             async move { handle_router_request(req, s).await }
         });
 
-        let bind_result = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
-            Ok(l) => Ok(l),
-            Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", port)).await,
+        let bind_result = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(probe) => {
+                drop(probe);
+                match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+                    Ok(l) => Ok(l),
+                    Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", port)).await,
+                }
+            }
+            Err(e) => Err(e),
         };
 
         match bind_result {
             Ok(listener) => {
+                let _ = tx.send(true);
                 let _ = axum::serve(listener, app).await;
             }
             Err(e) => {
                 eprintln!("Failed to bind site router on port {}: {}", port, e);
+                let _ = tx.send(false);
             }
         }
-    })
+    });
+    (handle, rx)
+}
+
+pub fn start_site_router(state: Arc<AppState>, port: u16) -> tokio::task::JoinHandle<()> {
+    let (handle, _rx) = start_site_router_checked(state, port);
+    handle
 }
 
 #[cfg(test)]
@@ -676,7 +709,7 @@ Active Connections
         let config_dir = temp_dir.join("config");
         let sites_dir = temp_dir.join("sites");
         let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
-        let _site = state.create_site("test-stopped.test", Some("8.3"));
+        let _site = state.create_site("test-stopped.test", Some("8.3")).unwrap();
         // Mark site as stopped
         {
             let mut data = state.data.lock().unwrap();
@@ -750,7 +783,7 @@ Active Connections
         let config_dir = temp_dir.join("config");
         let sites_dir = temp_dir.join("sites");
         let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
-        let site = state.create_site("my-static-site.test", Some("8.3"));
+        let site = state.create_site("my-static-site.test", Some("8.3")).unwrap();
 
         // Add a custom css file
         let css_path = Path::new(&site.document_root).join("style.css");
@@ -790,7 +823,7 @@ Active Connections
         let config_dir = temp_dir.join("config");
         let sites_dir = temp_dir.join("sites");
         let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
-        let site = state.create_site("php-test.test", Some("8.3"));
+        let site = state.create_site("php-test.test", Some("8.3")).unwrap();
 
         // Create index.php in document root
         let php_file = Path::new(&site.document_root).join("index.php");
@@ -803,9 +836,16 @@ Active Connections
         let mock_server = tokio::spawn(async move {
             let mock_app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
                 let path = req.uri().to_string();
+                let has_keep_alive = req.headers().contains_key("keep-alive");
+                let has_te = req.headers().contains_key("te");
+                let has_upgrade = req.headers().contains_key("upgrade");
+                let has_trailer = req.headers().contains_key("trailer");
+                let has_custom = req.headers().get("x-custom-test").and_then(|v| v.to_str().ok()) == Some("ok");
                 axum::response::Response::builder()
                     .status(axum::http::StatusCode::OK)
                     .header("x-mock-php", "true")
+                    .header("x-stripped-hop", format!("{},{},{},{}", has_keep_alive, has_te, has_upgrade, has_trailer))
+                    .header("x-custom-forwarded", has_custom.to_string())
                     .body(axum::body::Body::from(format!("Hello from PHP Worker at {}", path)))
                     .unwrap()
             });
@@ -815,9 +855,14 @@ Active Connections
         // Set worker port in state
         state.set_site_worker_port("php-test.test", mock_port);
 
-        // Send request to "/"
+        // Send request to "/" with hop-by-hop headers that should be stripped
         let req = axum::http::Request::builder()
             .header("host", "php-test.test")
+            .header("keep-alive", "timeout=5")
+            .header("te", "trailers")
+            .header("upgrade", "websocket")
+            .header("trailer", "X-Trailer")
+            .header("x-custom-test", "ok")
             .uri("/?page=about")
             .body(axum::body::Body::empty())
             .unwrap();
@@ -825,6 +870,8 @@ Active Connections
         let resp = handle_router_request(req, state.clone()).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(resp.headers().get("x-mock-php").unwrap(), "true");
+        assert_eq!(resp.headers().get("x-stripped-hop").unwrap(), "false,false,false,false");
+        assert_eq!(resp.headers().get("x-custom-forwarded").unwrap(), "true");
         let b = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
         let body_str = String::from_utf8_lossy(&b);
         assert!(body_str.contains("Hello from PHP Worker at /index.php?page=about"));
@@ -840,7 +887,7 @@ Active Connections
         let config_dir = temp_dir.join("config");
         let sites_dir = temp_dir.join("sites");
         let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
-        let site = state.create_site("no-worker.test", Some("8.3"));
+        let site = state.create_site("no-worker.test", Some("8.3")).unwrap();
 
         // Create index.php
         let php_file = Path::new(&site.document_root).join("index.php");
@@ -869,7 +916,7 @@ Active Connections
         let config_dir = temp_dir.join("config");
         let sites_dir = temp_dir.join("sites");
         let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
-        let _site = state.create_site("e2e-site.test", Some("8.3"));
+        let _site = state.create_site("e2e-site.test", Some("8.3")).unwrap();
 
         // Find available port
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
