@@ -14,6 +14,8 @@ pub struct LocalSite {
     pub status: String,
     pub created_at: String,
     pub ssl_enabled: bool,
+    #[serde(default)]
+    pub php_preset: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -249,6 +251,22 @@ impl AppState {
         }
     }
 
+    pub fn update_site_preset(&self, id_or_domain: &str, preset: &str) -> bool {
+        let clean = id_or_domain.trim().to_lowercase();
+        let mut data = match self.data.lock() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
+            s.php_preset = Some(preset.to_string());
+            drop(data);
+            self.save_data();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn get_site_worker_port(&self, domain: &str) -> Option<u16> {
         let clean = domain.trim().to_lowercase();
         self.worker_ports.lock().unwrap().get(&clean).copied()
@@ -312,6 +330,7 @@ impl AppState {
             status: "active".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             ssl_enabled: true,
+            php_preset: None,
         };
 
         {
