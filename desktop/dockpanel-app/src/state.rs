@@ -53,6 +53,12 @@ pub struct AppData {
     pub sites: Vec<LocalSite>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PhpInstallJob {
+    pub steps: Vec<serde_json::Value>,
+    pub done: bool,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub data: Arc<Mutex<AppData>>,
@@ -60,6 +66,7 @@ pub struct AppState {
     pub worker_ports: Arc<Mutex<HashMap<String, u16>>>,
     pub worker_processes: Arc<Mutex<HashMap<String, std::process::Child>>>,
     pub router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    pub php_installs: Arc<Mutex<HashMap<String, PhpInstallJob>>>,
     pub config_dir: PathBuf,
     pub sites_dir: PathBuf,
 }
@@ -71,53 +78,50 @@ pub fn find_available_loopback_port() -> Option<u16> {
         .and_then(|l| l.local_addr().ok().map(|addr| addr.port()))
 }
 
-/// Finds a PHP CLI binary on the host machine.
-/// Searches:
-/// 1. C:\wamp64\bin\php\php*\php.exe (matching version_hint if supplied, or sorted descending by version)
-/// 2. PATH (using `where.exe php` on Windows or inspecting PATH env var)
-/// 3. Common Windows PHP paths (%USERPROFILE%\DockPanel\bin\php\php.exe, C:\php\php.exe, etc.)
-pub fn find_php_binary(version_hint: Option<&str>) -> Option<PathBuf> {
-    // 1. Check C:\wamp64\bin\php\
-    let wamp_php_dir = Path::new(r"C:\wamp64\bin\php");
-    if wamp_php_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(wamp_php_dir) {
-            let mut php_dirs: Vec<(String, PathBuf)> = Vec::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let exe = path.join("php.exe");
-                    if exe.is_file() {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        php_dirs.push((name, exe));
+/// Returns the `%USERPROFILE%\DockPanel\bin\php` base directory.
+pub fn dockpanel_php_dir() -> Option<PathBuf> {
+    std::env::var("USERPROFILE").ok().map(|u| {
+        PathBuf::from(u).join("DockPanel").join("bin").join("php")
+    })
+}
+
+/// Collects `(dir_name, php_exe_path)` across versioned PHP install directories
+/// (`%USERPROFILE%\DockPanel\bin\php` and `C:\wamp64\bin\php`), sorted descending by version name.
+fn collect_versioned_php_dirs() -> Vec<(String, PathBuf)> {
+    let mut dirs = Vec::new();
+    let mut search_roots = Vec::new();
+    if let Some(dp_dir) = dockpanel_php_dir() {
+        search_roots.push(dp_dir);
+    }
+    search_roots.push(PathBuf::from(r"C:\wamp64\bin\php"));
+
+    for root in search_roots {
+        if root.is_dir() {
+            if let Ok(entries) = fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let exe = path.join("php.exe");
+                        if exe.is_file() {
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            dirs.push((name, exe));
+                        }
                     }
                 }
             }
-
-            // Sort descending by directory name (e.g. php8.3.0 > php8.2.13 > php7.4.33)
-            php_dirs.sort_by(|a, b| b.0.cmp(&a.0));
-
-            // If version_hint is given, check for matching directory name
-            if let Some(hint) = version_hint {
-                let clean_hint = hint.trim().to_lowercase();
-                if let Some((_, exe)) = php_dirs.iter().find(|(name, _)| {
-                    name.to_lowercase().contains(&clean_hint)
-                }) {
-                    return Some(exe.clone());
-                }
-            }
-
-            // Fallback to highest WampServer version
-            if let Some((_, exe)) = php_dirs.first() {
-                return Some(exe.clone());
-            }
         }
     }
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs
+}
 
-    // 2. Check PATH
+/// Returns candidate standalone `php.exe` paths from PATH and common Windows locations.
+fn collect_standalone_php_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -128,50 +132,95 @@ pub fn find_php_binary(version_hint: Option<&str>) -> Option<PathBuf> {
             .output()
         {
             if output.status.success() {
-                let out_str = String::from_utf8_lossy(&output.stdout);
-                for line in out_str.lines() {
-                    let trimmed = line.trim();
-                    let p = PathBuf::from(trimmed);
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let p = PathBuf::from(line.trim());
                     if p.is_file() {
-                        return Some(p);
+                        paths.push(p);
                     }
                 }
             }
         }
     }
-
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("php.exe");
-            if candidate.is_file() {
-                return Some(candidate);
+            if candidate.is_file() && !paths.contains(&candidate) {
+                paths.push(candidate);
             }
         }
     }
-
-    // 3. Common Windows PHP directories
-    let common_paths = [
-        PathBuf::from(r"C:\php\php.exe"),
-        PathBuf::from(r"C:\tools\php\php.exe"),
-    ];
-    for p in common_paths {
-        if p.is_file() {
-            return Some(p);
+    for common in [r"C:\php\php.exe", r"C:\tools\php\php.exe"] {
+        let p = PathBuf::from(common);
+        if p.is_file() && !paths.contains(&p) {
+            paths.push(p);
         }
     }
-
-    if let Ok(user_profile) = std::env::var("USERPROFILE") {
-        let p = PathBuf::from(user_profile)
-            .join("DockPanel")
-            .join("bin")
-            .join("php")
-            .join("php.exe");
-        if p.is_file() {
-            return Some(p);
+    if let Some(dp_dir) = dockpanel_php_dir() {
+        let p = dp_dir.join("php.exe");
+        if p.is_file() && !paths.contains(&p) {
+            paths.push(p);
         }
     }
+    paths
+}
 
+/// Checks if a given directory name or path matches a major.minor version like `"8.3"`.
+fn dir_matches_version(dir_name: &str, version: &str) -> bool {
+    let lower = dir_name.to_lowercase();
+    let v = version.trim().to_lowercase();
+    lower.contains(&format!("php{v}")) || lower.contains(&format!("php-{v}")) || lower == v
+}
+
+/// Finds a PHP binary matching the exact requested `major.minor` version (without falling back to other versions).
+pub fn find_php_binary_exact(version: &str) -> Option<PathBuf> {
+    let dirs = collect_versioned_php_dirs();
+    if let Some((_, exe)) = dirs.iter().find(|(name, _)| dir_matches_version(name, version)) {
+        return Some(exe.clone());
+    }
+
+    // Check standalone paths by inspecting parent dir name or invoking `php -v`
+    for exe in collect_standalone_php_paths() {
+        if let Some(parent) = exe.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+            if dir_matches_version(parent, version) {
+                return Some(exe);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            if let Ok(out) = std::process::Command::new(&exe)
+                .args(["-r", "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                if out.status.success() {
+                    let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if ver == version.trim() {
+                        return Some(exe);
+                    }
+                }
+            }
+        }
+    }
     None
+}
+
+/// Finds a PHP CLI binary on the host machine, preferring `version_hint` if installed,
+/// and falling back to any installed PHP version on Windows.
+pub fn find_php_binary(version_hint: Option<&str>) -> Option<PathBuf> {
+    if let Some(hint) = version_hint {
+        if let Some(exact) = find_php_binary_exact(hint) {
+            return Some(exact);
+        }
+    }
+
+    let dirs = collect_versioned_php_dirs();
+    if let Some((_, exe)) = dirs.first() {
+        return Some(exe.clone());
+    }
+
+    collect_standalone_php_paths().into_iter().next()
 }
 
 impl AppState {
@@ -197,6 +246,7 @@ impl AppState {
             worker_ports: Arc::new(Mutex::new(HashMap::new())),
             worker_processes: Arc::new(Mutex::new(HashMap::new())),
             router_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            php_installs: Arc::new(Mutex::new(HashMap::new())),
             config_dir,
             sites_dir,
         }
@@ -295,6 +345,80 @@ impl AppState {
             true
         } else {
             false
+        }
+    }
+
+    pub fn update_site_php_version(&self, id_or_domain: &str, php_version: &str) -> Result<LocalSite, String> {
+        let clean = id_or_domain.trim().to_lowercase();
+        let site = {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
+                s.php_version = php_version.trim().to_string();
+                s.runtime = "php".to_string();
+                s.clone()
+            } else {
+                return Err(format!("Site '{}' not found", id_or_domain));
+            }
+        };
+        self.save_data();
+        if site.status == "active" {
+            self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+        }
+        Ok(site)
+    }
+
+    pub fn update_site_runtime(
+        &self,
+        id_or_domain: &str,
+        runtime: &str,
+        php_version: Option<&str>,
+    ) -> Result<LocalSite, String> {
+        let clean = id_or_domain.trim().to_lowercase();
+        let site = {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
+                s.runtime = runtime.trim().to_string();
+                if let Some(ver) = php_version {
+                    s.php_version = ver.trim().to_string();
+                }
+                s.clone()
+            } else {
+                return Err(format!("Site '{}' not found", id_or_domain));
+            }
+        };
+        self.save_data();
+        if site.status == "active" && site.runtime == "php" {
+            self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+        }
+        Ok(site)
+    }
+
+    pub fn list_php_versions(&self) -> Vec<serde_json::Value> {
+        const STANDARD_VERSIONS: &[&str] = &["8.6", "8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"];
+        STANDARD_VERSIONS
+            .iter()
+            .map(|&ver| {
+                let exe = find_php_binary_exact(ver);
+                let installed = exe.is_some();
+                serde_json::json!({
+                    "version": ver,
+                    "installed": installed,
+                    // Desktop runs PHP-CGI workers on demand per site, so an installed binary is immediately ready.
+                    "fpm_running": installed,
+                    "socket": exe.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                    "default": ver == "8.3",
+                })
+            })
+            .collect()
+    }
+
+    pub fn push_php_install_step(&self, install_id: &str, step: serde_json::Value, done: bool) {
+        if let Ok(mut jobs) = self.php_installs.lock() {
+            let job = jobs.entry(install_id.to_string()).or_default();
+            job.steps.push(step);
+            if done {
+                job.done = true;
+            }
         }
     }
 

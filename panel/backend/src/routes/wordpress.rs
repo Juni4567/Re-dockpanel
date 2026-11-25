@@ -216,16 +216,21 @@ pub async fn install(
     let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
 
     // Normalize field aliases so callers can send admin_pass OR admin_password, title OR site_title
+    // without triggering serde duplicate-field 422 downstream in the agent.
     if let Some(obj) = body.as_object_mut() {
         if !obj.contains_key("admin_pass") {
-            if let Some(pass) = obj.get("admin_password").cloned() {
+            if let Some(pass) = obj.remove("admin_password") {
                 obj.insert("admin_pass".to_string(), pass);
             }
+        } else {
+            obj.remove("admin_password");
         }
         if !obj.contains_key("title") {
-            if let Some(t) = obj.get("site_title").cloned() {
+            if let Some(t) = obj.remove("site_title") {
                 obj.insert("title".to_string(), t);
             }
+        } else {
+            obj.remove("site_title");
         }
         if !obj.contains_key("url") || obj.get("url").and_then(|u| u.as_str()).map(|s| s.is_empty()).unwrap_or(false) {
             obj.insert("url".to_string(), serde_json::json!(format!("http://{domain}")));

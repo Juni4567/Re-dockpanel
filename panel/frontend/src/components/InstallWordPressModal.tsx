@@ -55,7 +55,6 @@ export default function InstallWordPressModal({
         title: title.trim() || "My WordPress Site",
         admin_user: adminUser.trim(),
         admin_pass: adminPass,
-        admin_password: adminPass,
         admin_email: adminEmail.trim() || `admin@${domain}`,
         url: `http://${domain}`,
       });

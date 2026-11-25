@@ -8,8 +8,11 @@ pub mod wordpress;
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    routing::{get, post, put},
     Json, Router,
 };
 use rust_embed::RustEmbed;
@@ -215,8 +218,33 @@ async fn get_wordpress_info_handler(
 async fn install_wordpress_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(payload): Json<wordpress::InstallWpRequest>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Response {
+    let payload = wordpress::InstallWpRequest {
+        admin_user: raw
+            .get("admin_user")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        admin_pass: raw
+            .get("admin_pass")
+            .or_else(|| raw.get("admin_password"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        admin_email: raw
+            .get("admin_email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        title: raw
+            .get("title")
+            .or_else(|| raw.get("site_title"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        url: raw
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+
     if let Some(site) = state.get_site(&id) {
         let site_dir = state.sites_dir.join(&site.domain);
         match wordpress::install_site_wordpress(&site_dir, &site.domain, &payload) {
@@ -366,6 +394,403 @@ async fn wordpress_features_status_handler(
         )
             .into_response()
     }
+}
+
+async fn php_versions_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "versions": state.list_php_versions()
+    }))
+}
+
+async fn switch_site_php_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let version = payload
+        .get("version")
+        .or_else(|| payload.get("php_version"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let Some(ver) = version else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "PHP version is required"})),
+        )
+            .into_response();
+    };
+
+    if state::find_php_binary_exact(ver).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("PHP {} is not installed. Click Install PHP {} first.", ver, ver)})),
+        )
+            .into_response();
+    }
+
+    match state.update_site_php_version(&id, ver) {
+        Ok(site) => Json(site).into_response(),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": err})),
+        )
+            .into_response(),
+    }
+}
+
+async fn switch_site_runtime_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let runtime = payload
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .unwrap_or("php");
+    let php_version = payload.get("php_version").and_then(|v| v.as_str());
+
+    if runtime == "php" {
+        if let Some(ver) = php_version {
+            if state::find_php_binary_exact(ver).is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("PHP {} is not installed. Click Install PHP {} first.", ver, ver)})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match state.update_site_runtime(&id, runtime, php_version) {
+        Ok(site) => Json(site).into_response(),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": err})),
+        )
+            .into_response(),
+    }
+}
+
+async fn php_install_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let version = payload
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+
+    const ALLOWED: &[&str] = &["8.6", "8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"];
+    if !ALLOWED.contains(&version.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported PHP version: {}", version)})),
+        )
+            .into_response();
+    }
+
+    let install_id = uuid::Uuid::new_v4().to_string();
+    state.push_php_install_step(
+        &install_id,
+        serde_json::json!({
+            "step": "resolve",
+            "label": format!("Preparing PHP {} installation for Windows...", version),
+            "status": "in_progress"
+        }),
+        false,
+    );
+
+    let bg_state = state.clone();
+    let bg_id = install_id.clone();
+    let bg_ver = version.clone();
+
+    tokio::spawn(async move {
+        if let Some(existing) = state::find_php_binary_exact(&bg_ver) {
+            bg_state.push_php_install_step(
+                &bg_id,
+                serde_json::json!({
+                    "step": "resolve",
+                    "label": format!("Found existing PHP {} binary", bg_ver),
+                    "status": "done",
+                    "message": existing.to_string_lossy().to_string()
+                }),
+                false,
+            );
+            bg_state.push_php_install_step(
+                &bg_id,
+                serde_json::json!({
+                    "step": "complete",
+                    "label": format!("PHP {} is ready", bg_ver),
+                    "status": "done"
+                }),
+                true,
+            );
+            return;
+        }
+
+        let Some(base_dir) = state::dockpanel_php_dir() else {
+            bg_state.push_php_install_step(
+                &bg_id,
+                serde_json::json!({
+                    "step": "complete",
+                    "label": "Could not determine USERPROFILE directory",
+                    "status": "error"
+                }),
+                true,
+            );
+            return;
+        };
+
+        let target_dir = base_dir.join(format!("php{}", bg_ver));
+        bg_state.push_php_install_step(
+            &bg_id,
+            serde_json::json!({
+                "step": "resolve",
+                "label": format!("Querying windows.php.net for PHP {} release...", bg_ver),
+                "status": "done"
+            }),
+            false,
+        );
+        bg_state.push_php_install_step(
+            &bg_id,
+            serde_json::json!({
+                "step": "download",
+                "label": format!("Downloading & extracting PHP {} x64 package...", bg_ver),
+                "status": "in_progress"
+            }),
+            false,
+        );
+
+        let target_str = target_dir.to_string_lossy().replace('\'', "''");
+        let ver_escaped = bg_ver.replace('\'', "''");
+        let ps_script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ver = '{ver}'
+$dest = '{dest}'
+$zipPath = Join-Path $env:TEMP "dockpanel_php_$ver.zip"
+
+$downloadUrl = $null
+try {{
+    $releases = Invoke-RestMethod -Uri 'https://windows.php.net/downloads/releases/releases.json' -TimeoutSec 20
+    $entry = $releases.$ver
+    if ($entry) {{
+        $buildProp = $entry.PSObject.Properties | Where-Object {{ $_.Name -match '^(nts|ts)-vs\d+-x64$' }} | Sort-Object Name | Select-Object -First 1
+        if ($buildProp -and $buildProp.Value.zip.path) {{
+            $downloadUrl = 'https://windows.php.net/downloads/releases/' + $buildProp.Value.zip.path
+        }}
+    }}
+}} catch {{}}
+
+if (-not $downloadUrl) {{
+    $archHtml = (Invoke-WebRequest -Uri 'https://windows.php.net/downloads/releases/archives/' -TimeoutSec 20 -UseBasicParsing).Content
+    $escapedVer = [regex]::Escape($ver)
+    $matches = [regex]::Matches($archHtml, "php-$escapedVer\.\d+(?:-nts)?-Win32-v[sc]\d+-x64\.zip") | ForEach-Object {{ $_.Value }} | Sort-Object -Descending -Unique
+    $picked = $matches | Select-Object -First 1
+    if ($picked) {{
+        $downloadUrl = 'https://windows.php.net/downloads/releases/archives/' + $picked
+    }}
+}}
+
+if (-not $downloadUrl) {{
+    throw "Could not find an official Windows x64 release package for PHP $ver on windows.php.net."
+}}
+
+Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -TimeoutSec 180 -UseBasicParsing
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Expand-Archive -Path $zipPath -DestinationPath $dest -Force
+Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+
+$devIni = Join-Path $dest 'php.ini-development'
+$targetIni = Join-Path $dest 'php.ini'
+if ((Test-Path $devIni) -and -not (Test-Path $targetIni)) {{
+    $ini = Get-Content -Raw $devIni
+    $ini = $ini -replace ';extension_dir = "ext"', 'extension_dir = "ext"'
+    foreach ($ext in @('curl','fileinfo','gd','mbstring','mysqli','openssl','pdo_mysql','pdo_sqlite','sqlite3','zip')) {{
+        $ini = $ini -replace ";extension=$ext", "extension=$ext"
+    }}
+    Set-Content -Path $targetIni -Value $ini -Encoding ASCII
+}}
+
+$phpExe = Join-Path $dest 'php.exe'
+if (-not (Test-Path $phpExe)) {{
+    throw "php.exe was not found after extraction in $dest"
+}}
+Write-Output $phpExe
+"#,
+            ver = ver_escaped,
+            dest = target_str
+        );
+
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            use std::os::windows::process::CommandExt;
+            #[cfg(windows)]
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script]);
+            #[cfg(windows)]
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.output()
+        })
+        .await;
+
+        match result {
+            Ok(Ok(out)) if out.status.success() => {
+                let exe_out = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                bg_state.push_php_install_step(
+                    &bg_id,
+                    serde_json::json!({
+                        "step": "download",
+                        "label": format!("PHP {} installed to {}", bg_ver, exe_out),
+                        "status": "done"
+                    }),
+                    false,
+                );
+                bg_state.push_php_install_step(
+                    &bg_id,
+                    serde_json::json!({
+                        "step": "complete",
+                        "label": format!("PHP {} installed and ready for local sites!", bg_ver),
+                        "status": "done"
+                    }),
+                    true,
+                );
+            }
+            Ok(Ok(out)) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let msg = if !stderr.is_empty() { stderr } else { stdout };
+                bg_state.push_php_install_step(
+                    &bg_id,
+                    serde_json::json!({
+                        "step": "download",
+                        "label": format!("Failed to install PHP {}", bg_ver),
+                        "status": "error",
+                        "message": msg
+                    }),
+                    false,
+                );
+                bg_state.push_php_install_step(
+                    &bg_id,
+                    serde_json::json!({
+                        "step": "complete",
+                        "label": format!("PHP {} installation failed", bg_ver),
+                        "status": "error",
+                        "message": msg
+                    }),
+                    true,
+                );
+            }
+            _ => {
+                bg_state.push_php_install_step(
+                    &bg_id,
+                    serde_json::json!({
+                        "step": "complete",
+                        "label": format!("Failed to spawn PHP {} installer process", bg_ver),
+                        "status": "error"
+                    }),
+                    true,
+                );
+            }
+        }
+    });
+
+    Json(serde_json::json!({ "install_id": install_id })).into_response()
+}
+
+async fn php_install_log_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(32);
+
+    tokio::spawn(async move {
+        let mut sent = 0usize;
+        for _ in 0..720 {
+            let (new_steps, done) = {
+                if let Ok(jobs) = state.php_installs.lock() {
+                    if let Some(job) = jobs.get(&id) {
+                        let slice = if sent < job.steps.len() {
+                            job.steps[sent..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        (slice, job.done)
+                    } else {
+                        (
+                            vec![serde_json::json!({
+                                "step": "complete",
+                                "label": "Install job not found",
+                                "status": "error"
+                            })],
+                            true,
+                        )
+                    }
+                } else {
+                    (Vec::new(), true)
+                }
+            };
+
+            for step in new_steps {
+                sent += 1;
+                if let Ok(data) = serde_json::to_string(&step) {
+                    if tx.send(Ok(SseEvent::default().data(data))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    });
+
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+}
+
+async fn php_extensions_handler(Path(version): Path<String>) -> Json<serde_json::Value> {
+    let mut installed = Vec::new();
+    if let Some(exe) = state::find_php_binary_exact(&version) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            if let Ok(out) = std::process::Command::new(&exe)
+                .arg("-m")
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                if out.status.success() {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        let t = line.trim();
+                        if !t.is_empty() && !t.starts_with('[') {
+                            installed.push(t.to_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let common = ["curl", "fileinfo", "gd", "mbstring", "mysqli", "openssl", "pdo_mysql", "pdo_sqlite", "sqlite3", "zip"];
+    let available: Vec<&str> = common
+        .iter()
+        .copied()
+        .filter(|ext| !installed.iter().any(|i| i == ext))
+        .collect();
+    Json(serde_json::json!({
+        "installed": installed,
+        "available": available
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -653,6 +1078,8 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         )
         .route("/sites/{id}/start", post(start_site_handler))
         .route("/sites/{id}/stop", post(stop_site_handler))
+        .route("/sites/{id}/php", put(switch_site_php_handler))
+        .route("/sites/{id}/runtime", put(switch_site_runtime_handler))
         .route("/sites/{id}/wordpress", get(get_wordpress_info_handler))
         .route("/sites/{id}/wordpress/info", get(get_wordpress_info_handler))
         .route("/sites/{id}/wordpress/install", post(install_wordpress_handler))
@@ -738,17 +1165,10 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             "/notifications",
             get(|| async { Json(serde_json::json!([])) }),
         )
-        .route(
-            "/php/versions",
-            get(|| async {
-                Json(serde_json::json!({
-                    "versions": [
-                        {"version": "8.3", "installed": true, "default": true},
-                        {"version": "8.2", "installed": true, "default": false}
-                    ]
-                }))
-            }),
-        )
+        .route("/php/versions", get(php_versions_handler))
+        .route("/php/install", post(php_install_handler))
+        .route("/php/extensions/{version}", get(php_extensions_handler))
+        .route("/services/install/{id}/log", get(php_install_log_handler))
         .route(
             "/databases",
             get(|| async { Json(serde_json::json!([])) }),
@@ -1417,14 +1837,16 @@ mod tests {
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(val["installed"], false);
 
-        // 2. Install WordPress
-        let req = wordpress::InstallWpRequest {
-            admin_user: Some("wpadmin".to_string()),
-            admin_pass: Some("wpsecret999".to_string()),
-            admin_email: Some("wpadmin@wp-lifecycle.test".to_string()),
-            title: Some("Lifecycle Site".to_string()),
-            url: Some("http://wp-lifecycle.test".to_string()),
-        };
+        // 2. Install WordPress (verifies duplicate admin_pass + admin_password aliases do not 422)
+        let req = serde_json::json!({
+            "admin_user": "wpadmin",
+            "admin_pass": "wpsecret999",
+            "admin_password": "wpsecret999",
+            "admin_email": "wpadmin@wp-lifecycle.test",
+            "title": "Lifecycle Site",
+            "site_title": "Lifecycle Site",
+            "url": "http://wp-lifecycle.test"
+        });
         let install_resp = install_wordpress_handler(State(state.clone()), Path(site.id.clone()), Json(req)).await;
         assert_eq!(install_resp.status(), StatusCode::CREATED);
         assert_eq!(state.get_site(&site.id).unwrap().php_preset.as_deref(), Some("wordpress"));
@@ -1454,6 +1876,32 @@ mod tests {
         assert_eq!(th_resp.status(), StatusCode::OK);
 
         let _ = state.stop_site(&site.id);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_php_versions_and_switch_endpoints() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_php_api_test_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir));
+
+        let Json(versions_val) = php_versions_handler(State(state.clone())).await;
+        let versions = versions_val["versions"].as_array().unwrap();
+        assert!(versions.len() >= 8);
+        for v in versions {
+            // fpm_running must match installed so PhpVersionPicker never claims PHP-FPM is stopped when PHP is ready.
+            assert_eq!(v["installed"], v["fpm_running"]);
+        }
+
+        // Unsupported PHP version should return 400 BAD_REQUEST
+        let bad_install = php_install_handler(
+            State(state.clone()),
+            Json(serde_json::json!({ "version": "5.2" })),
+        )
+        .await;
+        assert_eq!(bad_install.status(), StatusCode::BAD_REQUEST);
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -283,9 +283,7 @@ export default function WordPress() {
       const payload = {
         ...installData,
         admin_pass: installData.admin_pass,
-        admin_password: installData.admin_pass,
-        title: installData.title,
-        site_title: installData.title,
+        title: installData.title || "My WordPress Site",
         url: installData.url || (site?.domain ? `http://${site.domain}` : ""),
         admin_email: installData.admin_email || (site?.domain ? `admin@${site.domain}` : ""),
       };

@@ -49,6 +49,7 @@ export default function PhpVersionPicker({
 }: Props) {
   const [versions, setVersions] = useState<PhpVersion[]>([]);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [checkingVersions, setCheckingVersions] = useState(false);
   const [installId, setInstallId] = useState<string | null>(null);
   const [installing, setInstalling] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -58,6 +59,7 @@ export default function PhpVersionPicker({
   // successful install read as a failed install — and made an agent that answered
   // with an empty list read as every version being present.
   const load = useCallback(async (): Promise<PhpVersion[] | null> => {
+    setCheckingVersions(true);
     try {
       const res = await api.get<{ versions: PhpVersion[] }>("/php/versions");
       const list = res.versions ?? [];
@@ -70,6 +72,8 @@ export default function PhpVersionPicker({
       // every version unannotated, which is exactly the old behaviour.
       setLoadFailed(true);
       return null;
+    } finally {
+      setCheckingVersions(false);
     }
   }, []);
 
@@ -188,19 +192,39 @@ export default function PhpVersionPicker({
 
   return (
     <div className={className}>
-      <select
-        id={id}
-        value={value}
-        onChange={(e) => onChange(e.target.value, isReady(e.target.value))}
-        disabled={disabled || !!installing}
-        className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800 disabled:opacity-50"
-      >
-        {offered.map((v) => (
-          <option key={v.version} value={v.version}>
-            {loadFailed ? `PHP ${v.version}` : label(v)}
-          </option>
-        ))}
-      </select>
+      <div className="flex items-center gap-2">
+        <select
+          id={id}
+          value={value}
+          onChange={(e) => onChange(e.target.value, isReady(e.target.value))}
+          disabled={disabled || !!installing}
+          className="flex-1 px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800 disabled:opacity-50"
+        >
+          {offered.map((v) => (
+            <option key={v.version} value={v.version}>
+              {loadFailed ? `PHP ${v.version}` : label(v)}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={() => load()}
+          disabled={checkingVersions || !!installing}
+          title="Check for more PHP versions"
+          className="px-2.5 py-2.5 bg-dark-700 hover:bg-dark-600 border border-dark-500 text-dark-200 hover:text-dark-50 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 shrink-0 flex items-center gap-1"
+        >
+          <svg
+            className={`w-3.5 h-3.5 ${checkingVersions ? "animate-spin" : ""}`}
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          <span className="hidden sm:inline">{checkingVersions ? "Checking…" : "Check"}</span>
+        </button>
+      </div>
 
       {needsInstall && !installing && (
         <div className="mt-2 px-3 py-2.5 bg-warn-500/10 border border-warn-500/30 rounded-lg">
