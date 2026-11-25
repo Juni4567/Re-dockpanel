@@ -5,10 +5,32 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use crate::router::RouterConfig;
 
+fn default_runtime() -> String {
+    "php".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_upload_mb() -> i32 {
+    64
+}
+
+fn default_php_memory_mb() -> i32 {
+    256
+}
+
+fn default_php_workers() -> i32 {
+    4
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalSite {
     pub id: String,
     pub domain: String,
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
     pub php_version: String,
     pub document_root: String,
     pub status: String,
@@ -16,6 +38,14 @@ pub struct LocalSite {
     pub ssl_enabled: bool,
     #[serde(default)]
     pub php_preset: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_upload_mb")]
+    pub max_upload_mb: i32,
+    #[serde(default = "default_php_memory_mb")]
+    pub php_memory_mb: i32,
+    #[serde(default = "default_php_workers")]
+    pub php_max_workers: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -259,6 +289,7 @@ impl AppState {
         };
         if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
             s.php_preset = Some(preset.to_string());
+            s.runtime = "php".to_string();
             drop(data);
             self.save_data();
             true
@@ -325,12 +356,17 @@ impl AppState {
         let site = LocalSite {
             id,
             domain: clean_domain.clone(),
+            runtime: "php".to_string(),
             php_version: php_version.unwrap_or("8.3").to_string(),
             document_root: site_dir.to_string_lossy().to_string(),
             status: "active".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             ssl_enabled: true,
             php_preset: None,
+            enabled: true,
+            max_upload_mb: 64,
+            php_memory_mb: 256,
+            php_max_workers: 4,
         };
 
         {
@@ -733,6 +769,17 @@ mod tests {
             h.abort();
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_local_site_defaults_runtime_and_enabled() {
+        let legacy_json = r#"{"id":"1","domain":"domain.local","php_version":"8.3","document_root":"C:\\sites\\domain.local","status":"active","created_at":"2026-01-01T00:00:00Z","ssl_enabled":true}"#;
+        let site: LocalSite = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(site.runtime, "php");
+        assert!(site.enabled);
+        assert_eq!(site.max_upload_mb, 64);
+        assert_eq!(site.php_memory_mb, 256);
+        assert_eq!(site.php_max_workers, 4);
     }
 }
 

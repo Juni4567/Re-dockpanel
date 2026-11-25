@@ -122,9 +122,33 @@ async fn create_site_handler(
 ) -> Response {
     let domain = payload.get("domain").and_then(|v| v.as_str()).unwrap_or("site.test");
     let php = payload.get("php_version").and_then(|v| v.as_str());
+    let cms = payload.get("cms").and_then(|v| v.as_str());
+    let preset = payload.get("php_preset").and_then(|v| v.as_str());
     match state.create_site(domain, php) {
         Ok(site) => {
-            let site = state.start_site(&site.id).unwrap_or(site);
+            if let Some(p) = cms.or(preset).filter(|s| !s.is_empty() && *s != "generic") {
+                state.update_site_preset(&site.id, p);
+            }
+            if cms == Some("wordpress") {
+                let site_dir = state.sites_dir.join(&site.domain);
+                let wp_req = wordpress::InstallWpRequest {
+                    admin_user: payload.get("admin_user").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    admin_pass: payload
+                        .get("admin_password")
+                        .or_else(|| payload.get("admin_pass"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    admin_email: payload.get("admin_email").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    title: payload
+                        .get("site_title")
+                        .or_else(|| payload.get("title"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    url: Some(format!("http://{}", site.domain)),
+                };
+                let _ = wordpress::install_site_wordpress(&site_dir, &site.domain, &wp_req);
+            }
+            let site = state.start_site(&site.id).unwrap_or_else(|_| state.get_site(&site.id).unwrap_or(site));
             Json(site).into_response()
         }
         Err(err) => (

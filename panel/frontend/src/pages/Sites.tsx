@@ -10,6 +10,7 @@ import PhpVersionPicker from "../components/PhpVersionPicker";
 import SiteThumbnail from "../components/SiteThumbnail";
 import SiteFavicon from "../components/SiteFavicon";
 import DesktopSiteActions from "../components/DesktopSiteActions";
+import InstallWordPressModal from "../components/InstallWordPressModal";
 import LiveSyncModal from "../components/LiveSyncModal";
 import PortConflictModal, {
   PortConflictInfo,
@@ -29,7 +30,8 @@ interface SiteMetrics {
 interface Site {
   id: string;
   domain: string;
-  runtime: string;
+  runtime?: string;
+  php_preset?: string | null;
   status: string;
   ssl_enabled: boolean;
   enabled: boolean;
@@ -77,6 +79,7 @@ export default function Sites() {
   const [transferring, setTransferring] = useState(false);
   const [notice, setNotice] = useState("");
   const [syncSite, setSyncSite] = useState<Site | null>(null);
+  const [wpInstallSite, setWpInstallSite] = useState<Site | null>(null);
   const [conflictInfo, setConflictInfo] = useState<PortConflictInfo | null>(null);
   const [showPortModal, setShowPortModal] = useState(false);
 
@@ -794,7 +797,7 @@ export default function Sites() {
                               </div>
                               <div className="flex items-center justify-between">
                                 <span className="text-dark-300">Runtime:</span>
-                                <span className="font-mono text-dark-100">{runtimeLabels[site.runtime] || site.runtime}</span>
+                                <span className="font-mono text-dark-100">{runtimeLabels[site.runtime || "php"] || site.runtime || "PHP"}</span>
                               </div>
                               <div className="flex items-center justify-between">
                                 <span className="text-dark-300">Disk Usage:</span>
@@ -846,6 +849,29 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
                                 </svg>
                               </Link>
+                              {(!site.runtime || site.runtime === "php" || site.runtime === "static") && (
+                                site.php_preset === "wordpress" ? (
+                                  <Link
+                                    to={`/sites/${site.id}/wordpress`}
+                                    className="p-1.5 rounded hover:bg-dark-700 text-[#38bdf8] transition-colors"
+                                    title="Manage WordPress"
+                                  >
+                                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                                      <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                                    </svg>
+                                  </Link>
+                                ) : (
+                                  <button
+                                    onClick={() => setWpInstallSite(site)}
+                                    className="p-1.5 rounded hover:bg-dark-700 text-dark-300 hover:text-[#38bdf8] transition-colors"
+                                    title="Install WordPress"
+                                  >
+                                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                                      <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                                    </svg>
+                                  </button>
+                                )
+                              )}
                               {isDesktopApp() && (
                                 <>
                                   <button
@@ -972,7 +998,7 @@ export default function Sites() {
                             {m?.traffic_bytes_this_month ? `${formatSize(m.traffic_bytes_this_month)} / mo` : "0 B / mo"}
                           </td>
                           <td className="px-4 py-4 text-sm text-dark-200 hidden sm:table-cell">
-                            {runtimeLabels[site.runtime] || site.runtime}
+                            {runtimeLabels[site.runtime || "php"] || site.runtime || "PHP"}
                           </td>
                           <td className="px-4 py-4 whitespace-nowrap">
                             <div className="flex items-center gap-1.5">
@@ -1017,6 +1043,29 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V7M4 7c0-2 1.5-3 3.5-3s3.5 1 3.5 3M4 7c0 2 1.5 3 3.5 3s3.5-1 3.5-3m7-3v10c0 2 1.5 3 3.5 3s3.5-1 3.5-3V4m0 0c0-2 1.5-3 3.5-3s3.5 1 3.5 3m0 0c0 2 1.5 3 3.5 3s3.5-1 3.5-3" />
                                 </svg>
                               </Link>
+                              {(!site.runtime || site.runtime === "php" || site.runtime === "static") && (
+                                site.php_preset === "wordpress" ? (
+                                  <Link
+                                    to={`/sites/${site.id}/wordpress`}
+                                    className="p-1.5 rounded hover:bg-dark-700 text-[#38bdf8] transition-colors"
+                                    title="Manage WordPress"
+                                  >
+                                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                                      <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                                    </svg>
+                                  </Link>
+                                ) : (
+                                  <button
+                                    onClick={() => setWpInstallSite(site)}
+                                    className="p-1.5 rounded hover:bg-dark-700 text-dark-300 hover:text-[#38bdf8] transition-colors"
+                                    title="Install WordPress"
+                                  >
+                                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                                      <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                                    </svg>
+                                  </button>
+                                )
+                              )}
                               {isDesktopApp() && (
                                 <>
                                   <button
@@ -1137,6 +1186,15 @@ export default function Sites() {
           site={syncSite}
           isOpen={!!syncSite}
           onClose={() => setSyncSite(null)}
+        />
+      )}
+      {wpInstallSite && (
+        <InstallWordPressModal
+          isOpen={!!wpInstallSite}
+          onClose={() => setWpInstallSite(null)}
+          siteId={wpInstallSite.id}
+          domain={wpInstallSite.domain}
+          onSuccess={fetchSites}
         />
       )}
       <PortConflictModal

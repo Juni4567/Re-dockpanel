@@ -237,6 +237,38 @@ pub async fn install(
         .await
         .map_err(|e| agent_error("WordPress", e))?;
 
+    // Ensure the site record reflects WordPress (and upgrades static sites to PHP + WordPress vhost).
+    if let Ok(Some(mut site)) = sqlx::query_as::<_, crate::models::Site>(
+        "SELECT * FROM sites WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        let was_static = site.runtime == "static";
+        let preset_changed = site.php_preset.as_deref() != Some("wordpress");
+        if was_static {
+            site.runtime = "php".to_string();
+            if site.php_version.is_none() {
+                site.php_version = Some("8.3".to_string());
+            }
+        }
+        site.php_preset = Some("wordpress".to_string());
+
+        if was_static || preset_changed {
+            let nginx_body = crate::routes::sites::build_nginx_body(&site);
+            let _ = agent.put(&format!("/nginx/sites/{domain}"), nginx_body).await;
+            let _ = sqlx::query(
+                "UPDATE sites SET runtime = $1, php_version = $2, php_preset = 'wordpress', updated_at = NOW() WHERE id = $3",
+            )
+            .bind(&site.runtime)
+            .bind(&site.php_version)
+            .bind(id)
+            .execute(&state.db)
+            .await;
+        }
+    }
+
     activity::log_activity(
         &state.db,
         claims.sub,

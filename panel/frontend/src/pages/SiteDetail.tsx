@@ -800,18 +800,31 @@ export default function SiteDetail() {
                 className="px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 transition-colors">
                 Rename
               </button>
-              {/* Install WordPress */}
-              {site?.runtime === "php" && site?.php_preset !== "wordpress" && (
-                <button
-                  onClick={() => setShowInstallWpModal(true)}
-                  className="px-4 py-2 bg-[#0073aa] hover:bg-[#005177] text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 shadow-sm"
-                  title="Install WordPress on this site"
-                >
-                  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
-                  </svg>
-                  Install WordPress
-                </button>
+              {/* Install / Manage WordPress */}
+              {(!site?.runtime || site.runtime === "php" || site.runtime === "static") && (
+                site?.php_preset === "wordpress" ? (
+                  <Link
+                    to={`/sites/${id}/wordpress`}
+                    className="px-4 py-2 bg-[#0073aa] hover:bg-[#005177] text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 shadow-sm"
+                    title="Manage WordPress Toolkit"
+                  >
+                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                    </svg>
+                    WordPress
+                  </Link>
+                ) : (
+                  <button
+                    onClick={() => setShowInstallWpModal(true)}
+                    className="px-4 py-2 bg-[#0073aa] hover:bg-[#005177] text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 shadow-sm"
+                    title="Install WordPress on this site"
+                  >
+                    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                    </svg>
+                    Install WordPress
+                  </button>
+                )
               )}
               {/* Clone */}
               {showCloneInput ? (
@@ -1577,7 +1590,7 @@ export default function SiteDetail() {
             </div>
           </div>
         </Link>
-        {(site.php_preset === "wordpress" || site.runtime === "php") && (
+        {(!site.runtime || site.runtime === "php" || site.runtime === "static" || site.php_preset === "wordpress") && (
           site.php_preset === "wordpress" ? (
             <Link
               to={`/sites/${id}/wordpress`}
