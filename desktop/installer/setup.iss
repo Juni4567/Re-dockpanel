@@ -29,7 +29,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=assets\app.ico
 WizardImageFile=assets\banner.bmp
-WizardSmallImageFile=assets\app.ico
+WizardSmallImageFile=assets\small.bmp
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ChangesEnvironment=no
@@ -60,10 +60,24 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilen
 
 [Run]
 Filename: "{sys}\sc.exe"; Parameters: "create DockPanelHostHelper binPath= ""{app}\dockpanel-host-helper.exe"" start= auto obj= ""LocalSystem"""; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "config DockPanelHostHelper binPath= ""{app}\dockpanel-host-helper.exe"" start= auto obj= ""LocalSystem"""; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "start DockPanelHostHelper"; Flags: runhidden
 Filename: "{app}\mkcert.exe"; Parameters: "-install"; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-Filename: "{sys}\sc.exe"; Parameters: "stop DockPanelHostHelper"; Flags: runhidden
-Filename: "{sys}\sc.exe"; Parameters: "delete DockPanelHostHelper"; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "stop DockPanelHostHelper"; Flags: runhidden; RunOnceId: "StopHostHelper"
+Filename: "{sys}\sc.exe"; Parameters: "delete DockPanelHostHelper"; Flags: runhidden; RunOnceId: "DeleteHostHelper"
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "DockPanel Desktop.exe" /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "dockpanel.exe" /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\sc.exe'), 'stop DockPanelHostHelper', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1000);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "dockpanel-host-helper.exe" /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
+end;
