@@ -211,9 +211,26 @@ pub async fn install(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+
+    // Normalize field aliases so callers can send admin_pass OR admin_password, title OR site_title
+    if let Some(obj) = body.as_object_mut() {
+        if !obj.contains_key("admin_pass") {
+            if let Some(pass) = obj.get("admin_password").cloned() {
+                obj.insert("admin_pass".to_string(), pass);
+            }
+        }
+        if !obj.contains_key("title") {
+            if let Some(t) = obj.get("site_title").cloned() {
+                obj.insert("title".to_string(), t);
+            }
+        }
+        if !obj.contains_key("url") || obj.get("url").and_then(|u| u.as_str()).map(|s| s.is_empty()).unwrap_or(false) {
+            obj.insert("url".to_string(), serde_json::json!(format!("http://{domain}")));
+        }
+    }
 
     let resp: serde_json::Value = agent
         .post(&format!("/wordpress/{domain}/install"), Some(body))

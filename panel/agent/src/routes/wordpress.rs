@@ -10,15 +10,26 @@ use crate::services::wordpress;
 
 #[derive(serde::Deserialize)]
 pub struct InstallRequest {
-    url: String,
-    title: String,
-    admin_user: String,
-    admin_pass: String,
-    admin_email: String,
-    db_name: String,
-    db_user: String,
-    db_pass: String,
-    db_host: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(alias = "site_title")]
+    pub title: String,
+    pub admin_user: String,
+    #[serde(alias = "admin_password")]
+    pub admin_pass: String,
+    pub admin_email: String,
+    #[serde(default)]
+    pub db_name: String,
+    #[serde(default)]
+    pub db_user: String,
+    #[serde(default)]
+    pub db_pass: String,
+    #[serde(default = "default_db_host")]
+    pub db_host: String,
+}
+
+fn default_db_host() -> String {
+    "localhost".to_string()
 }
 
 #[derive(serde::Deserialize)]
@@ -214,15 +225,19 @@ async fn install(
     Json(body): Json<InstallRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_domain(&domain)?;
+    let url = if body.url.is_empty() { format!("http://{domain}") } else { body.url };
+    let db_name = if body.db_name.is_empty() { format!("{}_wp", domain.replace('.', "_").replace('-', "_")) } else { body.db_name };
+    let db_user = if body.db_user.is_empty() { "root".to_string() } else { body.db_user };
+
     wordpress::install(
         &domain,
-        &body.url,
+        &url,
         &body.title,
         &body.admin_user,
         &body.admin_pass,
         &body.admin_email,
-        &body.db_name,
-        &body.db_user,
+        &db_name,
+        &db_user,
         &body.db_pass,
         &body.db_host,
     )
