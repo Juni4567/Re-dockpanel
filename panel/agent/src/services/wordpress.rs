@@ -293,6 +293,37 @@ pub async fn install(
     // Download WordPress core files
     wp(domain, &["core", "download", "--force"]).await?;
 
+    // Wait briefly for a newly created MariaDB container to finish initializing
+    // before invoking `wp config create` (returns immediately if already accepting TCP/MySQL).
+    if db_host != "localhost" && !db_host.is_empty() {
+        let (wait_host, wait_port) = match db_host.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, p),
+            _ => (db_host, "3306"),
+        };
+        for attempt in 0..25 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let check = safe_command("php")
+                .args([
+                    "-r",
+                    "mysqli_report(MYSQLI_REPORT_OFF); $c = @mysqli_connect(getenv('DB_H'), getenv('DB_U'), getenv('DB_P'), getenv('DB_N'), (int)getenv('DB_PORT')); if ($c) { mysqli_close($c); echo 'OK'; }",
+                ])
+                .env("DB_H", wait_host)
+                .env("DB_PORT", wait_port)
+                .env("DB_U", db_user)
+                .env("DB_P", db_pass)
+                .env("DB_N", db_name)
+                .output()
+                .await;
+            if let Ok(o) = check {
+                if String::from_utf8_lossy(&o.stdout).contains("OK") {
+                    break;
+                }
+            }
+        }
+    }
+
     // Create wp-config.php (--skip-plugins --skip-themes for safety)
     //
     // These two calls predate `wp_at_root` — the file's own doc comment on that

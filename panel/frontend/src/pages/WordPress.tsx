@@ -296,6 +296,10 @@ export default function WordPress() {
     }
   }, [id, desktop]);
 
+  const defaultInstallUrl = site?.domain
+    ? `${!desktop && site.ssl_enabled ? "https" : "http"}://${site.domain}`
+    : "";
+
   const handleInstall = async () => {
     setBusy("install");
     setWpInstallId(null);
@@ -304,7 +308,7 @@ export default function WordPress() {
         ...installData,
         admin_pass: installData.admin_pass,
         title: installData.title || "My WordPress Site",
-        url: installData.url || (site?.domain ? `http://${site.domain}` : ""),
+        url: installData.url || defaultInstallUrl,
         admin_email: installData.admin_email || (site?.domain ? `admin@${site.domain}` : ""),
         ...(desktop ? { stream: true } : {}),
       };
@@ -778,7 +782,7 @@ export default function WordPress() {
                     setWpInstallId(null);
                     setBusy("");
                     setShowInstall(false);
-                    showGlobalNotification("success", `WordPress installed successfully on http://${domain}!`);
+                    showGlobalNotification("success", `WordPress installed successfully on ${installData.url || defaultInstallUrl}!`);
                     loadData();
                   }}
                 />
@@ -789,7 +793,7 @@ export default function WordPress() {
                   <label className="block text-xs font-medium text-dark-100 mb-1">Site URL</label>
                   <input
                     type="text"
-                    value={installData.url || `${desktop ? "http" : "https"}://${domain}`}
+                    value={installData.url || defaultInstallUrl}
                     onChange={(e) => setInstallData({ ...installData, url: e.target.value })}
                     className="w-full px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-sm text-dark-100 focus:border-rust-500 outline-none"
                   />

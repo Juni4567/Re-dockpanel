@@ -954,7 +954,7 @@ pub async fn schema_overview(
 /// or Err(403) if the reseller's database quota is exhausted. The conditional
 /// UPDATE ... RETURNING makes the quota check and the increment a single atomic
 /// statement, closing the check-then-increment TOCTOU.
-async fn reserve_reseller_db_slot(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
+pub(crate) async fn reserve_reseller_db_slot(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
     let reserved: Option<i32> = sqlx::query_scalar(
         "UPDATE reseller_profiles SET used_databases = used_databases + 1, updated_at = NOW() \
          WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL) \
@@ -989,7 +989,7 @@ async fn reserve_reseller_db_slot(state: &AppState, user_id: Uuid) -> Result<boo
 
 /// Release a reserved reseller database slot (compensating decrement) when a
 /// create fails after `reserve_reseller_db_slot` succeeded.
-async fn release_reseller_db_slot(state: &AppState, user_id: Uuid) {
+pub(crate) async fn release_reseller_db_slot(state: &AppState, user_id: Uuid) {
     let _ = sqlx::query(
         "UPDATE reseller_profiles SET used_databases = GREATEST(used_databases - 1, 0), updated_at = NOW() \
          WHERE user_id = (SELECT reseller_id FROM users WHERE id = $1 AND reseller_id IS NOT NULL)",
@@ -1000,7 +1000,7 @@ async fn release_reseller_db_slot(state: &AppState, user_id: Uuid) {
 }
 
 /// Find an available port using a single SQL query to find the first gap.
-async fn find_available_port(state: &AppState, engine: &str) -> Result<i32, ApiError> {
+pub(crate) async fn find_available_port(state: &AppState, engine: &str) -> Result<i32, ApiError> {
     // Choose port range based on engine. Ranges are intentionally wide so that the
     // per-account cap (MAX_DATABASES_PER_USER) leaves ample headroom and one tenant
     // cannot exhaust the shared, host-wide pool.
@@ -1025,6 +1025,202 @@ async fn find_available_port(state: &AppState, engine: &str) -> Result<i32, ApiE
         StatusCode::INTERNAL_SERVER_ERROR,
         "No available ports for database",
     ))
+}
+
+pub(crate) struct SiteMariaDbCredentials {
+    pub db_id: Uuid,
+    pub db_name: String,
+    pub db_user: String,
+    pub db_pass: String,
+    pub db_host: String,
+    pub container_id: Option<String>,
+    pub reserved_quota: bool,
+    pub newly_created: bool,
+}
+
+/// Sanitize a domain into a valid MySQL/PostgreSQL database identifier (max 63 chars).
+fn sanitize_wp_db_name(domain: &str) -> String {
+    let mut base: String = domain
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if !base
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        base = format!("wp_{base}");
+    }
+    base.truncate(59);
+    let candidate = if base.ends_with("_wp") {
+        base
+    } else {
+        format!("{base}_wp")
+    };
+    candidate
+}
+
+/// Reuse an existing site MariaDB/MySQL database or provision a new MariaDB container for WordPress.
+pub(crate) async fn ensure_site_mariadb(
+    state: &AppState,
+    agent: &crate::services::agent::AgentHandle,
+    user_id: Uuid,
+    site_id: Uuid,
+    domain: &str,
+) -> Result<SiteMariaDbCredentials, ApiError> {
+    if let Some((db_id, db_name, db_user, db_password_enc, port)) = sqlx::query_as::<_, (Uuid, String, String, String, i32)>(
+        "SELECT id, name, db_user, db_password_enc, port \
+         FROM databases \
+         WHERE site_id = $1 AND engine IN ('mariadb', 'mysql') AND port IS NOT NULL \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(site_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| internal_error("lookup site database", e))?
+    {
+        let db_pass = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+            &db_password_enc,
+            &state.config.jwt_secret,
+        );
+        return Ok(SiteMariaDbCredentials {
+            db_id,
+            db_name,
+            db_user,
+            db_pass,
+            db_host: format!("127.0.0.1:{port}"),
+            container_id: None,
+            reserved_quota: false,
+            newly_created: false,
+        });
+    }
+
+    let (db_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE COALESCE(s.user_id, st.user_id) = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| internal_error("count databases", e))?;
+    if db_count >= MAX_DATABASES_PER_USER {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            &format!("Database limit reached ({MAX_DATABASES_PER_USER} per account)"),
+        ));
+    }
+
+    let mut db_name = sanitize_wp_db_name(domain);
+    let taken: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM databases WHERE name = $1 LIMIT 1")
+        .bind(&db_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("check database name", e))?;
+    if taken.is_some() || is_reserved_db_name(&db_name) {
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let max_prefix = 63usize.saturating_sub(suffix.len() + 1);
+        let mut prefix = sanitize_wp_db_name(domain);
+        prefix.truncate(max_prefix);
+        db_name = format!("{prefix}_{suffix}");
+    }
+
+    let password = Uuid::new_v4().to_string().replace('-', "");
+    let port = find_available_port(state, "mariadb").await?;
+    let encrypted_password =
+        crate::services::secrets_crypto::encrypt_credential(&password, &state.config.jwt_secret)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Encryption failed: {e}")))?;
+
+    let reserved_quota = reserve_reseller_db_slot(state, user_id).await?;
+    let db_id: Uuid = match sqlx::query_scalar(
+        "INSERT INTO databases (site_id, stack_id, name, engine, db_user, db_password_enc, container_id, port) \
+         VALUES ($1, NULL, $2, 'mariadb', $3, $4, '', $5) RETURNING id",
+    )
+    .bind(site_id)
+    .bind(&db_name)
+    .bind(&db_name)
+    .bind(&encrypted_password)
+    .bind(port)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            if reserved_quota {
+                release_reseller_db_slot(state, user_id).await;
+            }
+            return Err(internal_error("insert site database", e));
+        }
+    };
+
+    let agent_body = serde_json::json!({
+        "name": db_name,
+        "engine": "mariadb",
+        "password": password,
+        "port": port,
+    });
+    let result = match agent.post("/databases", Some(agent_body)).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = sqlx::query("DELETE FROM databases WHERE id = $1")
+                .bind(db_id)
+                .execute(&state.db)
+                .await;
+            if reserved_quota {
+                release_reseller_db_slot(state, user_id).await;
+            }
+            return Err(agent_error("Database creation", e));
+        }
+    };
+
+    let container_id = result
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let _ = sqlx::query("UPDATE databases SET container_id = $1 WHERE id = $2")
+        .bind(&container_id)
+        .bind(db_id)
+        .execute(&state.db)
+        .await;
+
+    tracing::info!("Auto-provisioned MariaDB {db_name} (port {port}) for WordPress install on {domain}");
+
+    Ok(SiteMariaDbCredentials {
+        db_id,
+        db_name: db_name.clone(),
+        db_user: db_name,
+        db_pass: password,
+        db_host: format!("127.0.0.1:{port}"),
+        container_id: Some(container_id),
+        reserved_quota,
+        newly_created: true,
+    })
+}
+
+/// Remove a newly provisioned MariaDB database if WordPress installation fails before completion.
+pub(crate) async fn cleanup_provisioned_db(
+    state: &AppState,
+    agent: &crate::services::agent::AgentHandle,
+    user_id: Uuid,
+    creds: &SiteMariaDbCredentials,
+) {
+    if !creds.newly_created {
+        return;
+    }
+    if let Some(ref cid) = creds.container_id {
+        if !cid.is_empty() {
+            let _ = agent.delete(&format!("/databases/{cid}")).await;
+        }
+    }
+    let _ = sqlx::query("DELETE FROM databases WHERE id = $1")
+        .bind(creds.db_id)
+        .execute(&state.db)
+        .await;
+    if creds.reserved_quota {
+        release_reseller_db_slot(state, user_id).await;
+    }
 }
 
 // ─── Point-in-Time Recovery (PITR) ─────────────────────────────

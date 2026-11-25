@@ -148,7 +148,7 @@ fn emit_step(
 /// But every failure is logged at error level, because the failure mode this
 /// exists to kill (s252 F3) was a password generated, handed to wp-cli, and
 /// dropped on the floor beside an empty vault — with nothing said anywhere.
-async fn store_site_secret(
+pub(crate) async fn store_site_secret(
     pool: &sqlx::PgPool,
     jwt_secret: &str,
     vault_id: Uuid,

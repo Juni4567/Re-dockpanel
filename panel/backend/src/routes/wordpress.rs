@@ -237,10 +237,94 @@ pub async fn install(
         }
     }
 
-    let resp: serde_json::Value = agent
+    // One-click installs from WP Toolkit omit DB fields; ensure a site MariaDB container
+    // exists and pass 127.0.0.1:<port> so wp-cli does not fall back to localhost Unix socket.
+    let needs_db_creds = body
+        .as_object()
+        .map(|obj| {
+            let has = |k: &str| {
+                obj.get(k)
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            };
+            !(has("db_host") && has("db_name") && has("db_user"))
+        })
+        .unwrap_or(true);
+
+    let provisioned_db = if needs_db_creds {
+        let creds = crate::routes::databases::ensure_site_mariadb(&state, &agent, claims.sub, id, &domain).await?;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("db_name".to_string(), serde_json::json!(&creds.db_name));
+            obj.insert("db_user".to_string(), serde_json::json!(&creds.db_user));
+            obj.insert("db_pass".to_string(), serde_json::json!(&creds.db_pass));
+            obj.insert("db_host".to_string(), serde_json::json!(&creds.db_host));
+        }
+        Some(creds)
+    } else {
+        None
+    };
+
+    let admin_user_val = body.get("admin_user").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let admin_pass_val = body.get("admin_pass").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let resp: serde_json::Value = match agent
         .post(&format!("/wordpress/{domain}/install"), Some(body))
         .await
-        .map_err(|e| agent_error("WordPress", e))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(ref creds) = provisioned_db {
+                crate::routes::databases::cleanup_provisioned_db(&state, &agent, claims.sub, creds).await;
+            }
+            return Err(agent_error("WordPress", e));
+        }
+    };
+
+    // Save DB and WP admin credentials to the site vault if one exists.
+    if let Ok(Some((vault_id,))) = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM secrets_vaults WHERE site_id = $1 LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        if let Some(ref creds) = provisioned_db {
+            if creds.newly_created {
+                crate::routes::sites::store_site_secret(
+                    &state.db,
+                    &state.config.jwt_secret,
+                    vault_id,
+                    "database_password",
+                    &creds.db_pass,
+                    &format!("Database password for {}", creds.db_name),
+                )
+                .await;
+            }
+        }
+        if !admin_pass_val.is_empty() {
+            crate::routes::sites::store_site_secret(
+                &state.db,
+                &state.config.jwt_secret,
+                vault_id,
+                "wordpress_admin_password",
+                &admin_pass_val,
+                &format!("WordPress admin password for {domain}"),
+            )
+            .await;
+        }
+        if !admin_user_val.is_empty() {
+            crate::routes::sites::store_site_secret(
+                &state.db,
+                &state.config.jwt_secret,
+                vault_id,
+                "wordpress_admin_user",
+                &admin_user_val,
+                &format!("WordPress admin username for {domain}"),
+            )
+            .await;
+        }
+    }
 
     // Ensure the site record reflects WordPress (and upgrades static sites to PHP + WordPress vhost).
     if let Ok(Some(mut site)) = sqlx::query_as::<_, crate::models::Site>(
