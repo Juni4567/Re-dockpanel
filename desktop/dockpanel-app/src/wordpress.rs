@@ -79,6 +79,178 @@ pub fn get_site_wp_info(site_dir: &Path, domain: &str, php_version: &str) -> ser
     })
 }
 
+/// Attempts to install real WordPress core + official SQLite database integration on Windows.
+/// Returns `Ok(true)` if real WordPress was installed, or `Ok(false)` / `Err` so caller falls back cleanly.
+#[cfg(not(test))]
+fn try_install_real_wordpress_windows(
+    site_dir: &Path,
+    domain: &str,
+    title: &str,
+    admin_user: &str,
+    admin_pass: &str,
+    admin_email: &str,
+) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let app_data = std::env::var("APPDATA")
+            .unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()));
+        let cache_dir = Path::new(&app_data).join("DockPanel").join("cache");
+        let _ = fs::create_dir_all(&cache_dir);
+
+        let php_exe = crate::state::find_php_binary(None)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let esc = |s: &str| s.replace('\'', "''");
+        let ps = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$siteDir = '{site_dir}'
+$cacheDir = '{cache_dir}'
+$wpZip = Join-Path $cacheDir 'wordpress-latest.zip'
+$sqliteZip = Join-Path $cacheDir 'sqlite-database-integration.zip'
+
+if (-not (Test-Path $wpZip) -or (Get-Item $wpZip).Length -lt 5000000) {{
+    Invoke-WebRequest -Uri 'https://wordpress.org/latest.zip' -OutFile $wpZip -TimeoutSec 120 -UseBasicParsing
+}}
+if (-not (Test-Path $sqliteZip) -or (Get-Item $sqliteZip).Length -lt 10000) {{
+    Invoke-WebRequest -Uri 'https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip' -OutFile $sqliteZip -TimeoutSec 60 -UseBasicParsing
+}}
+
+$tmpExtract = Join-Path $env:TEMP ("wp_extract_" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $tmpExtract | Out-Null
+Expand-Archive -Path $wpZip -DestinationPath $tmpExtract -Force
+$wpRoot = Join-Path $tmpExtract 'wordpress'
+if (-not (Test-Path $wpRoot)) {{ throw 'wordpress folder missing inside archive' }}
+
+Get-ChildItem -Force $wpRoot | ForEach-Object {{
+    $dest = Join-Path $siteDir $_.Name
+    Copy-Item -Path $_.FullName -Destination $dest -Recurse -Force
+}}
+
+$pluginsDir = Join-Path $siteDir 'wp-content\plugins'
+New-Item -ItemType Directory -Force -Path $pluginsDir | Out-Null
+Expand-Archive -Path $sqliteZip -DestinationPath $pluginsDir -Force
+
+$dbCopy = Join-Path $pluginsDir 'sqlite-database-integration\db.copy'
+$dbTarget = Join-Path $siteDir 'wp-content\db.php'
+if (Test-Path $dbCopy) {{
+    $dbPhp = Get-Content -Raw $dbCopy
+    $dbPhp = $dbPhp -replace '\{{SQLITE_IMPLEMENTATION_FOLDER_PATH\}}', ($pluginsDir.Replace('\', '/') + '/sqlite-database-integration')
+    $dbPhp = $dbPhp -replace '\{{SQLITE_PLUGIN\}}', 'sqlite-database-integration/load.php'
+    Set-Content -Path $dbTarget -Value $dbPhp -Encoding UTF8
+}}
+
+Remove-Item -Recurse -Force $tmpExtract -ErrorAction SilentlyContinue
+"#,
+            site_dir = esc(&site_dir.to_string_lossy()),
+            cache_dir = esc(&cache_dir.to_string_lossy()),
+        );
+
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+        }
+
+        // Write wp-config.php configured for local SQLite + dynamic scheme/host
+        let salt = uuid::Uuid::new_v4().to_string();
+        let esc_php = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
+        let db_dir = site_dir.join("wp-content").join("database");
+        let _ = fs::create_dir_all(&db_dir);
+
+        let config_content = format!(
+            r#"<?php
+define( 'DB_ENGINE', 'sqlite' );
+define( 'DB_DIR', __DIR__ . '/wp-content/database' );
+define( 'DB_FILE', '.ht.sqlite' );
+define( 'DB_NAME', '{domain_php}_wp' );
+define( 'DB_USER', 'root' );
+define( 'DB_PASSWORD', '' );
+define( 'DB_HOST', '127.0.0.1' );
+define( 'DB_CHARSET', 'utf8mb4' );
+define( 'DB_COLLATE', '' );
+
+define( 'AUTH_KEY',         '{salt}-auth' );
+define( 'SECURE_AUTH_KEY',  '{salt}-sec' );
+define( 'LOGGED_IN_KEY',    '{salt}-log' );
+define( 'NONCE_KEY',        '{salt}-non' );
+define( 'AUTH_SALT',        '{salt}-asalt' );
+define( 'SECURE_AUTH_SALT', '{salt}-ssalt' );
+define( 'LOGGED_IN_SALT',   '{salt}-lsalt' );
+define( 'NONCE_SALT',       '{salt}-nsalt' );
+
+$table_prefix = 'wp_';
+define( 'WP_DEBUG', false );
+define( 'WP_ADMIN_USER', '{admin_user_php}' );
+define( 'WP_ADMIN_EMAIL', '{admin_email_php}' );
+define( 'WP_TITLE', '{title_php}' );
+
+$scheme = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' ) ? 'https' : 'http';
+$host   = $_SERVER['HTTP_HOST'] ?? '{domain_php}';
+define( 'WP_SITEURL', $scheme . '://' . $host );
+define( 'WP_HOME',    $scheme . '://' . $host );
+
+if ( ! defined( 'ABSPATH' ) ) {{
+    define( 'ABSPATH', __DIR__ . '/' );
+}}
+require_once ABSPATH . 'wp-settings.php';
+"#,
+            domain_php = esc_php(domain),
+            admin_user_php = esc_php(admin_user),
+            admin_email_php = esc_php(admin_email),
+            title_php = esc_php(title),
+        );
+        fs::write(site_dir.join("wp-config.php"), config_content)
+            .map_err(|e| format!("Failed to write wp-config.php: {}", e))?;
+
+        // Run silent wp_install via PHP so WordPress is pre-installed and skips the install wizard
+        if !php_exe.is_empty() && site_dir.join("wp-admin").join("includes").join("upgrade.php").is_file() {
+            let install_php = format!(
+                r#"<?php
+$_SERVER['HTTP_HOST'] = '{domain}';
+$_SERVER['SERVER_NAME'] = '{domain}';
+$_SERVER['REQUEST_URI'] = '/';
+define('WP_INSTALLING', true);
+require_once __DIR__ . '/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+if (!is_blog_installed()) {{
+    wp_install('{title}', '{user}', '{email}', true, '', '{pass}');
+}}
+"#,
+                domain = esc_php(domain),
+                title = esc_php(title),
+                user = esc_php(admin_user),
+                email = esc_php(admin_email),
+                pass = esc_php(admin_pass),
+            );
+            let helper = site_dir.join(".dockpanel_wp_setup.php");
+            if fs::write(&helper, install_php).is_ok() {
+                let _ = std::process::Command::new(&php_exe)
+                    .arg(&helper)
+                    .current_dir(site_dir)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                let _ = fs::remove_file(&helper);
+            }
+        }
+        return Ok(true);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (site_dir, domain, title, admin_user, admin_pass, admin_email);
+        Ok(false)
+    }
+}
+
 /// Installs WordPress files, SQLite/MySQL configuration, and sample page into site_dir.
 pub fn install_site_wordpress(
     site_dir: &Path,
@@ -87,12 +259,41 @@ pub fn install_site_wordpress(
 ) -> Result<serde_json::Value, String> {
     fs::create_dir_all(site_dir).map_err(|e| format!("Failed to create site directory: {}", e))?;
 
+    // Remove starter index.html so WordPress index.php takes precedence cleanly
+    let starter_html = site_dir.join("index.html");
+    if starter_html.is_file() {
+        let _ = fs::remove_file(&starter_html);
+    }
+
     let title = req.title.as_deref().unwrap_or("WordPress Site");
     let admin_user = req.admin_user.as_deref().unwrap_or("admin");
     let default_email = format!("admin@{}", domain);
     let admin_email = req.admin_email.as_deref().unwrap_or(&default_email);
-    let _admin_pass = req.admin_pass.as_deref().unwrap_or("password");
+    let admin_pass = req.admin_pass.as_deref().unwrap_or("password");
 
+    #[cfg(not(test))]
+    {
+        if let Ok(true) = try_install_real_wordpress_windows(
+            site_dir,
+            domain,
+            title,
+            admin_user,
+            admin_pass,
+            admin_email,
+        ) {
+            return Ok(json!({
+                "success": true,
+                "installed": true,
+                "version": "latest",
+                "url": format!("http://{}", domain),
+                "admin_user": admin_user,
+                "admin_email": admin_email,
+                "message": "WordPress installed successfully!"
+            }));
+        }
+    }
+
+    let _ = admin_pass;
     // 1. Create wp-includes/version.php
     let includes_dir = site_dir.join("wp-includes");
     fs::create_dir_all(&includes_dir).map_err(|e| format!("Failed to create wp-includes: {}", e))?;

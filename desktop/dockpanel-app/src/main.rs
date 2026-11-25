@@ -133,7 +133,7 @@ async fn create_site_handler(
             if let Some(p) = cms.or(preset).filter(|s| !s.is_empty() && *s != "generic") {
                 state.update_site_preset(&site.id, p);
             }
-            if cms == Some("wordpress") {
+            if cms == Some("wordpress") || preset == Some("wordpress") {
                 let site_dir = state.sites_dir.join(&site.domain);
                 let wp_req = wordpress::InstallWpRequest {
                     admin_user: payload.get("admin_user").and_then(|v| v.as_str()).map(|s| s.to_string()),

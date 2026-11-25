@@ -246,10 +246,11 @@ pub fn remove_domain_from_hosts_with_path(domain: &str, hosts_path: &Path) -> Re
 fn notify_host_helper(action: &str, domain: &str, ip: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
-        use std::io::Write;
+        use std::io::{BufRead, BufReader, Write};
         let mut last_err = None;
         for _attempt in 0..2 {
             match std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .open(HOST_HELPER_PIPE)
             {
@@ -264,6 +265,23 @@ fn notify_host_helper(action: &str, domain: &str, ip: &str) -> Result<(), String
                         continue;
                     }
                     let _ = pipe.flush();
+                    let mut reader = BufReader::new(pipe);
+                    let mut resp_line = String::new();
+                    if let Ok(n) = reader.read_line(&mut resp_line) {
+                        if n > 0 {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&resp_line) {
+                                if val.get("success").and_then(|v| v.as_bool()) == Some(true) {
+                                    return Ok(());
+                                }
+                                let err_msg = val
+                                    .get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Host helper returned failure");
+                                last_err = Some(err_msg.to_string());
+                                continue;
+                            }
+                        }
+                    }
                     return Ok(());
                 }
                 Err(e) => {
