@@ -935,10 +935,27 @@ pub async fn db_info(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
-    let resp = agent
+    let mut resp = agent
         .get(&format!("/wordpress/{domain}/db-info"))
         .await
         .map_err(|e| agent_error("WP db info", e))?;
+    if let Some(obj) = resp.as_object_mut() {
+        let db_name = obj
+            .get("db_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Ok(Some((db_id,))) = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT id FROM databases WHERE site_id = $1 ORDER BY (name = $2) DESC, created_at DESC LIMIT 1",
+        )
+        .bind(id)
+        .bind(&db_name)
+        .fetch_optional(&state.db)
+        .await
+        {
+            obj.insert("db_id".to_string(), serde_json::json!(db_id.to_string()));
+        }
+    }
     Ok(Json(resp))
 }
 
@@ -1044,9 +1061,21 @@ pub async fn setup(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    if let Some(obj) = body.as_object_mut() {
+        if !obj.contains_key("admin_pass") {
+            if let Some(p) = obj.remove("admin_password") {
+                obj.insert("admin_pass".to_string(), p);
+            }
+        }
+        if !obj.contains_key("site_title") {
+            if let Some(t) = obj.remove("title") {
+                obj.insert("site_title".to_string(), t);
+            }
+        }
+    }
     let resp: serde_json::Value = agent
         .post(&format!("/wordpress/{domain}/setup"), Some(body))
         .await

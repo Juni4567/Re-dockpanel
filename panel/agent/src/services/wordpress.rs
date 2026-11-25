@@ -797,9 +797,13 @@ pub async fn run_cli(domain: &str, command: &str) -> Result<(bool, String), Stri
 pub async fn get_features_status(domain: &str) -> Result<serde_json::Value, String> {
     let path = site_path(domain)?;
 
-    // 1. WP_DEBUG
+    // 1. WP_DEBUG (+ log/display flags)
     let debug_val = wp(domain, &["config", "get", "WP_DEBUG"]).await.unwrap_or_default();
     let wp_debug = debug_val.trim().eq_ignore_ascii_case("true") || debug_val.trim() == "1";
+    let debug_log_val = wp(domain, &["config", "get", "WP_DEBUG_LOG"]).await.unwrap_or_default();
+    let wp_debug_log = debug_log_val.trim().eq_ignore_ascii_case("true") || debug_log_val.trim() == "1";
+    let debug_disp_val = wp(domain, &["config", "get", "WP_DEBUG_DISPLAY"]).await.unwrap_or_default();
+    let wp_debug_display = debug_disp_val.trim().eq_ignore_ascii_case("true") || debug_disp_val.trim() == "1";
 
     // 2. Search engine indexing (blog_public)
     let public_val = wp(domain, &["option", "get", "blog_public"]).await.unwrap_or_default();
@@ -850,6 +854,8 @@ pub async fn get_features_status(domain: &str) -> Result<serde_json::Value, Stri
 
     Ok(serde_json::json!({
         "wp_debug": wp_debug,
+        "wp_debug_log": wp_debug_log,
+        "wp_debug_display": wp_debug_display,
         "search_indexing": search_indexing,
         "takeover_cron": takeover_cron,
         "maintenance_mode": maintenance_mode,
@@ -984,6 +990,8 @@ pub async fn toggle_feature(domain: &str, feature: &str, enabled: bool, params: 
         "caching" => {
             let flag = format!("/var/www/{domain}/.wp_nginx_cache");
             let nocache_flag = format!("/var/www/{domain}/.wp_nocache");
+            let val = if enabled { "true" } else { "false" };
+            let _ = wp(domain, &["config", "set", "WP_CACHE", val, "--raw"]).await;
             if enabled {
                 let _ = std::fs::write(&flag, "enabled");
                 let _ = std::fs::remove_file(&nocache_flag);
@@ -992,7 +1000,7 @@ pub async fn toggle_feature(domain: &str, feature: &str, enabled: bool, params: 
                 let _ = std::fs::write(&nocache_flag, "disabled");
             }
         }
-        "vuln_protect" => {
+        "vuln_protect" | "file_editing" => {
             let val = if enabled { "true" } else { "false" };
             let _ = wp(domain, &["config", "set", "DISALLOW_FILE_EDIT", val, "--raw"]).await;
             let _ = wp(domain, &["config", "set", "DISALLOW_FILE_MODS", val, "--raw"]).await;
@@ -1109,7 +1117,18 @@ pub async fn setup_admin(
         }
     }
 
-    let mut args = vec!["user", "update", user];
+    let resolved_user = if user.trim().is_empty() {
+        wp(domain, &["user", "list", "--role=administrator", "--field=user_login"])
+            .await
+            .ok()
+            .and_then(|out| out.lines().next().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "admin".to_string())
+    } else {
+        user.trim().to_string()
+    };
+
+    let mut args = vec!["user", "update", &resolved_user];
     let email_arg;
     if !email.trim().is_empty() {
         email_arg = format!("--user_email={}", email.trim());

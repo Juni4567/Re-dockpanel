@@ -1453,7 +1453,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/sites/{id}/wordpress/features-status", get(wordpress::features_status))
         .route("/api/sites/{id}/wordpress/toggle-feature", post(wordpress::toggle_feature))
         .route("/api/sites/{id}/wordpress/setup", post(wordpress::setup))
-        .route("/api/sites/{id}/wordpress/integrity", post(wordpress::integrity))
+        .route("/api/sites/{id}/wordpress/integrity", get(wordpress::integrity).post(wordpress::integrity))
         .route("/api/sites/{id}/wordpress/copy-data", post(wordpress::copy_data))
         .route("/api/sites/{id}/wordpress/mitigate-vulns", post(wordpress::mitigate_vulns))
         .route("/api/sites/{id}/wordpress/autoupdate-settings", post(wordpress::autoupdate_settings))

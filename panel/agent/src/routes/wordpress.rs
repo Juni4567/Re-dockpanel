@@ -62,11 +62,13 @@ pub struct MaintenanceRequest {
 
 #[derive(serde::Deserialize)]
 pub struct SetupRequest {
+    #[serde(default)]
     admin_user: String,
+    #[serde(default)]
     admin_email: String,
-    #[serde(default)]
+    #[serde(default, alias = "admin_password")]
     admin_pass: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "title")]
     site_title: Option<String>,
 }
 
@@ -127,7 +129,7 @@ pub fn router() -> Router<AppState> {
         .route("/wordpress/{domain}/toggle-feature", post(toggle_feature_route))
         .route("/wordpress/{domain}/maintenance", post(maintenance_route))
         .route("/wordpress/{domain}/setup", post(setup_route))
-        .route("/wordpress/{domain}/integrity", post(integrity_route))
+        .route("/wordpress/{domain}/integrity", get(integrity_route).post(integrity_route))
         .route("/wordpress/{domain}/copy-data", post(copy_data_route))
         .route("/wordpress/{domain}/mitigate-vulns", post(mitigate_vulns_route))
         .route("/wordpress/{domain}/reinstall-core", post(reinstall_core_route))
@@ -445,6 +447,10 @@ async fn clear_cache(
 
     let cache_ok = cache_result.map(|o| o.status.success()).unwrap_or(false);
     let transient_ok = transient_result.map(|o| o.status.success()).unwrap_or(false);
+    let cache_dir = std::path::Path::new(&path).join("wp-content").join("cache");
+    if cache_dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 
     Ok(Json(serde_json::json!({
         "ok": true,
