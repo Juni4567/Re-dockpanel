@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     DockPanel Desktop - Native Standalone Windows Installer
@@ -42,17 +42,28 @@ Write-Host "✓ Directories created at $InstallDir" -ForegroundColor Green
 # 3. Copy Application Binaries & Payloads
 Write-Host "`n[3/6] Copying binaries and runtime assets..." -ForegroundColor Yellow
 
-$SourceTauri = Join-Path $RootDir "desktop\src-tauri\target\release\DockPanel Desktop.exe"
+$SourceApp = Join-Path $RootDir "dockpanel.exe"
+if (-not (Test-Path $SourceApp)) {
+    $SourceApp = Join-Path $RootDir "desktop\dockpanel-app\target\release\dockpanel.exe"
+}
+if (-not (Test-Path $SourceApp)) {
+    $SourceApp = Join-Path $ScriptDir "bin\dockpanel.exe"
+}
 $SourceHelper = Join-Path $RootDir "desktop\host-helper\target\release\dockpanel-host-helper.exe"
-$SourceRuntime = Join-Path $RootDir "desktop\runtime\dockpanel-runtime.tar.gz"
+if (-not (Test-Path $SourceHelper)) {
+    $SourceHelper = Join-Path $RootDir "desktop\host-helper\target\debug\dockpanel-host-helper.exe"
+}
 $SourceMkcert = Join-Path $ScriptDir "bin\mkcert.exe"
 $SourceAppIcon = Join-Path $ScriptDir "assets\app.ico"
 $SourceBanner = Join-Path $ScriptDir "assets\banner.bmp"
 
-Copy-Item -Force $SourceTauri "$InstallDir\DockPanel Desktop.exe"
-Copy-Item -Force $SourceHelper "$InstallDir\dockpanel-host-helper.exe"
-Copy-Item -Force $SourceRuntime "$InstallDir\runtime\dockpanel-runtime.tar.gz"
-Copy-Item -Force $SourceMkcert "$InstallDir\mkcert.exe"
+Copy-Item -Force $SourceApp "$InstallDir\DockPanel Desktop.exe"
+if (Test-Path $SourceHelper) {
+    Copy-Item -Force $SourceHelper "$InstallDir\dockpanel-host-helper.exe"
+}
+if (Test-Path $SourceMkcert) {
+    Copy-Item -Force $SourceMkcert "$InstallDir\mkcert.exe"
+}
 Copy-Item -Force $SourceAppIcon "$InstallDir\assets\app.ico"
 Copy-Item -Force $SourceBanner "$InstallDir\assets\banner.bmp"
 Write-Host "✓ Application files copied successfully." -ForegroundColor Green

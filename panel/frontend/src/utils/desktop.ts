@@ -1,24 +1,28 @@
 /**
  * Desktop Environment Detection & Path Utilities
  *
- * DockPanel Desktop runs as a local workstation app powered by Tauri v2
- * and an isolated WSL2 micro-instance (dockpanel-desktop).
+ * DockPanel Desktop runs as a pure-Rust native Windows workstation app (Tao + Wry + Axum).
  */
 
 declare global {
   interface Window {
+    __DOCKPANEL__?: unknown;
     __TAURI__?: unknown;
+    ipc?: { postMessage: (msg: string) => void };
   }
 }
 
 /**
  * Detects whether the panel is running inside the desktop application:
- * - Inside the Tauri webview wrapper (window.__TAURI__ is defined)
+ * - Inside the native desktop webview wrapper (window.__DOCKPANEL__, window.ipc, or window.__TAURI__)
  * - Under desktop Vite development/preview mode (VITE_APP_MODE === 'desktop')
  */
 export function isDesktopApp(): boolean {
-  if (typeof window !== "undefined" && (window as any).__TAURI__ !== undefined) {
-    return true;
+  if (typeof window !== "undefined") {
+    const win = window as any;
+    if (win.__DOCKPANEL__ !== undefined || win.ipc !== undefined || win.__TAURI__ !== undefined) {
+      return true;
+    }
   }
   if (
     typeof import.meta !== "undefined" &&

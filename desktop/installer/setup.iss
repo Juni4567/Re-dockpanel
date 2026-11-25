@@ -41,8 +41,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; Main Tauri Desktop Application Executable
-Source: "..\src-tauri\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; Main Pure-Rust Desktop Application Executable
+Source: "bin\dockpanel.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 
 ; Zero-UAC Windows Named Pipe Host Helper Service
 Source: "..\host-helper\target\release\dockpanel-host-helper.exe"; DestDir: "{app}"; Flags: ignoreversion

@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=../../panel/frontend/dist");
     #[cfg(windows)]
     {
         let mut res = winres::WindowsResource::new();

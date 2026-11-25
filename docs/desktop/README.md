@@ -1,23 +1,24 @@
 # DockPanel Desktop
 
-> **Local WordPress and PHP Development Environment with Exact Linux Parity**  
-> Powered by Tauri v2, WSL2 Micro-distro, and Zero-UAC Windows Named Pipe Host Helper.
+> **Local WordPress and PHP Development Environment for Windows**  
+> Pure-Rust Desktop Architecture (Tao + Wry + Axum) with Embedded Multi-Site Router and Zero-UAC Windows Hosts Integration.
 
 ---
 
 ## 🌟 Overview
 
-**DockPanel Desktop** brings the complete, production-grade Linux server hosting stack of DockPanel to your local Windows development workstation. Unlike traditional Windows local development tools that run simulated Windows binaries, slow Docker-desktop layers, or VMs that degrade disk I/O, DockPanel Desktop leverages an isolated **WSL2 Micro-distro** running native Linux services directly on an ext4 filesystem.
+**DockPanel Desktop** is a high-performance, standalone Windows desktop application that brings local PHP and WordPress site management to your workstation with zero external virtualization dependencies (no Tauri, no WSL2 required).
 
 ### Key Capabilities
 
-- **Exact Linux Parity**: Runs the exact same Nginx, PHP (8.1 - 8.4 FPM), MariaDB, PostgreSQL, and Linux permissions (`www-data:www-data`, `0775`) as production VPS servers.
-- **Zero-UAC Local Domains**: Automatic host entry resolution for `.test` and `.local` domains without annoying Windows User Account Control (UAC) elevation prompts.
-- **Locally-Trusted Green-Padlock HTTPS**: Out-of-the-box wildcard SSL certificates signed by a local Root CA (`mkcert`) trusted by Windows and all browsers.
-- **Blazing Fast Disk I/O**: Files reside inside ext4 storage and are exposed directly to Windows via Windows UNC paths (`\\wsl.localhost\dockpanel-desktop\var\www\...`), avoiding NTFS cross-filesystem translation slowdowns.
-- **Native OS Integration**: One-click actions to "Open in Explorer" and "Open in VS Code" directly from the site dashboard.
-- **Bidirectional Live Server Synchronization**: Push local sites to staging/production or pull remote live sites down to local in seconds, featuring serialized PHP database domain rewriting and automated remote safety snapshots.
-- **100% Offline Installer**: Self-contained Inno Setup installer bundling the WSL micro-distro, binaries, and mkcert for friction-free setup without internet dependencies.
+- **Pure Rust Native Architecture**: Built directly with Tao, Wry, and an embedded in-process Tokio/Axum HTTP server.
+- **Embedded Multi-Site Router**: Routes incoming requests by `Host` header (`mytestdomain.local`, `wordpress.test`) directly to your local sites in `%USERPROFILE%\DockPanel\sites\<domain>\`.
+- **Intelligent Port Conflict Detection**: Detects when port 80 is occupied (e.g. by WampServer/Apache) and provides seamless automatic fallback to port 8080 with in-app resolution options.
+- **Site Start / Stop Lifecycle Controls**: Toggle sites between running and stopped directly from the UI with custom holding pages for stopped sites.
+- **Native Host PHP Proxy**: Automatically detects and uses local PHP installations (`C:\wamp64\bin\php\php8.*` or PATH) to run background workers per site.
+- **Zero-UAC Local Domains**: Automatic host entry resolution for `.test` and `.local` domains.
+- **One-Click Native Shortcuts**: "Open in Explorer" and "Open in VS Code" directly from the site list.
+- **Standalone Binary**: Compiles to a single, portable `dockpanel.exe` with embedded React UI.
 
 ---
 
@@ -184,11 +185,11 @@ cargo build --manifest-path desktop/host-helper/Cargo.toml --release
 ```
 Produces `desktop/host-helper/target/release/dockpanel-host-helper.exe`.
 
-#### 4. Build the Tauri Desktop Application
+#### 4. Build the Desktop Application
 ```bash
-cargo build --manifest-path desktop/src-tauri/Cargo.toml --release
+cargo build --manifest-path desktop/dockpanel-app/Cargo.toml --release
 ```
-Produces `desktop/src-tauri/target/release/DockPanel Desktop.exe`.
+Produces `desktop/dockpanel-app/target/release/dockpanel.exe` (copied to root `dockpanel.exe`).
 
 #### 5. Verify Installer Components
 Run the automated installer validation suite:
@@ -214,7 +215,7 @@ To run all automated verification tests across the desktop ecosystem:
 | **Frontend Production Build** | `npm --prefix panel/frontend run build` | TypeScript compilation and Vite production bundling |
 | **Backend Bootstrap & Sync** | `cargo test --manifest-path panel/backend/Cargo.toml --test desktop_bootstrap_test --test live_sync_test` | Tests for desktop mode loopback guards & SQL domain rewriter |
 | **Host Helper Service** | `cargo test --manifest-path desktop/host-helper/Cargo.toml` | Host entries manager, named pipe IPC, validation & safety tests |
-| **Tauri Desktop Shell** | `cargo test --manifest-path desktop/src-tauri/Cargo.toml` | WSL status detection, explorer launcher, mock API bootstrap |
+| **Pure Rust Desktop App** | `cargo test --manifest-path desktop/dockpanel-app/Cargo.toml` | Site router, port conflict detection, process lifecycle, hosts sync |
 | **Runtime Packaging Syntax** | `bash -n scripts/build-desktop-runtime.sh && bash -n desktop/runtime/setup-desktop-services.sh` | Bash script static syntax validation |
 | **Installer Validation** | `powershell -ExecutionPolicy Bypass -File desktop/installer/tests/installer_test.ps1` | Inno Setup AST, file existence, and Pascal scripts check |
 | **Honesty Pin Regression** | `bash tests/client-role-honesty-pin-e2e.sh` | End-to-end regression tests for RBAC honesty pins |

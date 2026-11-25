@@ -711,6 +711,14 @@ fn start_embedded_server(state: Arc<AppState>) -> u16 {
                 .await
                 .expect("Failed to bind loopback TCP listener");
             let port = listener.local_addr().unwrap().port();
+
+            let api_routes = build_api_router(state.clone());
+
+            let app = Router::new()
+                .nest("/api", api_routes)
+                .fallback(static_handler)
+                .layer(CorsLayer::permissive());
+
             let _ = port_tx.send(port);
 
             // Reconcile and start PHP workers for all active sites in the background
@@ -719,13 +727,6 @@ fn start_embedded_server(state: Arc<AppState>) -> u16 {
             tokio::task::spawn_blocking(move || {
                 reconcile_state.reconcile_active_sites();
             });
-
-            let api_routes = build_api_router(state.clone());
-
-            let app = Router::new()
-                .nest("/api", api_routes)
-                .fallback(static_handler)
-                .layer(CorsLayer::permissive());
 
             axum::serve(
                 listener,
@@ -745,6 +746,19 @@ fn main() {
         let _ = std::fs::write("dockpanel_panic.log", msg);
     }));
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--server-only") {
+        let state = Arc::new(AppState::new());
+        if state.list_sites().is_empty() {
+            let _ = state.create_site("mytestdomain.local", Some("8.3"));
+            let _ = state.create_site("wordpress.test", Some("8.3"));
+        }
+        let port = start_embedded_server(state);
+        println!("DOCKPANEL_EMBEDDED_PORT={}", port);
+        std::thread::park();
+        return;
+    }
+
     if let Err(e) = run_app() {
         let _ = std::fs::write("dockpanel_error.log", format!("RUN_APP_ERROR: {:?}\n", e));
     }
@@ -762,6 +776,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Start in-memory embedded HTTP server
     let port = start_embedded_server(state.clone());
 
+    // Ensure the embedded server is actively accepting connections before creating the webview
+    let test_addr = format!("127.0.0.1:{}", port);
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(&test_addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("DockPanel Desktop")
@@ -769,8 +792,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .with_min_inner_size(LogicalSize::new(1024.0, 600.0))
         .build(&event_loop)?;
 
-    // JavaScript shim injecting window.__TAURI__
+    // JavaScript shim injecting window.__DOCKPANEL__ and window.__TAURI__ for desktop detection
     let init_script = r#"
+        window.__DOCKPANEL__ = true;
         window.__TAURI__ = {
             invoke: function(cmd, args) {
                 return new Promise(function(resolve, reject) {
@@ -795,7 +819,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     let target_url = format!("http://127.0.0.1:{}/", port);
 
-    let _webview = WebViewBuilder::new()
+    let data_dir = state.config_dir.join("webview2");
+    std::fs::create_dir_all(&data_dir).ok();
+    let mut web_context = wry::WebContext::new(Some(data_dir));
+
+    let _webview = WebViewBuilder::with_web_context(&mut web_context)
         .with_devtools(true)
         .with_initialization_script(init_script)
         .with_ipc_handler(move |request| {
@@ -840,6 +868,33 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_static_handler_serves_assets() {
+        let resp = static_handler("/".parse().unwrap()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(ct.contains("text/html"));
+
+        // Extract the JS bundle path dynamically from index.html
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        let js_match = html
+            .lines()
+            .find(|l| l.contains("src=\"/assets/"))
+            .and_then(|l| {
+                let start = l.find("src=\"")? + 5;
+                let end = l[start..].find('"')? + start;
+                Some(&l[start..end])
+            })
+            .expect("index.html must reference a JS asset in /assets/");
+
+        let uri: axum::http::Uri = js_match.parse().unwrap();
+        let resp_js = static_handler(uri).await.into_response();
+        assert_eq!(resp_js.status(), StatusCode::OK);
+        let ct_js = resp_js.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert!(ct_js.contains("javascript"));
+    }
 
     #[tokio::test]
     async fn test_api_sites_start_stop() {

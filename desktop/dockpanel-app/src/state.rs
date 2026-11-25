@@ -28,8 +28,8 @@ pub struct AppState {
     pub worker_ports: Arc<Mutex<HashMap<String, u16>>>,
     pub worker_processes: Arc<Mutex<HashMap<String, std::process::Child>>>,
     pub router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    config_dir: PathBuf,
-    sites_dir: PathBuf,
+    pub config_dir: PathBuf,
+    pub sites_dir: PathBuf,
 }
 
 /// Finds an available loopback TCP port.
