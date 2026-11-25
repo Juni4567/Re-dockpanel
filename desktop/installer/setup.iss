@@ -45,10 +45,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "bin\dockpanel.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 
 ; Zero-UAC Windows Named Pipe Host Helper Service
-Source: "..\host-helper\target\release\dockpanel-host-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
-
-; Bundled WSL2 Micro-Runtime Container Archive
-Source: "..\runtime\dockpanel-runtime.tar.gz"; DestDir: "{app}\runtime"; Flags: ignoreversion
+Source: "bin\dockpanel-host-helper.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Offline Bundled mkcert Windows CLI Utility for Local Root CA Trust
 Source: "bin\mkcert.exe"; DestDir: "{app}"; DestName: "mkcert.exe"; Flags: ignoreversion
@@ -67,33 +64,3 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 [UninstallRun]
 Filename: "{sys}\sc.exe"; Parameters: "stop DockPanelHostHelper"; Flags: runhidden
 Filename: "{sys}\sc.exe"; Parameters: "delete DockPanelHostHelper"; Flags: runhidden
-Filename: "{sys}\wsl.exe"; Parameters: "--unregister dockpanel-desktop"; Flags: runhidden
-
-[Code]
-#include "wsl_prereq.pas"
-
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-  begin
-    // 1. Verify host WSL2 status, install if missing
-    CheckAndEnableWSL;
-
-    // 2. Import bundled micro-runtime into WSL2 distro
-    ImportWSLDistro;
-
-    // 3. Register and start Windows Host Helper service
-    InstallHostHelperService;
-
-    // 4. Install local development Root CA in Windows trust store
-    InstallRootCA;
-  end;
-end;
-
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-  if CurUninstallStep = usUninstall then
-  begin
-    PerformUninstallCleanup;
-  end;
-end;
