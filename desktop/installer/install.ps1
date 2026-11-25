@@ -131,3 +131,8 @@ Write-Host "==========================================================" -Foregro
 Write-Host "Location: $InstallDir\DockPanel Desktop.exe" -ForegroundColor White
 Write-Host "Desktop shortcut created on your desktop." -ForegroundColor White
 
+if ([Environment]::UserInteractive) {
+    Write-Host "`nPress Enter to exit..." -ForegroundColor Gray
+    [void][System.Console]::ReadLine()
+}
+

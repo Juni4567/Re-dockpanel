@@ -9,7 +9,7 @@ echo.
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo Administrative privileges required. Requesting elevation...
-    powershell -Command "Start-Process cmd.exe -ArgumentList '/c \"\"%~dp0Uninstall-DockPanel.bat\"\"' -Verb RunAs"
+    powershell -NoProfile -Command "Start-Process powershell.exe -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"\"%~dp0uninstall.ps1\"\"' -Verb RunAs"
     exit /b
 )
 

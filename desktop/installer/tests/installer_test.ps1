@@ -53,6 +53,8 @@ Assert-Condition (Test-Path $InstallBatPath) "Install-DockPanel.bat exists"
 Assert-Condition (Test-Path $UninstallPs1Path) "uninstall.ps1 exists"
 Assert-Condition (Test-Path $UninstallBatPath) "Uninstall-DockPanel.bat exists"
 Assert-Condition (Test-Path $SetupIssPath) "setup.iss exists"
+$SetupExePath = Join-Path $InstallerDir "DockPanel-Desktop-Setup.exe"
+Assert-Condition (Test-Path $SetupExePath) "DockPanel-Desktop-Setup.exe standalone installer exists"
 
 # -------------------------------------------------------------------
 # Test 2: Binaries Existence in bin/

@@ -20,7 +20,7 @@ AppUpdatesURL={#MyAppURL}/releases
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputBaseFilename=DockPanel-Desktop-Setup-v{#MyAppVersion}
+OutputBaseFilename=DockPanel-Desktop-Setup
 OutputDir=.
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -59,6 +59,9 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFile
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\assets\app.ico"; Tasks: desktopicon
 
 [Run]
+Filename: "{sys}\sc.exe"; Parameters: "create DockPanelHostHelper binPath= ""{app}\dockpanel-host-helper.exe"" start= auto obj= ""LocalSystem"""; Flags: runhidden
+Filename: "{sys}\sc.exe"; Parameters: "start DockPanelHostHelper"; Flags: runhidden
+Filename: "{app}\mkcert.exe"; Parameters: "-install"; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
