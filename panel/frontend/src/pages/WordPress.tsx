@@ -280,7 +280,16 @@ export default function WordPress() {
   const handleInstall = async () => {
     setBusy("install");
     try {
-      await api.post(`/sites/${id}/wordpress/install`, installData);
+      const payload = {
+        ...installData,
+        admin_pass: installData.admin_pass,
+        admin_password: installData.admin_pass,
+        title: installData.title,
+        site_title: installData.title,
+        url: installData.url || (site?.domain ? `http://${site.domain}` : ""),
+        admin_email: installData.admin_email || (site?.domain ? `admin@${site.domain}` : ""),
+      };
+      await api.post(`/sites/${id}/wordpress/install`, payload);
       showGlobalNotification("success", "WordPress installed successfully!");
       setShowInstall(false);
       loadData();

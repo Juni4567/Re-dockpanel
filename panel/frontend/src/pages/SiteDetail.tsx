@@ -7,6 +7,7 @@ import { PrereqCallout, useDnsPrereq, prereqBlocks } from "../components/Prerequ
 import PhpVersionPicker from "../components/PhpVersionPicker";
 import ConfirmDialog from "../components/ConfirmDialog";
 import SiteThumbnail from "../components/SiteThumbnail";
+import InstallWordPressModal from "../components/InstallWordPressModal";
 import { useAuth } from "../context/AuthContext";
 import { showGlobalNotification } from "../context/NotificationContext";
 
@@ -78,6 +79,7 @@ export default function SiteDetail() {
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showInstallWpModal, setShowInstallWpModal] = useState(false);
 
   // App Process management
   const [appStatus, setAppStatus] = useState<AppStatus | null>(null);
@@ -516,7 +518,8 @@ export default function SiteDetail() {
       .catch(() => setHealthSummary(null));
   }, [id]);
 
-  useEffect(() => {
+  const fetchSite = useCallback(() => {
+    if (!id) return;
     api
       .get<Site>(`/sites/${id}`)
       .then((s) => {
@@ -533,6 +536,10 @@ export default function SiteDetail() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
+  }, [id]);
+
+  useEffect(() => {
+    fetchSite();
     fetchStaging();
     loadRedirects();
     loadProtected();
@@ -541,7 +548,7 @@ export default function SiteDetail() {
       .get<{ used_bytes_this_month: number; year_month: string }>(`/sites/${id}/bandwidth-usage`)
       .then(setBandwidthUsage)
       .catch(() => setBandwidthUsage(null));
-  }, [id]);
+  }, [id, fetchSite]);
 
   useEffect(() => {
     if (site && (site.runtime === "node" || site.runtime === "python" || site.runtime === "proxy" || site.app_command)) {
@@ -793,6 +800,19 @@ export default function SiteDetail() {
                 className="px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 transition-colors">
                 Rename
               </button>
+              {/* Install WordPress */}
+              {site?.runtime === "php" && site?.php_preset !== "wordpress" && (
+                <button
+                  onClick={() => setShowInstallWpModal(true)}
+                  className="px-4 py-2 bg-[#0073aa] hover:bg-[#005177] text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 shadow-sm"
+                  title="Install WordPress on this site"
+                >
+                  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                  </svg>
+                  Install WordPress
+                </button>
+              )}
               {/* Clone */}
               {showCloneInput ? (
                 <div className="flex items-center gap-2">
@@ -1558,22 +1578,41 @@ export default function SiteDetail() {
           </div>
         </Link>
         {(site.php_preset === "wordpress" || site.runtime === "php") && (
-          <Link
-            to={`/sites/${id}/wordpress`}
-            className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
-          >
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-accent-500/10 rounded-lg text-accent-400 group-hover:bg-accent-500/20 transition-colors">
-                <svg className="w-5 h-5" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
-                </svg>
+          site.php_preset === "wordpress" ? (
+            <Link
+              to={`/sites/${id}/wordpress`}
+              className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
+            >
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-accent-500/10 rounded-lg text-accent-400 group-hover:bg-accent-500/20 transition-colors">
+                  <svg className="w-5 h-5" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-dark-50">WordPress</p>
+                  <p className="text-xs text-dark-200">Manage WP</p>
+                </div>
               </div>
-              <div>
-                <p className="text-sm font-medium text-dark-50">WordPress</p>
-                <p className="text-xs text-dark-200">{site.php_preset === "wordpress" ? "Manage WP" : "Toolkit / Install"}</p>
+            </Link>
+          ) : (
+            <button
+              onClick={() => setShowInstallWpModal(true)}
+              className="bg-dark-800 rounded-lg border border-dashed border-dark-500 hover:border-accent-400 p-5 hover:shadow-sm transition-all group text-left"
+            >
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-accent-500/10 rounded-lg text-accent-400 group-hover:bg-accent-500/20 transition-colors">
+                  <svg className="w-5 h-5" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.486 2 2 6.486 2 12s4.486 10 10 10 10-4.486 10-10S17.514 2 12 2zm0 2c1.67 0 3.214.52 4.488 1.401L5.401 16.488A7.957 7.957 0 0 1 4 12c0-4.411 3.589-8 8-8zm0 16c-1.67 0-3.214-.52-4.488-1.401L18.599 7.512A7.957 7.957 0 0 1 20 12c0 4.411-3.589 8-8 8z" />
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-dark-50">Install WordPress</p>
+                  <p className="text-xs text-accent-400 font-medium">1-Click Setup</p>
+                </div>
               </div>
-            </div>
-          </Link>
+            </button>
+          )
         )}
       </div>
 
@@ -3226,6 +3265,16 @@ export default function SiteDetail() {
       {/* The SSL message used to render here — at the bottom of the whole page,
           far below the SSL card whose buttons produce it. It now renders inside
           that card instead (see the "SSL" row above). */}
+
+      {site && (
+        <InstallWordPressModal
+          isOpen={showInstallWpModal}
+          onClose={() => setShowInstallWpModal(false)}
+          siteId={id!}
+          domain={site.domain}
+          onSuccess={fetchSite}
+        />
+      )}
     </div>
   );
 }
