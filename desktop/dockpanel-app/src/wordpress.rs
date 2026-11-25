@@ -342,10 +342,14 @@ pub fn get_wp_features_status(domain: &str, site_dir: &Path) -> serde_json::Valu
     let installed = is_wp_installed(site_dir);
     let mut title = domain.to_string();
     let mut email = format!("admin@{}", domain);
+    let mut wp_debug = false;
     let user = "admin".to_string();
 
     if installed {
         if let Ok(cfg) = fs::read_to_string(site_dir.join("wp-config.php")) {
+            if cfg.contains("define( 'WP_DEBUG', true )") {
+                wp_debug = true;
+            }
             for line in cfg.lines() {
                 if line.contains("WP_TITLE") {
                     if let Some(pos) = line.rfind('\'') {
@@ -368,10 +372,10 @@ pub fn get_wp_features_status(domain: &str, site_dir: &Path) -> serde_json::Valu
     }
 
     json!({
-        "wp_debug": false,
+        "wp_debug": wp_debug,
         "search_indexing": true,
         "takeover_cron": false,
-        "maintenance_mode": false,
+        "maintenance_mode": site_dir.join(".maintenance").exists(),
         "hotlink_protect": false,
         "pass_protect": false,
         "caching": true,
@@ -380,6 +384,41 @@ pub fn get_wp_features_status(domain: &str, site_dir: &Path) -> serde_json::Valu
         "admin_user": user,
         "admin_email": email
     })
+}
+
+pub fn set_maintenance(site_dir: &Path, enabled: bool) -> Result<serde_json::Value, String> {
+    let maint = site_dir.join(".maintenance");
+    if enabled {
+        fs::write(&maint, "<?php $upgrading = time(); ?>\n").map_err(|e| e.to_string())?;
+    } else if maint.exists() {
+        fs::remove_file(&maint).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({ "ok": true, "maintenance_mode": enabled }))
+}
+
+pub fn toggle_feature(site_dir: &Path, feature: &str, enabled: bool) -> Result<serde_json::Value, String> {
+    match feature {
+        "maintenance_mode" => set_maintenance(site_dir, enabled),
+        "wp_debug" => {
+            let cfg_path = site_dir.join("wp-config.php");
+            if cfg_path.is_file() {
+                let content = fs::read_to_string(&cfg_path).unwrap_or_default();
+                let updated = if content.contains("WP_DEBUG") {
+                    content
+                        .replace("define( 'WP_DEBUG', false );", &format!("define( 'WP_DEBUG', {} );", enabled))
+                        .replace("define( 'WP_DEBUG', true );", &format!("define( 'WP_DEBUG', {} );", enabled))
+                } else {
+                    content.replace(
+                        "<?php\n",
+                        &format!("<?php\ndefine( 'WP_DEBUG', {} );\n", enabled),
+                    )
+                };
+                fs::write(&cfg_path, updated).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({ "ok": true, "wp_debug": enabled }))
+        }
+        _ => Ok(json!({ "ok": true, "feature": feature, "enabled": enabled })),
+    }
 }
 
 #[cfg(test)]

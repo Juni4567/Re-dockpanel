@@ -422,6 +422,128 @@ impl AppState {
         }
     }
 
+    pub fn toggle_site_enabled(&self, id_or_domain: &str, enabled: bool) -> Result<LocalSite, String> {
+        let clean = id_or_domain.trim().to_lowercase();
+        {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
+                s.enabled = enabled;
+            } else {
+                return Err("Site not found".to_string());
+            }
+        }
+        self.save_data();
+        if enabled {
+            self.start_site(id_or_domain)
+        } else {
+            self.stop_site(id_or_domain)
+        }
+    }
+
+    pub fn rename_site_domain(&self, id_or_domain: &str, new_domain: &str) -> Result<LocalSite, String> {
+        let validated = crate::hosts_manager::validate_domain(new_domain)?;
+        let clean_new = validated.to_lowercase();
+        let clean = id_or_domain.trim().to_lowercase();
+
+        let (old_domain, site_id, was_active) = {
+            let data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            if data.sites.iter().any(|s| s.domain.to_lowercase() == clean_new) {
+                return Err(format!("Domain '{}' already exists", clean_new));
+            }
+            if let Some(s) = data.sites.iter().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
+                (s.domain.clone(), s.id.clone(), s.status == "active")
+            } else {
+                return Err("Site not found".to_string());
+            }
+        };
+
+        if was_active {
+            let _ = self.stop_site(&site_id);
+        }
+
+        let old_dir = self.sites_dir.join(&old_domain);
+        let new_dir = self.sites_dir.join(&clean_new);
+        if old_dir.exists() && !new_dir.exists() {
+            fs::rename(&old_dir, &new_dir).map_err(|e| format!("Failed to rename site folder: {}", e))?;
+        }
+        let _ = crate::hosts_manager::remove_domain_from_hosts(&old_domain);
+        let _ = crate::hosts_manager::sync_domain_to_hosts(&clean_new);
+
+        {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            if let Some(s) = data.sites.iter_mut().find(|s| s.id == site_id) {
+                s.domain = clean_new.clone();
+                s.document_root = new_dir.to_string_lossy().to_string();
+            }
+        }
+        self.save_data();
+
+        if was_active {
+            self.start_site(&site_id)
+        } else {
+            self.get_site(&site_id).ok_or_else(|| "Site not found".to_string())
+        }
+    }
+
+    pub fn clone_site(&self, id_or_domain: &str, new_domain: &str) -> Result<LocalSite, String> {
+        let src = self.get_site(id_or_domain).ok_or_else(|| "Site not found".to_string())?;
+        let cloned = self.create_site(new_domain, Some(&src.php_version))?;
+        let src_dir = self.sites_dir.join(&src.domain);
+        let dst_dir = self.sites_dir.join(&cloned.domain);
+        if src_dir.exists() {
+            let _ = crate::files::copy_dir_recursive(&src_dir, &dst_dir);
+        }
+        if let Some(preset) = src.php_preset.as_deref() {
+            self.update_site_preset(&cloned.id, preset);
+        }
+        self.start_site(&cloned.id)
+    }
+
+    pub fn update_site_limits(
+        &self,
+        id_or_domain: &str,
+        max_upload_mb: Option<i32>,
+        php_memory_mb: Option<i32>,
+        php_max_workers: Option<i32>,
+    ) -> Result<LocalSite, String> {
+        let clean = id_or_domain.trim().to_lowercase();
+        let site = {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
+                if let Some(v) = max_upload_mb {
+                    s.max_upload_mb = v;
+                }
+                if let Some(v) = php_memory_mb {
+                    s.php_memory_mb = v;
+                }
+                if let Some(v) = php_max_workers {
+                    s.php_max_workers = v;
+                }
+                s.clone()
+            } else {
+                return Err("Site not found".to_string());
+            }
+        };
+        self.save_data();
+        Ok(site)
+    }
+
+    pub fn dir_size_bytes(dir: &Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_dir() {
+                        total += Self::dir_size_bytes(&entry.path());
+                    } else {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+
     pub fn get_site_worker_port(&self, domain: &str) -> Option<u16> {
         let clean = domain.trim().to_lowercase();
         self.worker_ports.lock().unwrap().get(&clean).copied()
