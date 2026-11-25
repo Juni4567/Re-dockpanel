@@ -1,6 +1,9 @@
-import { useState, FormEvent } from "react";
+import { useState, useEffect, FormEvent } from "react";
 import { api } from "../api";
 import { showGlobalNotification } from "../context/NotificationContext";
+import ProvisionLog from "./ProvisionLog";
+import { buildSiteExternalUrl } from "./PortConflictModal";
+import { isDesktopApp } from "../utils/desktop";
 
 export interface InstallWordPressModalProps {
   isOpen: boolean;
@@ -33,8 +36,37 @@ export default function InstallWordPressModal({
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [installId, setInstallId] = useState<string | null>(null);
+  const [completed, setCompleted] = useState(false);
+  const [activePort, setActivePort] = useState<number>(80);
+  const [sslPort, setSslPort] = useState<number | null>(null);
+  const [dbEngine, setDbEngine] = useState<"sqlite" | "mariadb">("sqlite");
+  const desktop = isDesktopApp();
+
+  useEffect(() => {
+    if (!isOpen || !desktop) return;
+    api.get<{ active_port?: number; ssl_port?: number | null }>("/health")
+      .then((h) => {
+        if (h?.active_port) setActivePort(h.active_port);
+        if (typeof h?.ssl_port === "number") setSslPort(h.ssl_port);
+      })
+      .catch(() => {});
+  }, [isOpen, desktop]);
 
   if (!isOpen) return null;
+
+  const siteBaseUrl =
+    desktop && sslPort
+      ? buildSiteExternalUrl(domain, sslPort, true)
+      : buildSiteExternalUrl(domain, activePort, false);
+
+  const handleClose = () => {
+    if (loading) return;
+    setInstallId(null);
+    setCompleted(false);
+    setError("");
+    onClose();
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -49,22 +81,32 @@ export default function InstallWordPressModal({
 
     setError("");
     setLoading(true);
+    setInstallId(null);
+    setCompleted(false);
 
     try {
-      await api.post(`/sites/${siteId}/wordpress/install`, {
+      const res = await api.post<{ install_id?: string }>(`/sites/${siteId}/wordpress/install`, {
         title: title.trim() || "My WordPress Site",
         admin_user: adminUser.trim(),
         admin_pass: adminPass,
         admin_email: adminEmail.trim() || `admin@${domain}`,
         url: `http://${domain}`,
+        ...(desktop ? { stream: true, db_engine: dbEngine } : {}),
       });
+
+      if (res?.install_id) {
+        setInstallId(res.install_id);
+        return;
+      }
 
       showGlobalNotification("success", `WordPress successfully installed for ${domain}!`);
       if (onSuccess) onSuccess();
-      onClose();
+      setLoading(false);
+      handleClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to install WordPress");
-    } finally {
+      const msg = err instanceof Error ? err.message : "Failed to install WordPress";
+      setError(msg);
+      showGlobalNotification("error", msg);
       setLoading(false);
     }
   };
@@ -92,7 +134,7 @@ export default function InstallWordPressModal({
             </div>
           </div>
           <button
-            onClick={onClose}
+            onClick={handleClose}
             disabled={loading}
             className="text-dark-400 hover:text-dark-200 p-1.5 rounded-lg hover:bg-dark-800 transition-colors"
             aria-label="Close"
@@ -109,6 +151,47 @@ export default function InstallWordPressModal({
           </div>
         )}
 
+        {installId ? (
+          <div className="mt-4 space-y-4">
+            <ProvisionLog
+              sseUrl={`/api/services/install/${installId}/log`}
+              title={`Installing WordPress on ${domain}...`}
+              onComplete={() => {
+                setLoading(false);
+                setCompleted(true);
+                showGlobalNotification("success", `WordPress is ready at http://${domain}`);
+                if (onSuccess) onSuccess();
+              }}
+            />
+            {completed && (
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-dark-700">
+                <a
+                  href={`${siteBaseUrl}/`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3 py-2 rounded-lg text-xs font-medium bg-dark-800 border border-dark-600 text-dark-100 hover:bg-dark-700 transition-colors"
+                >
+                  Open Site
+                </a>
+                <a
+                  href={`${siteBaseUrl}/wp-admin/`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3 py-2 rounded-lg text-xs font-medium bg-[#0073aa] hover:bg-[#005a87] text-white transition-colors"
+                >
+                  Open WP Admin
+                </a>
+                <button
+                  type="button"
+                  onClick={handleClose}
+                  className="px-4 py-2 rounded-lg text-xs font-medium bg-rust-500 hover:bg-rust-600 text-white transition-colors"
+                >
+                  Done
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
           <div>
             <label className="block text-xs font-medium text-dark-300 mb-1">Site Title</label>
@@ -181,10 +264,25 @@ export default function InstallWordPressModal({
             />
           </div>
 
+          {desktop && (
+            <div>
+              <label className="block text-xs font-medium text-dark-300 mb-1">Database Engine</label>
+              <select
+                value={dbEngine}
+                onChange={(e) => setDbEngine(e.target.value as "sqlite" | "mariadb")}
+                disabled={loading}
+                className="w-full px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-dark-50 focus:outline-none focus:border-accent-500"
+              >
+                <option value="sqlite">SQLite (Zero-config embedded)</option>
+                <option value="mariadb">MariaDB (Open-source MySQL Server)</option>
+              </select>
+            </div>
+          )}
+
           <div className="pt-2 flex justify-end gap-3 border-t border-dark-700">
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleClose}
               disabled={loading}
               className="px-4 py-2 rounded-lg text-sm font-medium text-dark-300 hover:bg-dark-800 transition-colors"
             >
@@ -206,6 +304,7 @@ export default function InstallWordPressModal({
             </button>
           </div>
         </form>
+        )}
       </div>
     </div>
   );

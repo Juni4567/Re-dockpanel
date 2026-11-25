@@ -8,6 +8,9 @@ import PhpVersionPicker from "../components/PhpVersionPicker";
 import ConfirmDialog from "../components/ConfirmDialog";
 import SiteThumbnail from "../components/SiteThumbnail";
 import InstallWordPressModal from "../components/InstallWordPressModal";
+import DesktopSiteActions from "../components/DesktopSiteActions";
+import { buildSiteExternalUrl } from "../components/PortConflictModal";
+import { isDesktopApp } from "../utils/desktop";
 import { useAuth } from "../context/AuthContext";
 import { showGlobalNotification } from "../context/NotificationContext";
 
@@ -72,6 +75,10 @@ export default function SiteDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { user } = useAuth();
+  const desktop = isDesktopApp();
+  const [activePort, setActivePort] = useState<number>(80);
+  const [sslPort, setSslPort] = useState<number | null>(null);
+  const [provisioningLocalSsl, setProvisioningLocalSsl] = useState(false);
   /** Holds sites, cannot claim a new domain — see `domain_claim::ensure_claimable`. */
   const isClient = user?.role === "client";
   const [site, setSite] = useState<Site | null>(null);
@@ -109,7 +116,7 @@ export default function SiteDetail() {
     prereq: dnsPrereq,
     checking: dnsChecking,
     recheck: recheckDns,
-  } = useDnsPrereq(site && !site.ssl_enabled ? site.domain : "", { autoPoll: true, debounceMs: 0 });
+  } = useDnsPrereq(!desktop && site && !site.ssl_enabled ? site.domain : "", { autoPoll: true, debounceMs: 0 });
   const [switchingPhp, setSwitchingPhp] = useState(false);
   const [phpMessage, setPhpMessage] = useState("");
   // What the picker is showing, which is not the same as what the site runs:
@@ -540,6 +547,20 @@ export default function SiteDetail() {
 
   useEffect(() => {
     fetchSite();
+    if (desktop) {
+      api
+        .get<{ active_port?: number; ssl_port?: number | null }>("/health")
+        .then((h) => {
+          if (typeof h?.active_port === "number" && h.active_port > 0) {
+            setActivePort(h.active_port);
+          }
+          if (typeof h?.ssl_port === "number" && h.ssl_port > 0) {
+            setSslPort(h.ssl_port);
+          }
+        })
+        .catch(() => {});
+      return;
+    }
     fetchStaging();
     loadRedirects();
     loadProtected();
@@ -548,7 +569,7 @@ export default function SiteDetail() {
       .get<{ used_bytes_this_month: number; year_month: string }>(`/sites/${id}/bandwidth-usage`)
       .then(setBandwidthUsage)
       .catch(() => setBandwidthUsage(null));
-  }, [id, fetchSite]);
+  }, [id, fetchSite, desktop]);
 
   useEffect(() => {
     if (site && (site.runtime === "node" || site.runtime === "python" || site.runtime === "proxy" || site.app_command)) {
@@ -708,7 +729,13 @@ export default function SiteDetail() {
           <div className="w-20 h-14 rounded-lg border border-dark-600 bg-dark-800 shrink-0 overflow-hidden relative shadow-md group/thumb">
             <SiteThumbnail domain={site.domain} className="w-full h-full" w={400} />
             <a
-              href={`${site.ssl_enabled ? "https" : "http"}://${site.domain}`}
+              href={
+                desktop
+                  ? (sslPort && site.ssl_enabled
+                      ? buildSiteExternalUrl(site.domain, sslPort, true)
+                      : buildSiteExternalUrl(site.domain, activePort, false))
+                  : `${site.ssl_enabled ? "https" : "http"}://${site.domain}`
+              }
               target="_blank"
               rel="noreferrer"
               className="absolute inset-0 bg-dark-950/60 opacity-0 group-hover/thumb:opacity-100 flex items-center justify-center transition-opacity text-white text-xs font-medium gap-1"
@@ -724,7 +751,13 @@ export default function SiteDetail() {
             <div className="flex items-center gap-2">
               <h1 className="text-base font-semibold text-dark-50 font-mono tracking-tight">{site.domain}</h1>
               <a
-                href={`${site.ssl_enabled ? "https" : "http"}://${site.domain}`}
+                href={
+                  desktop
+                    ? (sslPort && site.ssl_enabled
+                        ? buildSiteExternalUrl(site.domain, sslPort, true)
+                        : buildSiteExternalUrl(site.domain, activePort, false))
+                    : `${site.ssl_enabled ? "https" : "http"}://${site.domain}`
+                }
                 target="_blank"
                 rel="noreferrer"
                 className="text-dark-400 hover:text-rust-400 transition-colors"
@@ -779,13 +812,26 @@ export default function SiteDetail() {
           </div>
         </div>
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
+              {desktop && site && (
+                <DesktopSiteActions
+                  domain={site.domain}
+                  siteId={site.id}
+                  status={site.status}
+                  onStatusChange={(newStatus) =>
+                    setSite((s) => (s ? { ...s, status: newStatus } : s))
+                  }
+                  onError={(msg) => setError(msg)}
+                />
+              )}
               {/* Enable/Disable toggle */}
               <button disabled={toggling} onClick={async () => {
                 setToggling(true);
                 try {
-                  await api.put(`/sites/${id}/toggle`, { enabled: !site?.enabled });
-                  setSite(s => s ? { ...s, enabled: !s.enabled } : s);
+                  const nextEnabled = !site?.enabled;
+                  await api.put(`/sites/${id}/toggle`, { enabled: nextEnabled });
+                  setSite(s => s ? { ...s, enabled: nextEnabled } : s);
+                  showGlobalNotification("success", `Site ${nextEnabled ? "enabled" : "disabled"}`);
                 } catch (e) { setError(e instanceof Error ? e.message : "Toggle failed"); }
                 finally { setToggling(false); }
               }} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
@@ -880,7 +926,7 @@ export default function SiteDetail() {
                   </button>
                 )
               )}
-              {user?.role === "admin" && (
+              {!desktop && user?.role === "admin" && (
                 showTransfer ? (
                   <div className="flex items-center gap-2">
                     {/* Picked, not typed. The endpoint answers 404 "No account
@@ -942,12 +988,20 @@ export default function SiteDetail() {
           <ConfirmDialog
             title={`Permanently Delete "${site?.domain}"?`}
             label={`You are about to permanently delete ${site?.domain}. This is an irreversible destructive action.`}
-            consequences={[
-              `All web files and directories located in /var/www/${site?.domain} will be permanently wiped.`,
-              "Nginx reverse proxy virtual host configuration will be removed and Nginx reloaded.",
-              "Active background application services (Node.js, Python, or PHP-FPM pools) will be stopped and deleted.",
-              "All SSL/TLS certificates, environment variables (.env), and associated staging clones will be removed."
-            ]}
+            consequences={
+              desktop
+                ? [
+                    `Local site files for ${site?.domain} will be permanently deleted.`,
+                    "The local hosts entry and router mapping for this domain will be removed.",
+                    "Any attached local database records for this site will be cleaned up.",
+                  ]
+                : [
+                    `All web files and directories located in /var/www/${site?.domain} will be permanently wiped.`,
+                    "Nginx reverse proxy virtual host configuration will be removed and Nginx reloaded.",
+                    "Active background application services (Node.js, Python, or PHP-FPM pools) will be stopped and deleted.",
+                    "All SSL/TLS certificates, environment variables (.env), and associated staging clones will be removed.",
+                  ]
+            }
             confirmLabel={deleting ? "Deleting Site..." : "Permanently Delete Site"}
             tone="danger"
             onConfirm={handleDelete}
@@ -1186,6 +1240,7 @@ export default function SiteDetail() {
                           const updated = await api.put<Site>(`/sites/${id}/php`, { version: newVersion });
                           setSite(updated);
                           setPhpMessage(`Switched to PHP ${newVersion}`);
+                          showGlobalNotification("success", `Switched to PHP ${newVersion}`);
                         } catch (err) {
                           setPhpMessage(err instanceof Error ? err.message : "Switch failed");
                           // Put the control back on what the site is actually
@@ -1219,6 +1274,45 @@ export default function SiteDetail() {
               <dd className="text-sm text-dark-50 col-span-2 capitalize">{site.php_preset}</dd>
             </div>
           )}
+          {desktop && (
+          <div className="px-5 py-4 grid grid-cols-3 items-center">
+            <dt className="text-sm font-medium text-dark-200">Local SSL (HTTPS)</dt>
+            <dd className="text-sm col-span-2 flex items-center gap-3 flex-wrap">
+              {sslPort ? (
+                <a
+                  href={buildSiteExternalUrl(site.domain, sslPort, true)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 text-rust-400 hover:underline font-mono text-xs"
+                >
+                  <span>✓ HTTPS Active ({sslPort === 443 ? "Port 443" : `Port ${sslPort}`}) — mkcert Local CA</span>
+                </a>
+              ) : (
+                <span className="text-xs text-warn-400">HTTPS listener inactive — click Provision Local SSL</span>
+              )}
+              <button
+                type="button"
+                disabled={provisioningLocalSsl}
+                onClick={async () => {
+                  setProvisioningLocalSsl(true);
+                  try {
+                    const res = await api.post<{ ssl_port?: number | null; message?: string }>(`/sites/${id}/ssl/provision`, {});
+                    if (typeof res?.ssl_port === "number") setSslPort(res.ssl_port);
+                    showGlobalNotification("success", res?.message || `Local SSL enabled for ${site.domain}`);
+                  } catch (err) {
+                    showGlobalNotification("error", err instanceof Error ? err.message : "Failed to enable local SSL");
+                  } finally {
+                    setProvisioningLocalSsl(false);
+                  }
+                }}
+                className="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded text-xs font-medium disabled:opacity-50"
+              >
+                {provisioningLocalSsl ? "Issuing Cert..." : "Issue / Refresh SSL"}
+              </button>
+            </dd>
+          </div>
+          )}
+          {!desktop && (
           <div className="px-5 py-4 grid grid-cols-3">
             <dt className="text-sm font-medium text-dark-200">SSL</dt>
             <dd className="text-sm col-span-2">
@@ -1485,6 +1579,7 @@ export default function SiteDetail() {
               )}
             </dd>
           </div>
+          )}
           <div className="px-5 py-4 grid grid-cols-3">
             <dt className="text-sm font-medium text-dark-200">Status</dt>
             <dd className="text-sm col-span-2">
@@ -1526,6 +1621,7 @@ export default function SiteDetail() {
             </div>
           </div>
         </Link>
+        {!desktop && (
         <Link
           to={`/terminal?site=${id}`}
           className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
@@ -1542,6 +1638,7 @@ export default function SiteDetail() {
             </div>
           </div>
         </Link>
+        )}
         <Link
           to={`/sites/${id}/backups`}
           className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
@@ -1558,6 +1655,7 @@ export default function SiteDetail() {
             </div>
           </div>
         </Link>
+        {!desktop && (
         <Link
           to={`/sites/${id}/crons`}
           className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
@@ -1574,6 +1672,8 @@ export default function SiteDetail() {
             </div>
           </div>
         </Link>
+        )}
+        {!desktop && (
         <Link
           to={`/sites/${id}/deploy`}
           className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
@@ -1590,6 +1690,7 @@ export default function SiteDetail() {
             </div>
           </div>
         </Link>
+        )}
         {(!site.runtime || site.runtime === "php" || site.runtime === "static" || site.php_preset === "wordpress") && (
           site.php_preset === "wordpress" ? (
             <Link
@@ -1785,7 +1886,7 @@ export default function SiteDetail() {
       )}
 
       {/* Resource Limits */}
-      {site.status === "active" && (
+      {!desktop && site.status === "active" && (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
           <div className="px-5 py-4 border-b border-dark-600">
             <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Resource Limits</h2>
@@ -1950,6 +2051,8 @@ export default function SiteDetail() {
         </div>
       )}
 
+      {!desktop && (
+      <>
       {/* FastCGI Cache — PHP sites only */}
       {site.runtime === "php" && site.status === "active" && (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
@@ -3173,6 +3276,8 @@ export default function SiteDetail() {
           )}
         </div>
       )}
+      </>
+      )}
 
       {/* PHP Extensions */}
       {site?.runtime === "php" && (
@@ -3204,6 +3309,7 @@ export default function SiteDetail() {
                   ))}
                 </div>
               </div>
+              {!desktop && (
               <div>
                 <h4 className="text-xs text-dark-300 uppercase font-mono mb-2">Available to install</h4>
                 <div className="flex flex-wrap gap-1.5">
@@ -3228,6 +3334,7 @@ export default function SiteDetail() {
                 </div>
                 {extMessage && <p className="text-xs text-danger-400 mt-2">{extMessage}</p>}
               </div>
+              )}
             </div>
           )}
         </div>
@@ -3261,6 +3368,7 @@ export default function SiteDetail() {
                 try {
                   await api.put(`/sites/${id}/env`, { vars: envVars.filter(v => v.key) });
                   setEnvMsg("Environment variables saved");
+                  showGlobalNotification("success", "Environment variables saved");
                 } catch (e) { setEnvMsg(e instanceof Error ? e.message : "Save failed"); }
                 finally { setSavingEnv(false); }
               }} className="px-3 py-1 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50">

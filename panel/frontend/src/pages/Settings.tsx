@@ -3,6 +3,8 @@ import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../api";
 import ProvisionLog from "../components/ProvisionLog";
+import PhpVersionPicker from "../components/PhpVersionPicker";
+import { isDesktopApp } from "../utils/desktop";
 import UpdatesContent from "./Updates";
 import { timeAgo } from "../utils/format";
 import { applyTheme, readStoredTheme } from "../hooks/useLayoutState";
@@ -181,7 +183,24 @@ const NOTIF_PLACEHOLDERS = ["{{title}}", "{{message}}", "{{severity}}", "{{times
 
 export default function Settings() {
   const { user } = useAuth();
+  const desktop = isDesktopApp();
   const [settings, setSettings] = useState<Record<string, string>>({});
+  const [defaultPhp, setDefaultPhp] = useState("8.3");
+  const [defaultSitesDir, setDefaultSitesDir] = useState("");
+  const [mariadbInstallId, setMariadbInstallId] = useState<string | null>(null);
+  const [desktopSvcStatus, setDesktopSvcStatus] = useState<{
+    php?: { installed?: boolean; running?: boolean; version?: string };
+    mariadb?: { installed?: boolean; running?: boolean; port?: number };
+    host_helper?: { installed?: boolean; running?: boolean };
+  } | null>(null);
+  const [desktopPortInfo, setDesktopPortInfo] = useState<{
+    preferred_port: number;
+    active_port: number;
+    in_use: boolean;
+    process_name?: string | null;
+    display_name?: string | null;
+  } | null>(null);
+  const [clearingCache, setClearingCache] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState<string | null>(null);
   const [health, setHealth] = useState<HealthStatus | null>(null);
@@ -304,6 +323,12 @@ export default function Settings() {
     try {
       const data = await api.get<Record<string, string>>("/settings");
       setSettings(data);
+      if (data.default_php_version) setDefaultPhp(data.default_php_version);
+      if (data.default_sites_dir) setDefaultSitesDir(data.default_sites_dir);
+      if (desktop) {
+        api.get<typeof desktopSvcStatus>("/services/install-status").then(setDesktopSvcStatus).catch(() => {});
+        api.get<typeof desktopPortInfo>("/system/ports/conflict").then(setDesktopPortInfo).catch(() => {});
+      }
       setPanelName(data.panel_name || "");
       setBaseUrl(data.base_url || "");
       setPanelIps(data.allowed_panel_ips || "");
@@ -527,7 +552,14 @@ export default function Settings() {
     setSaving("general");
     setMessage({ text: "", type: "" });
     try {
-      await api.put("/settings", { panel_name: panelName, base_url: baseUrl.trim() });
+      const payload: Record<string, string> = {
+        panel_name: panelName,
+        base_url: baseUrl.trim(),
+      };
+      if (desktop && defaultSitesDir.trim()) {
+        payload.default_sites_dir = defaultSitesDir.trim();
+      }
+      await api.put("/settings", payload);
       setMessage({ text: "General settings saved", type: "success" });
     } catch (e) {
       setMessage({
@@ -622,7 +654,9 @@ export default function Settings() {
   // to write a correct link even if you wanted to, because nothing here read the
   // URL. "Configure alert channels →" on the notifications page was the instance
   // that surfaced it; there are several more.
-  const SETTINGS_TABS: readonly string[] = ["general", "email", "account", "channels", "services"];
+  const SETTINGS_TABS: readonly string[] = desktop
+    ? ["general", "services"]
+    : ["general", "email", "account", "channels", "services"];
   const [searchParams] = useSearchParams();
   const resolveSettingsTab = (raw: string | null): string =>
     raw && SETTINGS_TABS.includes(raw) ? raw : "general";
@@ -659,13 +693,19 @@ export default function Settings() {
 
       <div className="p-6 lg:p-8">
       <div className="flex gap-1 mb-6 border-b border-dark-600 pb-1 overflow-x-auto">
-        {[
-          { id: "general", label: "General" },
-          { id: "email", label: "Email" },
-          { id: "account", label: "Account" },
-          { id: "channels", label: "Alert Channels" },
-          { id: "services", label: "Services" },
-        ].map(t => (
+        {(desktop
+          ? [
+              { id: "general", label: "General" },
+              { id: "services", label: "PHP & Services" },
+            ]
+          : [
+              { id: "general", label: "General" },
+              { id: "email", label: "Email" },
+              { id: "account", label: "Account" },
+              { id: "channels", label: "Alert Channels" },
+              { id: "services", label: "Services" },
+            ]
+        ).map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
             className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-t-lg transition-colors whitespace-nowrap shrink-0 ${
               tab === t.id ? "text-rust-400 border-b-2 border-rust-400" : "text-dark-300 hover:text-dark-100"
@@ -739,6 +779,24 @@ export default function Settings() {
                 without the link.
               </p>
             </div>
+            {desktop && (
+              <div>
+                <label htmlFor="default_sites_dir" className="block text-sm font-medium text-dark-100 mb-1">
+                  Default Websites Directory
+                </label>
+                <input
+                  id="default_sites_dir"
+                  type="text"
+                  value={defaultSitesDir}
+                  onChange={(e) => setDefaultSitesDir(e.target.value)}
+                  className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                  placeholder="C:\Users\...\DockPanel\sites"
+                />
+                <p className="text-xs text-dark-300 mt-1">
+                  Default parent folder where new local websites are created on disk (you can also override per site).
+                </p>
+              </div>
+            )}
             <div className="flex justify-end">
               <button
                 onClick={saveGeneral}
@@ -751,6 +809,7 @@ export default function Settings() {
           </div>
         </div>
 
+        {!desktop && (<>
         {/* Panel Domain & SSL Configuration */}
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
           <div className="px-5 py-3 border-b border-dark-600 flex items-center justify-between">
@@ -1079,6 +1138,7 @@ export default function Settings() {
             </div>
           </div>
         </div>
+        </>)}
 
         {/* A timezone selector lived here until v2.46.0, claiming to "affect
             displayed timestamps throughout the panel". Nothing read the key —
@@ -1206,6 +1266,38 @@ export default function Settings() {
           </div>
         </div>
 
+        {/* Feature #9: Disk Cleanup / Desktop Download Cache */}
+        {desktop ? (
+        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+          <div className="px-5 py-3 border-b border-dark-600">
+            <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Download Cache</h3>
+          </div>
+          <div className="p-5 flex items-center justify-between">
+            <div>
+              <p className="text-sm text-dark-100">Clear WordPress &amp; PHP download cache</p>
+              <p className="text-xs text-dark-300 mt-0.5">Removes cached WordPress/PHP archives in %APPDATA%\DockPanel\cache</p>
+            </div>
+            <button
+              disabled={clearingCache}
+              onClick={async () => {
+                setClearingCache(true);
+                try {
+                  const res = await api.post<{ cleared_bytes?: number }>("/desktop/clear-cache", {});
+                  const kb = Math.round((res?.cleared_bytes || 0) / 1024);
+                  setMessage({ text: `Cleared ${kb} KB from DockPanel download cache`, type: "success" });
+                } catch (e) {
+                  setMessage({ text: e instanceof Error ? e.message : "Failed to clear cache", type: "error" });
+                } finally {
+                  setClearingCache(false);
+                }
+              }}
+              className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 disabled:opacity-50"
+            >
+              {clearingCache ? "Clearing..." : "Clear Cache"}
+            </button>
+          </div>
+        </div>
+        ) : (<>
         {/* Feature #9: Disk Cleanup */}
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
           <div className="px-5 py-3 border-b border-dark-600">
@@ -1244,6 +1336,7 @@ export default function Settings() {
             <p className="text-xs text-dark-300 mt-1">Only alphanumeric characters, hyphens, and dots allowed</p>
           </div>
         </div>
+        </>)}
 
         {/* Feature #11: Theme Picker */}
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
@@ -2612,8 +2705,185 @@ export default function Settings() {
         )}
         </>)}
 
-        {/* Services tab: Service Installers (incl. PowerDNS config), System Health */}
+        {/* Services tab: Desktop Runtimes on Windows, Service Installers on Server */}
         {tab === "services" && (<>
+        {desktop ? (
+        <div className="space-y-6">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+            <div className="px-5 py-3 border-b border-dark-600">
+              <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">PHP Runtimes &amp; Installer</h3>
+              <p className="text-xs text-dark-200 mt-0.5">Check available Windows PHP versions, install new ones with live logs, or set your default version for new sites</p>
+            </div>
+            <div className="p-5 space-y-3">
+              <PhpVersionPicker
+                value={defaultPhp}
+                canInstall={true}
+                onChange={(ver, ready) => {
+                  setDefaultPhp(ver);
+                  if (ready) {
+                    api.put("/settings", { default_php_version: ver })
+                      .then(() => setMessage({ text: `Default PHP version set to PHP ${ver}`, type: "success" }))
+                      .catch(() => {});
+                  }
+                }}
+              />
+            </div>
+          </div>
+
+          <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+            <div className="px-5 py-3 border-b border-dark-600">
+              <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Local Windows Services</h3>
+              <p className="text-xs text-dark-200 mt-0.5">Background components managed by DockPanel Desktop</p>
+            </div>
+            <div className="p-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="border border-dark-500 bg-dark-900/50 p-4 rounded-lg flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium text-dark-50">DockPanel Host Helper</div>
+                  <p className="text-[11px] text-dark-300 mt-0.5">Syncs local .test / .local domains to Windows hosts without UAC prompts</p>
+                </div>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${desktopSvcStatus?.host_helper?.installed ? "bg-emerald-500/15 text-emerald-400" : "bg-warn-500/15 text-warn-400"}`}>
+                  {desktopSvcStatus?.host_helper?.installed ? "Installed" : "Checking"}
+                </span>
+              </div>
+              <div className="border border-dark-500 bg-dark-900/50 p-4 rounded-lg flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium text-dark-50">Local PHP Engine</div>
+                  <p className="text-[11px] text-dark-300 mt-0.5">
+                    {desktopSvcStatus?.php?.installed ? `Active (${desktopSvcStatus.php.version ? `PHP ${desktopSvcStatus.php.version}` : "Ready"})` : "No PHP binary installed yet"}
+                  </p>
+                </div>
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${desktopSvcStatus?.php?.installed ? "bg-emerald-500/15 text-emerald-400" : "bg-danger-500/15 text-danger-400"}`}>
+                  {desktopSvcStatus?.php?.installed ? "Running" : "Missing"}
+                </span>
+              </div>
+              <div className="border border-dark-500 bg-dark-900/50 p-4 rounded-lg flex items-center justify-between sm:col-span-2 gap-3 flex-wrap">
+                <div>
+                  <div className="text-sm font-medium text-dark-50">Local MariaDB (Open-Source MySQL Server)</div>
+                  <p className="text-[11px] text-dark-300 mt-0.5">
+                    {desktopSvcStatus?.mariadb?.installed
+                      ? desktopSvcStatus.mariadb.running
+                        ? `Running locally on 127.0.0.1:${desktopSvcStatus.mariadb.port ?? 3306}`
+                        : "Installed locally (stopped)"
+                      : "Optional portable MySQL-compatible server for WordPress & PHP apps"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {desktopSvcStatus?.mariadb?.installed ? (
+                    desktopSvcStatus.mariadb.running ? (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await api.post("/mariadb/stop", {});
+                          api.get<typeof desktopSvcStatus>("/services/install-status").then(setDesktopSvcStatus).catch(() => {});
+                          setMessage({ text: "MariaDB stopped", type: "success" });
+                        }}
+                        className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded-lg text-xs font-medium"
+                      >
+                        Stop
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            const r = await api.post<{ port?: number }>("/mariadb/start", {});
+                            api.get<typeof desktopSvcStatus>("/services/install-status").then(setDesktopSvcStatus).catch(() => {});
+                            setMessage({ text: `MariaDB started on 127.0.0.1:${r?.port ?? 3306}`, type: "success" });
+                          } catch (e) {
+                            setMessage({ text: e instanceof Error ? e.message : "Failed to start MariaDB", type: "error" });
+                          }
+                        }}
+                        className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium"
+                      >
+                        Start MariaDB
+                      </button>
+                    )
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={!!mariadbInstallId}
+                      onClick={async () => {
+                        try {
+                          const r = await api.post<{ install_id?: string }>("/mariadb/install", {});
+                          if (r?.install_id) setMariadbInstallId(r.install_id);
+                        } catch (e) {
+                          setMessage({ text: e instanceof Error ? e.message : "MariaDB install failed", type: "error" });
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium disabled:opacity-50"
+                    >
+                      {mariadbInstallId ? "Installing..." : "Install MariaDB"}
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+            {mariadbInstallId && (
+              <div className="px-5 pb-5">
+                <ProvisionLog
+                  sseUrl={`/api/services/install/${mariadbInstallId}/log`}
+                  title="Installing portable MariaDB Server..."
+                  onComplete={() => {
+                    setMariadbInstallId(null);
+                    api.get<typeof desktopSvcStatus>("/services/install-status").then(setDesktopSvcStatus).catch(() => {});
+                  }}
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+            <div className="px-5 py-3 border-b border-dark-600">
+              <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Site Router Port</h3>
+              <p className="text-xs text-dark-200 mt-0.5">Port used to serve local .test / .local websites</p>
+            </div>
+            <div className="p-5 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm text-dark-50 font-mono">
+                  Active Port: <span className="text-rust-400 font-semibold">{desktopPortInfo?.active_port ?? 80}</span>
+                  {desktopPortInfo?.in_use && desktopPortInfo.preferred_port !== desktopPortInfo.active_port && (
+                    <span className="ml-2 text-xs text-warn-400">
+                      (Port {desktopPortInfo.preferred_port} used by {desktopPortInfo.display_name || desktopPortInfo.process_name || "another app"})
+                    </span>
+                  )}
+                </p>
+                <p className="text-xs text-dark-300 mt-0.5">
+                  Switch between port 80 and fallback ports (8080, 8443, 3000) without restarting DockPanel.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {[80, 8080, 8443, 3000].map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const res = await api.post<{ success?: boolean; active_port?: number; message?: string }>("/system/ports/resolve", { action: "use_port", port: p });
+                        if (res?.success === false) {
+                          setMessage({ text: res.message || `Port ${p} is unavailable`, type: "error" });
+                          return;
+                        }
+                        const updatedPort = res?.active_port ?? p;
+                        setDesktopPortInfo((prev) => prev ? { ...prev, active_port: updatedPort } : { preferred_port: 80, active_port: updatedPort, in_use: false });
+                        setMessage({ text: `Site router switched to port ${updatedPort}`, type: "success" });
+                      } catch (e) {
+                        setMessage({ text: e instanceof Error ? e.message : "Failed to switch port", type: "error" });
+                      }
+                    }}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-mono border transition-colors ${
+                      (desktopPortInfo?.active_port ?? 80) === p
+                        ? "bg-rust-500 text-white border-rust-500"
+                        : "bg-dark-900 text-dark-200 border-dark-500 hover:border-dark-300"
+                    }`}
+                  >
+                    :{p}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+        ) : (<>
         {/* Service Installers with integrated PowerDNS config */}
         <ServiceInstallers
           pdnsApiUrl={pdnsApiUrl}
@@ -2651,6 +2921,7 @@ export default function Settings() {
 
         {/* MCP server (dockpanel-mcp) — read-only introspection for AI agents */}
         <McpServerSettings setMessage={setMessage} onManageKeys={() => setTab("account")} />
+        </>)}
 
         {/* System Health */}
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">

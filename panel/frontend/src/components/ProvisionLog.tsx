@@ -5,6 +5,7 @@ interface ProvisionStep {
   step: string;
   label: string;
   status: "pending" | "in_progress" | "done" | "error";
+  progress?: number;
   message?: string;
 }
 
@@ -118,6 +119,20 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
     ? "Progress unavailable"
     : completeStep?.label ?? (isComplete ? (isDeploy ? "Deployment complete" : "Provisioning complete") : (isDeploy ? "Deployment failed" : "Provisioning failed"));
 
+  const overallPercent = (() => {
+    if (isComplete) return 100;
+    if (visibleSteps.length === 0) return 5;
+    const total = Math.max(visibleSteps.length, 4);
+    let score = 0;
+    for (const s of visibleSteps) {
+      if (s.status === "done") score += 1;
+      else if (s.status === "in_progress") {
+        score += typeof s.progress === "number" ? Math.min(99, Math.max(5, s.progress)) / 100 : 0.4;
+      }
+    }
+    return Math.min(98, Math.max(5, Math.round((score / total) * 100)));
+  })();
+
   // Collect all step messages into a combined execution log
   const allLogs = steps
     .filter((s) => s.message && s.message.trim().length > 0)
@@ -168,8 +183,13 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
           </div>
         </div>
 
-        {/* Right controls: View Logs toggle */}
+        {/* Right controls: Overall % + View Logs toggle */}
         <div className="flex items-center gap-2">
+          {!severed && (
+            <span className="text-xs font-mono font-semibold text-dark-200 tabular-nums">
+              {overallPercent}%
+            </span>
+          )}
           {allLogs && (
             <button
               type="button"
@@ -184,6 +204,17 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
           )}
         </div>
       </div>
+
+      {!severed && (
+        <div className="w-full h-1.5 bg-dark-700 rounded-full overflow-hidden mb-3.5">
+          <div
+            className={`h-full transition-all duration-200 ${
+              hasError ? "bg-danger-500" : isComplete ? "bg-rust-500" : "bg-accent-500"
+            }`}
+            style={{ width: `${overallPercent}%` }}
+          />
+        </div>
+      )}
 
       {severed && (
         <p className="text-xs mb-3 text-warn-400">
@@ -227,6 +258,19 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
               }`}>
                 {step.label}
               </span>
+              {step.status === "in_progress" && typeof step.progress === "number" && (
+                <div className="mt-1.5 flex items-center gap-2">
+                  <div className="flex-1 h-1.5 bg-dark-700 rounded-full overflow-hidden">
+                    <div
+                      className="h-full transition-all duration-200 bg-accent-500"
+                      style={{ width: `${Math.min(100, Math.max(0, step.progress))}%` }}
+                    />
+                  </div>
+                  <span className="text-[11px] font-mono text-dark-300 tabular-nums w-9 text-right">
+                    {step.progress}%
+                  </span>
+                </div>
+              )}
               {step.message && !showLogs && (
                 <p className="text-xs text-dark-300 mt-0.5 line-clamp-2 font-mono">
                   {step.message.slice(0, 300)}...

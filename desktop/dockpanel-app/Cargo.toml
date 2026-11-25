@@ -1,6 +1,6 @@
 [package]
 name = "dockpanel-app"
-version = "2.248.5"
+version = "2.249.0"
 edition = "2021"
 description = "DockPanel Desktop - Native Pure Rust Windows Application"
 
@@ -15,7 +15,17 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustls = "0.23"
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+tower = "0.5"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 

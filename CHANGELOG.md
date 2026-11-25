@@ -4,6 +4,36 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.249.0] - 2026-11-25
+
+### Release: DockPanel Desktop Production Release & Full Local Toolkit
+*Note: DockPanel Desktop (`desktop/`) is versioned and runtime-isolated independently (`2.249.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli` at `2.248.5`), with all desktop-only UI flows strictly gated by `isDesktopApp()`.*
+
+#### Added & Enhanced
+- **Local HTTPS / SSL Router (`mkcert v1.4.4` + `tokio-rustls`):**
+  - Bundled official `mkcert v1.4.4` binary with stub rejection and automatic SAN certificate generation (`<domain>`, `*.<domain>`, `localhost`, `127.0.0.1`).
+  - Added TLS termination on port `443` (fallback `8443`) with SNI dynamic certificate resolution and `X-Forwarded-Proto: https` header injection.
+  - Added `GET /api/sites/{id}/ssl` and `POST /api/sites/{id}/ssl/provision|renew` endpoints plus live SSL status/controls in `SiteDetail`, `Sites`, `InstallWordPressModal`, and `WordPress`.
+- **Portable Open-Source MariaDB & Multi-Engine Databases:**
+  - Added portable MariaDB manager (`/api/mariadb/status|install|start|stop`) supporting MariaDB download/initialization and automatic detection of active local MySQL/MariaDB daemons on port `3306`.
+  - Added `Database Engine` (`sqlite` / `mariadb`) selection when provisioning sites or WordPress instances, plus a dedicated management banner in `Databases` and `Settings`.
+- **Customizable Website Paths & Disk Cleanup:**
+  - Added `default_sites_dir` setting and per-site `document_root` selection via `AppState::create_site_with_root` with traversal/system-directory validation.
+  - Updated `AppState::delete_site` to remove website folders and files from disk (`fs::remove_dir_all`), along with hosts entries, certificates, security config, and linked MariaDB databases.
+- **Persistent WordPress Core Cache & Pure-Rust Streaming Progress:**
+  - Cached verified `wordpress-latest.zip` and `sqlite-database-integration.zip` locally in `%LOCALAPPDATA%\DockPanel\cache` (with ZIP magic validation) across all domains and core re-installations.
+  - Replaced PowerShell `Expand-Archive` double-copy extraction with direct pure-Rust `zip::ZipArchive` extraction streaming real file-count percentage (`0%–100%`).
+  - Updated SSE progress streaming (`php_install_log_handler`) to emit in-place progress bar updates every `150ms` and consolidated `ProvisionLog.tsx` around a unified overall progress bar without misleading partial percentages on completed steps.
+- **Full WordPress Toolkit Parity on Desktop:**
+  - Fixed `run_wp_php` script execution to define `DOCKPANEL_SITE_DIR` and load `wp-load.php` from the site root instead of `Temp`.
+  - Wired `POST /api/sites/{id}/wordpress/setup`, admin password setup/reset, real plugin/theme listing & actions (enforcing a single active theme), `wp_debug` constants, `blog_public` search indexing toggle, HTTP Basic Auth password protection in `router.rs`, caching toggle & cache purge, and official checksum integrity verification + core re-installation.
+
+#### Fixed
+- **Database Accessibility, Schema & Row Editing (`Databases.tsx`, `databases.rs`, `mariadb.rs`, `main.rs`):**
+  - Eliminated `404 Not found` on `Databases` by adding `GET /api/stacks` (`[]`) and `POST /api/databases/{id}/reset-password` and skipping `/stacks` queries in desktop mode.
+  - Replaced fragile `.rfind('{')` PHP JSON extraction with shared `parse_php_json_output` framing (`__DOCKPANEL_JSON__` + `JSON_INVALID_UTF8_SUBSTITUTE` + outer-brace scan), resolving `"Invalid MySQL output"` errors on rows containing serialized PHP objects (`\u0000`) or JSON strings.
+  - Fixed SQLite inline editing (`UPDATE`/`DELETE` without unsupported `LIMIT 1`), standardized SQL `NULL` encoding (`\N`), filtered internal `_wp_sqlite_*` shim tables from WordPress table lists, normalized SQLite `PRAGMA table_info` schema columns for the Structure tab, added per-row Edit Modal & Delete Row controls, fixed DB size lookups, and added dump download support (`/api/databases/{id}/dumps/{filename}/download`).
+
 ## [2.248.5] - 2026-11-23
 
 ### Features & Fixes: Interactive Plugin & Theme Updates Modals & User-Configurable Scheduled Backups

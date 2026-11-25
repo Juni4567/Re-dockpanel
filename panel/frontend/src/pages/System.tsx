@@ -2,11 +2,13 @@ import { useState, useEffect } from "react";
 import { Navigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../api";
+import { isDesktopApp } from "../utils/desktop";
 import UpdatesContent from "./Updates";
 
 export default function System() {
   const { user } = useAuth();
-  const [tab, setTab] = useState<"updates" | "health">("updates");
+  const desktop = isDesktopApp();
+  const [tab, setTab] = useState<"updates" | "health">(desktop ? "health" : "updates");
 
   if (!user || user.role !== "admin") return <Navigate to="/" replace />;
 
@@ -15,15 +17,19 @@ export default function System() {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6 pb-4 border-b border-dark-600">
         <div>
           <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">System</h1>
-          <p className="text-sm text-dark-200 mt-1">System updates, services, and health monitoring</p>
+          <p className="text-sm text-dark-200 mt-1">
+            {desktop ? "Local Windows host health, resources, and runtime telemetry" : "System updates, services, and health monitoring"}
+          </p>
         </div>
       </div>
-      <div className="flex gap-6 mb-6 text-sm font-mono overflow-x-auto">
-        <button onClick={() => setTab("updates")} className={`whitespace-nowrap ${tab === "updates" ? "border-b-2 border-rust-500 text-dark-50 pb-2" : "text-dark-300 hover:text-dark-100 pb-2"}`}>Updates</button>
-        <button onClick={() => setTab("health")} className={`whitespace-nowrap ${tab === "health" ? "border-b-2 border-rust-500 text-dark-50 pb-2" : "text-dark-300 hover:text-dark-100 pb-2"}`}>Health</button>
-      </div>
-      {tab === "updates" && <UpdatesContent />}
-      {tab === "health" && <HealthContent />}
+      {!desktop && (
+        <div className="flex gap-6 mb-6 text-sm font-mono overflow-x-auto">
+          <button onClick={() => setTab("updates")} className={`whitespace-nowrap ${tab === "updates" ? "border-b-2 border-rust-500 text-dark-50 pb-2" : "text-dark-300 hover:text-dark-100 pb-2"}`}>Updates</button>
+          <button onClick={() => setTab("health")} className={`whitespace-nowrap ${tab === "health" ? "border-b-2 border-rust-500 text-dark-50 pb-2" : "text-dark-300 hover:text-dark-100 pb-2"}`}>Health</button>
+        </div>
+      )}
+      {!desktop && tab === "updates" && <UpdatesContent />}
+      {(desktop || tab === "health") && <HealthContent />}
     </div>
   );
 }

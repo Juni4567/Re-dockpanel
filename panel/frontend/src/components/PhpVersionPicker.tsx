@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { api, ApiError } from "../api";
+import { isDesktopApp } from "../utils/desktop";
 import ProvisionLog from "./ProvisionLog";
 
 interface PhpVersion {
@@ -229,10 +230,14 @@ export default function PhpVersionPicker({
       {needsInstall && !installing && (
         <div className="mt-2 px-3 py-2.5 bg-warn-500/10 border border-warn-500/30 rounded-lg">
           <p className="text-xs text-warn-400">
-            {selected && !selected.installed
-              ? `PHP ${value} is not installed on this server.`
-              : `PHP ${value} is installed but its PHP-FPM service is not running.`}{" "}
-            Sites cannot use it until that is fixed.
+            {isDesktopApp()
+              ? (selected && !selected.installed
+                  ? `PHP ${value} is not installed locally yet.`
+                  : `PHP ${value} local runtime is not active yet.`)
+              : (selected && !selected.installed
+                  ? `PHP ${value} is not installed on this server.`
+                  : `PHP ${value} is installed but its PHP-FPM service is not running.`)}{" "}
+            Sites cannot use it until {isDesktopApp() ? "installed" : "that is fixed"}.
           </p>
           {canInstall ? (
             <button
@@ -256,9 +261,9 @@ export default function PhpVersionPicker({
         <div className="mt-2">
           {installing && (
             <p className="text-xs text-dark-300 mb-2">
-              Installing PHP {installing}. This adds the packages and, on some distributions, a
-              PHP repository first — a few minutes is normal. It runs on the server, so leaving
-              this page will not stop it.
+              {isDesktopApp()
+                ? `Downloading and extracting PHP ${installing} for Windows from windows.php.net...`
+                : `Installing PHP ${installing}. This adds the packages and, on some distributions, a PHP repository first — a few minutes is normal. It runs on the server, so leaving this page will not stop it.`}
             </p>
           )}
           <ProvisionLog

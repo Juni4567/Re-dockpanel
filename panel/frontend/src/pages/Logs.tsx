@@ -5,6 +5,7 @@ import { api, ApiError } from "../api";
 import SystemLogsContent from "./SystemLogs";
 import AuditLogContent from "./Activity";
 import ConfirmDialog from "../components/ConfirmDialog";
+import { isDesktopApp } from "../utils/desktop";
 
 interface Site {
   id: string;
@@ -52,6 +53,13 @@ const LOG_TYPES = [
   { value: "service", label: "Services" },
 ];
 
+const DESKTOP_LOG_TYPES = [
+  { value: "all", label: "All Desktop Logs" },
+  { value: "access", label: "Activity & Actions" },
+  { value: "php_fpm", label: "PHP Errors" },
+  { value: "error", label: "WebView & Errors" },
+];
+
 const SITE_LOG_TYPES = [
   { value: "access", label: "Access Log" },
   { value: "error", label: "Error Log" },
@@ -79,9 +87,10 @@ const TIME_PRESETS = [
 ];
 
 function SiteLogsContent() {
+  const desktop = isDesktopApp();
   const [lines, setLines] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
-  const [logType, setLogType] = useState("nginx_access");
+  const [logType, setLogType] = useState(desktop ? "all" : "nginx_access");
   const [lineCount, setLineCount] = useState(100);
   const [filter, setFilter] = useState("");
   const [filterInput, setFilterInput] = useState("");
@@ -504,16 +513,18 @@ function SiteLogsContent() {
             )}
             {isFileLogType && mode === "tail" && (
               <>
-                <button
-                  onClick={streaming ? stopStream : startStream}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                    streaming
-                      ? "bg-danger-500/15 text-danger-400 hover:bg-danger-500/20"
-                      : "bg-rust-500/15 text-rust-400 hover:bg-rust-500/20"
-                  }`}
-                >
-                  {streaming ? "Stop Stream" : "Live Stream"}
-                </button>
+                {!desktop && (
+                  <button
+                    onClick={streaming ? stopStream : startStream}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                      streaming
+                        ? "bg-danger-500/15 text-danger-400 hover:bg-danger-500/20"
+                        : "bg-rust-500/15 text-rust-400 hover:bg-rust-500/20"
+                    }`}
+                  >
+                    {streaming ? "Stop Stream" : "Live Stream"}
+                  </button>
+                )}
                 {!streaming && (
                   <button
                     onClick={() => setAutoRefresh(!autoRefresh)}
@@ -580,7 +591,12 @@ function SiteLogsContent() {
         <div className="flex items-center gap-3 flex-wrap">
           <select
             value={selectedSite}
-            onChange={(e) => { setSelectedSite(e.target.value); setLogType(e.target.value ? "nginx_access" : "nginx_access"); stopStream(); }}
+            onChange={(e) => {
+              const siteVal = e.target.value;
+              setSelectedSite(siteVal);
+              setLogType(siteVal ? "nginx_access" : desktop ? "all" : "nginx_access");
+              stopStream();
+            }}
             className="text-sm border border-dark-500 rounded-lg px-3 py-1.5 bg-dark-800"
             aria-label="Select site"
           >
@@ -602,7 +618,7 @@ function SiteLogsContent() {
             className="text-sm border border-dark-500 rounded-lg px-3 py-1.5 bg-dark-800"
             aria-label="Log type"
           >
-            {(selectedSite ? SITE_LOG_TYPES : LOG_TYPES).map((t) => (
+            {(selectedSite ? SITE_LOG_TYPES : desktop ? DESKTOP_LOG_TYPES : LOG_TYPES).map((t) => (
               <option key={t.value} value={t.value}>
                 {t.label}
               </option>

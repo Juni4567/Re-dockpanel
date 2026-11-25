@@ -3,6 +3,9 @@ import { useParams, Link } from "react-router-dom";
 import { api } from "../api";
 import SiteThumbnail from "../components/SiteThumbnail";
 import { showGlobalNotification } from "../context/NotificationContext";
+import ProvisionLog from "../components/ProvisionLog";
+import { buildSiteExternalUrl } from "../components/PortConflictModal";
+import { isDesktopApp } from "../utils/desktop";
 
 interface Site {
   id: string;
@@ -21,9 +24,11 @@ interface WpInfo {
 }
 
 interface WpDbInfo {
+  db_id?: string;
   db_name: string;
   db_user: string;
   db_host: string;
+  db_engine?: string;
   table_prefix: string;
 }
 
@@ -130,6 +135,7 @@ export default function WordPress() {
   // Integrity Check
   const [integrityLoading, setIntegrityLoading] = useState(false);
   const [reinstallingCore, setReinstallingCore] = useState(false);
+  const [reinstallInstallId, setReinstallInstallId] = useState<string | null>(null);
   const [integrityResult, setIntegrityResult] = useState<{
     clean: boolean;
     issues: Array<{ file: string; status: string; message?: string }>;
@@ -273,12 +279,26 @@ export default function WordPress() {
     }
   };
 
+  const [wpInstallId, setWpInstallId] = useState<string | null>(null);
+  const [activePort, setActivePort] = useState<number>(80);
+  const [sslPort, setSslPort] = useState<number | null>(null);
+  const desktop = isDesktopApp();
+
   useEffect(() => {
     loadData();
-  }, [id]);
+    if (desktop) {
+      api.get<{ active_port?: number; ssl_port?: number | null }>("/health")
+        .then((h) => {
+          if (h?.active_port) setActivePort(h.active_port);
+          if (typeof h?.ssl_port === "number") setSslPort(h.ssl_port);
+        })
+        .catch(() => {});
+    }
+  }, [id, desktop]);
 
   const handleInstall = async () => {
     setBusy("install");
+    setWpInstallId(null);
     try {
       const payload = {
         ...installData,
@@ -286,14 +306,19 @@ export default function WordPress() {
         title: installData.title || "My WordPress Site",
         url: installData.url || (site?.domain ? `http://${site.domain}` : ""),
         admin_email: installData.admin_email || (site?.domain ? `admin@${site.domain}` : ""),
+        ...(desktop ? { stream: true } : {}),
       };
-      await api.post(`/sites/${id}/wordpress/install`, payload);
+      const res = await api.post<{ install_id?: string }>(`/sites/${id}/wordpress/install`, payload);
+      if (res?.install_id) {
+        setWpInstallId(res.install_id);
+        return;
+      }
       showGlobalNotification("success", "WordPress installed successfully!");
       setShowInstall(false);
+      setBusy("");
       loadData();
     } catch (e) {
       showGlobalNotification("error", e instanceof Error ? e.message : "Install failed");
-    } finally {
       setBusy("");
     }
   };
@@ -519,14 +544,22 @@ export default function WordPress() {
   // Re-install WordPress Core Files safely
   const handleReinstallCore = async () => {
     setReinstallingCore(true);
+    setReinstallInstallId(null);
     try {
-      const res = await api.post<{ ok: boolean; message: string }>(`/sites/${id}/wordpress/reinstall-core`, {});
+      const res = await api.post<{ ok: boolean; message?: string; install_id?: string }>(
+        `/sites/${id}/wordpress/reinstall-core`,
+        desktop ? { stream: true } : {}
+      );
+      if (res?.install_id) {
+        setReinstallInstallId(res.install_id);
+        return;
+      }
       showGlobalNotification("success", res.message || "WordPress core files re-installed successfully!");
       await handleCheckIntegrity();
       loadData();
+      setReinstallingCore(false);
     } catch (e) {
       showGlobalNotification("error", e instanceof Error ? e.message : "Failed to re-install WordPress core");
-    } finally {
       setReinstallingCore(false);
     }
   };
@@ -737,13 +770,26 @@ export default function WordPress() {
 
           {showInstall && (
             <div className="pt-6 border-t border-dark-600 space-y-4">
+              {wpInstallId && (
+                <ProvisionLog
+                  sseUrl={`/api/services/install/${wpInstallId}/log`}
+                  title={`Installing WordPress on ${domain}...`}
+                  onComplete={() => {
+                    setWpInstallId(null);
+                    setBusy("");
+                    setShowInstall(false);
+                    showGlobalNotification("success", `WordPress installed successfully on http://${domain}!`);
+                    loadData();
+                  }}
+                />
+              )}
               <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Installation Details</h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-dark-100 mb-1">Site URL</label>
                   <input
                     type="text"
-                    value={installData.url || `https://${domain}`}
+                    value={installData.url || `${desktop ? "http" : "https"}://${domain}`}
                     onChange={(e) => setInstallData({ ...installData, url: e.target.value })}
                     className="w-full px-3 py-2 bg-dark-900 border border-dark-500 rounded-lg text-sm text-dark-100 focus:border-rust-500 outline-none"
                   />
@@ -793,14 +839,15 @@ export default function WordPress() {
               <div className="flex items-center gap-3 pt-4">
                 <button
                   onClick={handleInstall}
-                  disabled={busy === "install" || !installData.admin_pass}
+                  disabled={busy === "install" || !installData.admin_pass || !!wpInstallId}
                   className="px-5 py-2 bg-rust-500 hover:bg-rust-600 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
                 >
-                  {busy === "install" ? "Installing..." : "Install WordPress"}
+                  {busy === "install" || wpInstallId ? "Installing..." : "Install WordPress"}
                 </button>
                 <button
                   onClick={() => setShowInstall(false)}
-                  className="px-4 py-2 bg-dark-700 text-dark-200 hover:text-dark-50 rounded-lg text-sm font-medium transition-colors"
+                  disabled={busy === "install" || !!wpInstallId}
+                  className="px-4 py-2 bg-dark-700 text-dark-200 hover:text-dark-50 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors"
                 >
                   Cancel
                 </button>
@@ -836,7 +883,7 @@ export default function WordPress() {
 
                 <div className="flex items-center gap-3 pt-1">
                   <a
-                    href={`https://${domain}/wp-admin`}
+                    href={`${desktop ? (sslPort ? buildSiteExternalUrl(domain, sslPort, true) : buildSiteExternalUrl(domain, activePort, false)) : `https://${domain}`}/wp-admin/`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="py-1.5 px-4 bg-accent-600 hover:bg-accent-700 text-white text-xs font-semibold rounded flex items-center justify-center gap-1.5 shadow transition-colors"
@@ -922,7 +969,7 @@ export default function WordPress() {
                 </div>
 
                 <a
-                  href={site?.ssl_enabled ? `https://${domain}` : `http://${domain}`}
+                  href={desktop ? buildSiteExternalUrl(domain, sslPort || activePort, Boolean(sslPort)) : (site?.ssl_enabled ? `https://${domain}` : `http://${domain}`)}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="px-2.5 py-1 bg-dark-700 hover:bg-dark-600 text-dark-200 hover:text-dark-50 text-xs font-mono rounded transition-colors flex items-center gap-1.5"
@@ -1017,6 +1064,19 @@ export default function WordPress() {
                     </button>
                   </div>
 
+                  {reinstallInstallId && !showIntegrityModal && (
+                    <ProvisionLog
+                      sseUrl={`/api/services/install/${reinstallInstallId}/log`}
+                      title="Re-installing WordPress Core..."
+                      onComplete={() => {
+                        setReinstallInstallId(null);
+                        setReinstallingCore(false);
+                        showGlobalNotification("success", "WordPress core files re-installed cleanly!");
+                        loadData();
+                      }}
+                    />
+                  )}
+
                   {/* 4 Feature Boxes Grid (Updates, Tools, Security, Performance) */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                     {/* Card 1: Updates */}
@@ -1089,7 +1149,7 @@ export default function WordPress() {
                         {/* Debugging row with toggle on left */}
                         <div className="flex items-center gap-2">
                           <button
-                            onClick={() => handleToggleFeature("wp_debug", wpDebug)}
+                            onClick={() => handleToggleFeature("wp_debug", !wpDebug)}
                             className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               wpDebug ? "bg-accent-600" : "bg-dark-600"
                             }`}
@@ -1145,7 +1205,7 @@ export default function WordPress() {
                           <svg className="w-3.5 h-3.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
                             <path fillRule="evenodd" d="M10 1a4.5 4.5 0 0 0-4.5 4.5V9H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6a2 2 0 0 0-2-2h-.5V5.5A4.5 4.5 0 0 0 10 1Zm3 8V5.5a3 3 0 1 0-6 0V9h6Z" clipRule="evenodd" />
                           </svg>
-                          <span>{site?.ssl_enabled ? "Let's Encrypt" : "Let's Encrypt"}</span>
+                          <span>{desktop ? (sslPort ? "mkcert Local CA (HTTPS Active)" : "Local HTTP") : "Let's Encrypt"}</span>
                         </div>
 
                         <div className="space-y-1.5">
@@ -1170,7 +1230,7 @@ export default function WordPress() {
                         {/* Vulnerability Protection row with toggle on left */}
                         <div className="flex items-center gap-2">
                           <button
-                            onClick={() => handleToggleFeature("vuln_protect", vulnProtect)}
+                            onClick={() => handleToggleFeature("vuln_protect", !vulnProtect)}
                             className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               vulnProtect ? "bg-accent-600" : "bg-dark-600"
                             }`}
@@ -1185,7 +1245,7 @@ export default function WordPress() {
                         {/* Hotlink protection row with toggle on left */}
                         <div className="flex items-center gap-2">
                           <button
-                            onClick={() => handleToggleFeature("hotlink_protection", hotlinkProtect)}
+                            onClick={() => handleToggleFeature("hotlink_protection", !hotlinkProtect)}
                             className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               hotlinkProtect ? "bg-accent-600" : "bg-dark-600"
                             }`}
@@ -1214,7 +1274,7 @@ export default function WordPress() {
                         {/* Search engine indexing with toggle on left */}
                         <div className="flex items-center gap-2">
                           <button
-                            onClick={() => handleToggleFeature("search_indexing", searchIndexing)}
+                            onClick={() => handleToggleFeature("search_indexing", !searchIndexing)}
                             className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               searchIndexing ? "bg-accent-600" : "bg-dark-600"
                             }`}
@@ -1228,15 +1288,15 @@ export default function WordPress() {
                         {/* Caching (nginx) with toggle on left */}
                         <div className="flex items-center gap-2">
                           <button
-                            onClick={() => handleToggleFeature("caching", nginxCache)}
+                            onClick={() => handleToggleFeature("caching", !nginxCache)}
                             className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               nginxCache ? "bg-accent-600" : "bg-dark-600"
                             }`}
                           >
                             <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${nginxCache ? "translate-x-3.5" : "translate-x-0.5"}`} />
                           </button>
-                          <span className="text-dark-200">Caching (nginx)</span>
-                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="Nginx FastCGI microcaching">ⓘ</span>
+                          <span className="text-dark-200">Caching (WP / Local)</span>
+                          <span className="text-dark-400 hover:text-dark-200 cursor-pointer text-xs" title="WP_CACHE & page caching">ⓘ</span>
                           <button
                             onClick={() => setShowCacheModal(true)}
                             className="text-dark-400 hover:text-dark-200 transition-colors"
@@ -1251,7 +1311,7 @@ export default function WordPress() {
                         {/* Take over wp-cron.php with toggle on left */}
                         <div className="flex items-center gap-2">
                           <button
-                            onClick={() => handleToggleFeature("takeover_cron", takeoverCron)}
+                            onClick={() => handleToggleFeature("takeover_cron", !takeoverCron)}
                             className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
                               takeoverCron ? "bg-accent-600" : "bg-dark-600"
                             }`}
@@ -1674,13 +1734,13 @@ export default function WordPress() {
                       <span className="text-dark-300">Database name</span>
                       <div className="col-span-2 flex items-center gap-2">
                         <Link
-                          to={`/databases?search=${encodeURIComponent(dbInfo?.db_name || "")}&autoOpen=true`}
+                          to={dbInfo?.db_id ? `/databases?dbId=${encodeURIComponent(dbInfo.db_id)}&search=${encodeURIComponent(dbInfo.db_name || "")}&autoOpen=true` : `/databases?search=${encodeURIComponent(dbInfo?.db_name || "")}&autoOpen=true`}
                           className="font-mono text-accent-400 hover:text-accent-300 hover:underline font-medium"
                         >
                           {dbInfo?.db_name || "wp_db"}
                         </Link>
                         <Link
-                          to={`/databases?search=${encodeURIComponent(dbInfo?.db_name || "")}&autoOpen=true`}
+                          to={dbInfo?.db_id ? `/databases?dbId=${encodeURIComponent(dbInfo.db_id)}&search=${encodeURIComponent(dbInfo.db_name || "")}&autoOpen=true` : `/databases?search=${encodeURIComponent(dbInfo?.db_name || "")}&autoOpen=true`}
                           className="text-xs text-accent-400 hover:underline"
                         >
                           [open in Database Manager]
@@ -2076,7 +2136,7 @@ export default function WordPress() {
                   </div>
                 )}
 
-                {integrityResult.issues.length > 0 ? (
+                {(integrityResult.issues || []).length > 0 ? (
                   <div className="max-h-60 overflow-y-auto border border-dark-700 rounded bg-dark-900 p-2">
                     <table className="w-full text-xs text-left">
                       <thead className="border-b border-dark-700 text-dark-400">
@@ -2087,7 +2147,7 @@ export default function WordPress() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-dark-800 font-mono">
-                        {integrityResult.issues.map((issue, idx) => (
+                        {(integrityResult.issues || []).map((issue, idx) => (
                           <tr key={idx}>
                             <td className="p-2 text-dark-100">{issue.file}</td>
                             <td className="p-2 text-warn-400">{issue.status}</td>
@@ -2104,6 +2164,20 @@ export default function WordPress() {
                 )}
               </div>
             ) : null}
+
+            {reinstallInstallId && (
+              <ProvisionLog
+                sseUrl={`/api/services/install/${reinstallInstallId}/log`}
+                title="Re-installing WordPress Core..."
+                onComplete={() => {
+                  setReinstallInstallId(null);
+                  setReinstallingCore(false);
+                  showGlobalNotification("success", "WordPress core files re-installed cleanly!");
+                  handleCheckIntegrity();
+                  loadData();
+                }}
+              />
+            )}
 
             <div className="flex justify-between items-center gap-2 pt-2 border-t border-dark-700">
               <button
@@ -2442,7 +2516,7 @@ export default function WordPress() {
               </button>
               <button
                 onClick={async () => {
-                  await handleToggleFeature("wp_debug", false, { debug_log: debugLog, debug_display: debugDisplay });
+                  await handleToggleFeature("wp_debug", true, { debug_log: debugLog, debug_display: debugDisplay });
                   setShowDebugModal(false);
                 }}
                 className="px-4 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded text-xs font-medium transition-colors"
@@ -2735,7 +2809,7 @@ export default function WordPress() {
             </div>
             <div className="flex justify-between gap-2 pt-2 border-t border-dark-700">
               <Link
-                to={`/databases?search=${encodeURIComponent(dbInfo?.db_name || "")}&autoOpen=true`}
+                to={dbInfo?.db_id ? `/databases?dbId=${encodeURIComponent(dbInfo.db_id)}&search=${encodeURIComponent(dbInfo.db_name || "")}&autoOpen=true` : `/databases?search=${encodeURIComponent(dbInfo?.db_name || "")}&autoOpen=true`}
                 className="text-xs text-accent-400 hover:underline flex items-center gap-1"
               >
                 Manage in Database Manager →

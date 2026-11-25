@@ -59,6 +59,124 @@ pub struct PhpInstallJob {
     pub done: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalNotification {
+    pub id: String,
+    pub title: String,
+    pub message: String,
+    pub severity: String,
+    pub read: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalActivity {
+    pub id: String,
+    pub action: String,
+    pub target_type: String,
+    pub target_name: String,
+    pub details: String,
+    pub user_email: String,
+    pub created_at: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct WorkerJobGuard(isize);
+
+#[cfg(windows)]
+impl Drop for WorkerJobGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn CloseHandle(h: isize) -> i32;
+            }
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_kill_on_close_job() -> Option<Arc<WorkerJobGuard>> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct BasicLimitInfo {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct IoCounters {
+        vals: [u64; 6],
+    }
+
+    #[repr(C)]
+    struct ExtendedLimitInfo {
+        basic: BasicLimitInfo,
+        io: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attrs: *const c_void, name: *const u16) -> isize;
+        fn SetInformationJobObject(job: isize, info_class: u32, info: *const c_void, len: u32) -> i32;
+    }
+
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job == 0 {
+            return None;
+        }
+        let mut info: ExtendedLimitInfo = std::mem::zeroed();
+        info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            &info as *const _ as *const c_void,
+            std::mem::size_of::<ExtendedLimitInfo>() as u32,
+        );
+        if ok == 0 {
+            Some(Arc::new(WorkerJobGuard(job)))
+        } else {
+            Some(Arc::new(WorkerJobGuard(job)))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn assign_child_to_job(job: &Option<Arc<WorkerJobGuard>>, child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AssignProcessToJobObject(job: isize, proc_handle: isize) -> i32;
+    }
+    if let Some(j) = job {
+        if j.0 != 0 {
+            unsafe {
+                AssignProcessToJobObject(j.0, child.as_raw_handle() as isize);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub data: Arc<Mutex<AppData>>,
@@ -66,7 +184,17 @@ pub struct AppState {
     pub worker_ports: Arc<Mutex<HashMap<String, u16>>>,
     pub worker_processes: Arc<Mutex<HashMap<String, std::process::Child>>>,
     pub router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    pub ssl_router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    pub ssl_port: Arc<Mutex<Option<u16>>>,
+    pub cert_resolver: Arc<crate::ssl::DynamicCertResolver>,
+    pub mariadb_process: Arc<Mutex<Option<(std::process::Child, u16)>>>,
     pub php_installs: Arc<Mutex<HashMap<String, PhpInstallJob>>>,
+    pub notifications: Arc<Mutex<Vec<LocalNotification>>>,
+    pub activity_log: Arc<Mutex<Vec<LocalActivity>>>,
+    pub notif_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    #[cfg(windows)]
+    pub worker_job: Option<Arc<WorkerJobGuard>>,
+    pub started_at: std::time::Instant,
     pub config_dir: PathBuf,
     pub sites_dir: PathBuf,
 }
@@ -240,13 +368,26 @@ impl AppState {
 
         let data = Self::load_data(&config_dir);
         let router_config = Self::load_router_config(&config_dir);
+        let (notif_tx, _) = tokio::sync::broadcast::channel(64);
+        let cert_resolver = Arc::new(crate::ssl::DynamicCertResolver::new());
+        cert_resolver.load_existing_certs(&config_dir.join("certs"));
         Self {
             data: Arc::new(Mutex::new(data)),
             router_config: Arc::new(Mutex::new(router_config)),
             worker_ports: Arc::new(Mutex::new(HashMap::new())),
             worker_processes: Arc::new(Mutex::new(HashMap::new())),
             router_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            ssl_router_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            ssl_port: Arc::new(Mutex::new(None)),
+            cert_resolver,
+            mariadb_process: Arc::new(Mutex::new(None)),
             php_installs: Arc::new(Mutex::new(HashMap::new())),
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            activity_log: Arc::new(Mutex::new(Vec::new())),
+            notif_tx,
+            #[cfg(windows)]
+            worker_job: create_kill_on_close_job(),
+            started_at: std::time::Instant::now(),
             config_dir,
             sites_dir,
         }
@@ -395,6 +536,11 @@ impl AppState {
 
     pub fn list_php_versions(&self) -> Vec<serde_json::Value> {
         const STANDARD_VERSIONS: &[&str] = &["8.6", "8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"];
+        let highest_installed = STANDARD_VERSIONS
+            .iter()
+            .copied()
+            .find(|v| find_php_binary_exact(v).is_some())
+            .unwrap_or("8.3");
         STANDARD_VERSIONS
             .iter()
             .map(|&ver| {
@@ -406,7 +552,7 @@ impl AppState {
                     // Desktop runs PHP-CGI workers on demand per site, so an installed binary is immediately ready.
                     "fpm_running": installed,
                     "socket": exe.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-                    "default": ver == "8.3",
+                    "default": ver == highest_installed,
                 })
             })
             .collect()
@@ -415,11 +561,142 @@ impl AppState {
     pub fn push_php_install_step(&self, install_id: &str, step: serde_json::Value, done: bool) {
         if let Ok(mut jobs) = self.php_installs.lock() {
             let job = jobs.entry(install_id.to_string()).or_default();
-            job.steps.push(step);
+            if let Some(step_key) = step.get("step").and_then(|v| v.as_str()) {
+                if let Some(existing) = job.steps.iter_mut().find(|s| {
+                    s.get("step").and_then(|v| v.as_str()) == Some(step_key)
+                }) {
+                    *existing = step;
+                } else {
+                    job.steps.push(step);
+                }
+            } else {
+                job.steps.push(step);
+            }
             if done {
                 job.done = true;
             }
         }
+    }
+
+    pub fn push_install_progress(
+        &self,
+        install_id: &str,
+        step: &str,
+        label: &str,
+        status: &str,
+        progress: Option<u8>,
+        message: Option<&str>,
+        done: bool,
+    ) {
+        let mut obj = serde_json::json!({
+            "step": step,
+            "label": label,
+            "status": status,
+        });
+        if let Some(p) = progress {
+            obj["progress"] = serde_json::json!(p);
+        }
+        if let Some(m) = message {
+            obj["message"] = serde_json::json!(m);
+        }
+        self.push_php_install_step(install_id, obj, done);
+    }
+
+    pub fn certs_dir(&self) -> PathBuf {
+        self.config_dir.join("certs")
+    }
+
+    pub fn get_default_sites_dir(&self) -> PathBuf {
+        let path = self.config_dir.join("desktop_settings.json");
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                if let Some(custom) = saved.get("default_sites_dir").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    let candidate = PathBuf::from(custom);
+                    if candidate.is_absolute() && candidate.parent().is_some() {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        self.sites_dir.clone()
+    }
+
+    pub fn site_dir(&self, site: &LocalSite) -> PathBuf {
+        let trimmed = site.document_root.trim();
+        if !trimmed.is_empty() {
+            PathBuf::from(trimmed)
+        } else {
+            self.get_default_sites_dir().join(&site.domain)
+        }
+    }
+
+    pub fn ensure_site_ssl(&self, domain: &str) -> Result<(), String> {
+        let clean = domain.trim().to_lowercase();
+        let (cert, key) = crate::ssl::ensure_site_certificate(&self.certs_dir(), &clean)?;
+        let ck = crate::ssl::load_certified_key(&cert, &key)?;
+        self.cert_resolver.insert_key(&clean, ck);
+        Ok(())
+    }
+
+    pub fn get_ssl_port(&self) -> Option<u16> {
+        *self.ssl_port.lock().unwrap()
+    }
+
+    pub fn set_ssl_port(&self, port: Option<u16>) {
+        *self.ssl_port.lock().unwrap() = port;
+    }
+
+    fn site_security_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("site_security").join(format!("{}.json", clean))
+    }
+
+    /// Returns `Some((username, sha256_password_hex))` when site password protection is active.
+    pub fn get_site_pass_protect(&self, domain: &str) -> Option<(String, String)> {
+        let path = self.site_security_path(domain);
+        let content = fs::read_to_string(path).ok()?;
+        let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+        if val.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+            return None;
+        }
+        let user = val.get("user").and_then(|v| v.as_str()).unwrap_or("admin").to_string();
+        let hash = val.get("password_hash").and_then(|v| v.as_str())?.to_string();
+        if hash.is_empty() {
+            return None;
+        }
+        Some((user, hash))
+    }
+
+    pub fn set_site_pass_protect(
+        &self,
+        domain: &str,
+        enabled: bool,
+        user: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<(), String> {
+        let path = self.site_security_path(domain);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut current: serde_json::Value = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        current["enabled"] = serde_json::json!(enabled);
+        if let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) {
+            current["user"] = serde_json::json!(u);
+        } else if current.get("user").is_none() {
+            current["user"] = serde_json::json!("admin");
+        }
+        if let Some(p) = password.filter(|s| !s.is_empty()) {
+            current["password_hash"] = serde_json::json!(crate::downloads::sha256_hex(p));
+        } else if enabled && current.get("password_hash").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+            return Err("A password is required to enable Password Protection".to_string());
+        }
+
+        let serialized = serde_json::to_string_pretty(&current).map_err(|e| e.to_string())?;
+        fs::write(&path, serialized).map_err(|e| e.to_string())
     }
 
     pub fn toggle_site_enabled(&self, id_or_domain: &str, enabled: bool) -> Result<LocalSite, String> {
@@ -461,8 +738,15 @@ impl AppState {
             let _ = self.stop_site(&site_id);
         }
 
-        let old_dir = self.sites_dir.join(&old_domain);
-        let new_dir = self.sites_dir.join(&clean_new);
+        let old_dir = self
+            .get_site(&site_id)
+            .map(|s| self.site_dir(&s))
+            .unwrap_or_else(|| self.sites_dir.join(&old_domain));
+        let new_dir = if old_dir.parent().is_some() {
+            old_dir.parent().unwrap().join(&clean_new)
+        } else {
+            self.get_default_sites_dir().join(&clean_new)
+        };
         if old_dir.exists() && !new_dir.exists() {
             fs::rename(&old_dir, &new_dir).map_err(|e| format!("Failed to rename site folder: {}", e))?;
         }
@@ -488,8 +772,8 @@ impl AppState {
     pub fn clone_site(&self, id_or_domain: &str, new_domain: &str) -> Result<LocalSite, String> {
         let src = self.get_site(id_or_domain).ok_or_else(|| "Site not found".to_string())?;
         let cloned = self.create_site(new_domain, Some(&src.php_version))?;
-        let src_dir = self.sites_dir.join(&src.domain);
-        let dst_dir = self.sites_dir.join(&cloned.domain);
+        let src_dir = self.site_dir(&src);
+        let dst_dir = self.site_dir(&cloned);
         if src_dir.exists() {
             let _ = crate::files::copy_dir_recursive(&src_dir, &dst_dir);
         }
@@ -560,18 +844,44 @@ impl AppState {
     }
 
     pub fn create_site(&self, domain: &str, php_version: Option<&str>) -> Result<LocalSite, String> {
+        self.create_site_with_root(domain, php_version, None)
+    }
+
+    pub fn create_site_with_root(
+        &self,
+        domain: &str,
+        php_version: Option<&str>,
+        custom_root: Option<&str>,
+    ) -> Result<LocalSite, String> {
         let validated = crate::hosts_manager::validate_domain(domain)?;
         let clean_domain = validated.to_lowercase();
         let id = uuid::Uuid::new_v4().to_string();
-        let site_dir = self.sites_dir.join(&clean_domain);
-        if site_dir.parent() != Some(self.sites_dir.as_path()) {
-            return Err("Invalid domain path".to_string());
-        }
-        let _ = fs::create_dir_all(&site_dir);
 
-        // Write starter index.html
+        let base_dir = self.get_default_sites_dir();
+        let site_dir = if let Some(raw_root) = custom_root.map(str::trim).filter(|s| !s.is_empty()) {
+            let candidate = PathBuf::from(raw_root);
+            if !candidate.is_absolute() || candidate.parent().is_none() {
+                return Err("Custom site path must be a valid absolute non-root folder path".to_string());
+            }
+            let lower = raw_root.replace('/', "\\").to_lowercase();
+            if lower.starts_with(r"c:\windows") || lower == r"c:\program files" {
+                return Err("Cannot place website files inside a system directory".to_string());
+            }
+            candidate
+        } else {
+            let d = base_dir.join(&clean_domain);
+            if d.parent() != Some(base_dir.as_path()) {
+                return Err("Invalid domain path".to_string());
+            }
+            d
+        };
+        fs::create_dir_all(&site_dir)
+            .map_err(|e| format!("Failed creating site directory '{}': {}", site_dir.display(), e))?;
+
+        // Write starter index.html only if folder doesn't already have index.html or index.php
         let index_file = site_dir.join("index.html");
-        if !index_file.exists() {
+        let index_php = site_dir.join("index.php");
+        if !index_file.exists() && !index_php.exists() {
             let html = format!(
                 r#"<!DOCTYPE html>
 <html lang="en">
@@ -622,26 +932,26 @@ impl AppState {
         }
         self.save_data();
 
-        // Register domain in Windows hosts file (best-effort; never fail site creation on permission errors)
+        // Provision local mkcert TLS certificate + register in Windows hosts (best-effort)
+        #[cfg(not(test))]
+        {
+            let _ = self.ensure_site_ssl(&clean_domain);
+        }
         let _ = crate::hosts_manager::sync_domain_to_hosts(&clean_domain);
 
         Ok(site)
     }
 
     pub fn delete_site(&self, id: &str) -> bool {
-        let domain = {
+        let removed = {
             let mut data = self.data.lock().unwrap();
             let pos = data.sites.iter().position(|s| s.id == id || s.domain == id);
-            if let Some(idx) = pos {
-                let site = data.sites.remove(idx);
-                Some(site.domain)
-            } else {
-                None
-            }
+            pos.map(|idx| data.sites.remove(idx))
         };
 
-        if let Some(dom) = domain {
-            let clean = dom.trim().to_lowercase();
+        if let Some(site) = removed {
+            let clean = site.domain.trim().to_lowercase();
+            let doc_root = self.site_dir(&site);
             if let Ok(mut procs) = self.worker_processes.lock() {
                 if let Some(mut child) = procs.remove(&clean) {
                     let _ = child.kill();
@@ -650,7 +960,39 @@ impl AppState {
             }
             self.remove_site_worker_port(&clean);
             self.save_data();
-            let _ = crate::hosts_manager::remove_domain_from_hosts(&dom);
+            let _ = crate::hosts_manager::remove_domain_from_hosts(&site.domain);
+
+            // Clean up any per-site MariaDB database if present in wp-config.php
+            if let Some(wp_db) = crate::wordpress::read_wp_mysql_db_name(&doc_root) {
+                if let Some(port) = self.get_mariadb_port() {
+                    let _ = crate::mariadb::drop_database(port, &wp_db);
+                }
+            }
+
+            // Delete local site directory and all files to free disk space
+            let default_base = self.get_default_sites_dir();
+            let safe_to_remove = doc_root.exists()
+                && doc_root.parent().is_some()
+                && doc_root != self.sites_dir
+                && doc_root != default_base
+                && doc_root != self.config_dir;
+            if safe_to_remove {
+                for _ in 0..5 {
+                    if fs::remove_dir_all(&doc_root).is_ok() || !doc_root.exists() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+            }
+
+            let cert_dir = self.certs_dir().join(&clean);
+            if cert_dir.is_dir() {
+                let _ = fs::remove_dir_all(cert_dir);
+            }
+            let sec_file = self.site_security_path(&clean);
+            if sec_file.is_file() {
+                let _ = fs::remove_file(sec_file);
+            }
             true
         } else {
             false
@@ -705,16 +1047,28 @@ impl AppState {
         #[cfg(windows)]
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+        let php_error_log = self.config_dir.join("php_errors.log");
+        let error_log_arg = format!("error_log={}", php_error_log.to_string_lossy());
         let mut cmd = std::process::Command::new(&php_exe);
-        cmd.args(["-S", &format!("127.0.0.1:{}", worker_port), "-t", doc_root])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        cmd.args([
+            "-d",
+            &error_log_arg,
+            "-S",
+            &format!("127.0.0.1:{}", worker_port),
+            "-t",
+            doc_root,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
         match cmd.spawn() {
             Ok(child) => {
+                #[cfg(windows)]
+                assign_child_to_job(&self.worker_job, &child);
+
                 let mut procs = self.worker_processes.lock().unwrap();
                 if let Some(mut old_child) = procs.insert(clean.clone(), child) {
                     let _ = old_child.kill();
@@ -815,6 +1169,88 @@ impl AppState {
         for site in active_sites {
             self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
             let _ = crate::hosts_manager::sync_domain_to_hosts(&site.domain);
+            #[cfg(not(test))]
+            {
+                let _ = self.ensure_site_ssl(&site.domain);
+            }
+        }
+    }
+
+    pub fn get_mariadb_port(&self) -> Option<u16> {
+        if let Ok(mut guard) = self.mariadb_process.lock() {
+            if let Some((child, port)) = guard.as_mut() {
+                if matches!(child.try_wait(), Ok(None)) {
+                    return Some(*port);
+                }
+                *guard = None;
+            }
+        }
+        #[cfg(not(test))]
+        if crate::mariadb::is_port_accepting_tcp(3306) {
+            return Some(3306);
+        }
+        None
+    }
+
+    pub fn start_mariadb(&self) -> Result<u16, String> {
+        if let Some(existing) = self.get_mariadb_port() {
+            return Ok(existing);
+        }
+        let daemon = crate::mariadb::find_mariadbd_binary().ok_or_else(|| {
+            "MariaDB is not installed yet. Install MariaDB from Settings -> PHP & Services or Databases."
+                .to_string()
+        })?;
+        let port = crate::mariadb::select_mariadb_port(3306);
+        let data_dir = crate::mariadb::mariadb_data_dir();
+        crate::mariadb::ensure_data_dir_initialized(&data_dir, port)?;
+
+        let mut cmd = std::process::Command::new(&daemon);
+        cmd.args([
+            &format!("--datadir={}", data_dir.to_string_lossy()),
+            &format!("--port={}", port),
+            "--bind-address=127.0.0.1",
+            "--console",
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed starting MariaDB daemon: {}", e))?;
+
+        #[cfg(windows)]
+        assign_child_to_job(&self.worker_job, &child);
+
+        for _ in 0..40 {
+            if crate::mariadb::is_port_accepting_tcp(port) {
+                if let Ok(mut guard) = self.mariadb_process.lock() {
+                    *guard = Some((child, port));
+                }
+                return Ok(port);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        let _ = {
+            let mut c = child;
+            let _ = c.kill();
+            let _ = c.wait();
+        };
+        Err(format!("MariaDB daemon started but port {} did not become ready in time", port))
+    }
+
+    pub fn stop_mariadb(&self) {
+        if let Ok(mut guard) = self.mariadb_process.lock() {
+            if let Some((mut child, _)) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 
@@ -828,6 +1264,118 @@ impl AppState {
         if let Ok(mut ports) = self.worker_ports.lock() {
             ports.clear();
         }
+        self.stop_mariadb();
+    }
+
+    pub fn record_event(
+        &self,
+        action: &str,
+        target_type: &str,
+        target_name: &str,
+        title: &str,
+        message: &str,
+        severity: &str,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let entry = LocalActivity {
+            id: uuid::Uuid::new_v4().to_string(),
+            action: action.to_string(),
+            target_type: target_type.to_string(),
+            target_name: target_name.to_string(),
+            details: message.to_string(),
+            user_email: "local@dockpanel.desktop".to_string(),
+            created_at: now.clone(),
+        };
+        if let Ok(mut act) = self.activity_log.lock() {
+            act.insert(0, entry);
+            act.truncate(100);
+        }
+
+        let notif = LocalNotification {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            message: message.to_string(),
+            severity: severity.to_string(),
+            read: false,
+            created_at: now.clone(),
+        };
+        let _ = self.notif_tx.send(serde_json::json!({
+            "id": notif.id,
+            "title": notif.title,
+            "message": notif.message,
+            "severity": notif.severity,
+            "category": "desktop",
+            "link": serde_json::Value::Null,
+            "read": false,
+            "read_at": serde_json::Value::Null,
+            "created_at": notif.created_at,
+        }));
+        if let Ok(mut notifs) = self.notifications.lock() {
+            notifs.insert(0, notif);
+            notifs.truncate(50);
+        }
+
+        let log_file = self.config_dir.join("desktop_activity.log");
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log_file) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] [{}] {}: {}", now, action, target_name, message);
+        }
+    }
+
+    pub fn get_settings(&self) -> HashMap<String, String> {
+        let mut defaults = HashMap::new();
+        let default_php = ["8.6", "8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"]
+            .into_iter()
+            .find(|v| find_php_binary_exact(v).is_some())
+            .unwrap_or("8.3");
+        defaults.insert("panel_name".to_string(), "DockPanel Desktop".to_string());
+        defaults.insert("base_url".to_string(), "http://127.0.0.1".to_string());
+        defaults.insert("default_php_version".to_string(), default_php.to_string());
+        defaults.insert("preferred_port".to_string(), self.get_router_config().preferred_port.to_string());
+        defaults.insert(
+            "default_sites_dir".to_string(),
+            self.sites_dir.to_string_lossy().to_string(),
+        );
+
+        let path = self.config_dir.join("desktop_settings.json");
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(saved) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                for (k, v) in saved {
+                    defaults.insert(k, v);
+                }
+            }
+        }
+        defaults
+    }
+
+    pub fn update_settings(&self, updates: HashMap<String, String>) -> HashMap<String, String> {
+        let mut current = self.get_settings();
+        for (k, v) in updates {
+            current.insert(k, v);
+        }
+        let path = self.config_dir.join("desktop_settings.json");
+        if let Ok(json) = serde_json::to_string_pretty(&current) {
+            let _ = fs::write(path, json);
+        }
+        current
+    }
+
+    /// Terminates stale PHP built-in server processes pointing at `sites_dir` left over from previous sessions.
+    pub fn cleanup_orphan_php_workers(&self) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let sites_str = self.sites_dir.to_string_lossy().replace('\'', "''");
+            let ps = format!(
+                "Get-CimInstance Win32_Process -Filter \"Name='php.exe'\" -ErrorAction SilentlyContinue | Where-Object {{ $_.CommandLine -like '*{}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
+                sites_str
+            );
+            let _ = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
     }
 
     pub async fn restart_site_router(&self, port: u16) -> bool {
@@ -840,6 +1388,23 @@ impl AppState {
         let bound = rx.await.unwrap_or(false);
         if bound {
             *handle_guard = Some(handle);
+        } else {
+            handle.abort();
+        }
+        bound
+    }
+
+    pub async fn restart_ssl_router(&self, port: u16) -> bool {
+        let mut handle_guard = self.ssl_router_handle.lock().await;
+        if let Some(old_handle) = handle_guard.take() {
+            old_handle.abort();
+            let _ = old_handle.await;
+        }
+        let (handle, rx) = crate::router::start_ssl_site_router_checked(Arc::new(self.clone()), port);
+        let bound = rx.await.unwrap_or(false);
+        if bound {
+            *handle_guard = Some(handle);
+            self.set_ssl_port(Some(port));
         } else {
             handle.abort();
         }
@@ -1026,6 +1591,30 @@ mod tests {
         assert_eq!(site.max_upload_mb, 64);
         assert_eq!(site.php_memory_mb, 256);
         assert_eq!(site.php_max_workers, 4);
+    }
+
+    #[test]
+    fn test_custom_root_site_and_disk_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_custom_root_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let custom_root = temp_dir.join("custom_websites").join("my-custom.test");
+        let state = AppState::new_with_dirs(config_dir, sites_dir);
+
+        assert!(state.create_site_with_root("rel.test", Some("8.3"), Some("relative/folder")).is_err());
+
+        let custom_str = custom_root.to_string_lossy().to_string();
+        let site = state
+            .create_site_with_root("my-custom.test", Some("8.3"), Some(&custom_str))
+            .unwrap();
+        assert_eq!(std::path::PathBuf::from(&site.document_root), custom_root);
+        assert!(custom_root.join("index.php").exists() || custom_root.join("index.html").exists());
+
+        std::fs::write(custom_root.join("extra.txt"), "cleanup-me").unwrap();
+        assert!(state.delete_site(&site.id));
+        assert!(!custom_root.exists(), "Deleting a site must remove its document root folder from disk");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 

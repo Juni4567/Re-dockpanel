@@ -18,10 +18,12 @@ if (typeof (globalThis as any).window === "undefined") {
 
 describe("DesktopSiteActions Component & Native OS Hooks", () => {
   const originalTauri = (window as any).__TAURI__;
+  const originalDockpanel = (window as any).__DOCKPANEL__;
   const originalEnvMode = import.meta.env.VITE_APP_MODE;
 
   beforeEach(() => {
     delete (window as any).__TAURI__;
+    delete (window as any).__DOCKPANEL__;
     (import.meta.env as any).VITE_APP_MODE = undefined;
     vi.clearAllMocks();
   });
@@ -31,6 +33,11 @@ describe("DesktopSiteActions Component & Native OS Hooks", () => {
       (window as any).__TAURI__ = originalTauri;
     } else {
       delete (window as any).__TAURI__;
+    }
+    if (originalDockpanel !== undefined) {
+      (window as any).__DOCKPANEL__ = originalDockpanel;
+    } else {
+      delete (window as any).__DOCKPANEL__;
     }
     (import.meta.env as any).VITE_APP_MODE = originalEnvMode;
   });
@@ -51,25 +58,25 @@ describe("DesktopSiteActions Component & Native OS Hooks", () => {
     expect(html).toContain("<svg");
   });
 
-  it("invokes Tauri open_folder with WSL UNC path when opening folder", async () => {
+  it("invokes Tauri open_folder with Windows site path when opening folder", async () => {
     const mockInvoke = vi.fn().mockResolvedValue(true);
     (window as any).__TAURI__ = { invoke: mockInvoke };
 
     const success = await openDesktopFolder("myproject.test");
     expect(success).toBe(true);
     expect(mockInvoke).toHaveBeenCalledWith("open_folder", {
-      path: "\\\\wsl.localhost\\dockpanel-desktop\\var\\www\\myproject.test",
+      path: "%USERPROFILE%\\DockPanel\\sites\\myproject.test",
     });
   });
 
-  it("invokes Tauri open_vscode with WSL UNC path when opening in VS Code", async () => {
+  it("invokes Tauri open_vscode with Windows site path when opening in VS Code", async () => {
     const mockInvoke = vi.fn().mockResolvedValue(true);
     (window as any).__TAURI__ = { invoke: mockInvoke };
 
     const success = await openDesktopVSCode("myproject.test");
     expect(success).toBe(true);
     expect(mockInvoke).toHaveBeenCalledWith("open_vscode", {
-      path: "\\\\wsl.localhost\\dockpanel-desktop\\var\\www\\myproject.test",
+      path: "%USERPROFILE%\\DockPanel\\sites\\myproject.test",
     });
   });
 
@@ -79,13 +86,26 @@ describe("DesktopSiteActions Component & Native OS Hooks", () => {
 
     await openDesktopFolder("store.local");
     expect(mockInvoke).toHaveBeenCalledWith("open_folder", {
-      path: "\\\\wsl.localhost\\dockpanel-desktop\\var\\www\\store.local",
+      path: "%USERPROFILE%\\DockPanel\\sites\\store.local",
     });
 
     await openDesktopVSCode("store.local");
     expect(mockInvoke).toHaveBeenCalledWith("open_vscode", {
-      path: "\\\\wsl.localhost\\dockpanel-desktop\\var\\www\\store.local",
+      path: "%USERPROFILE%\\DockPanel\\sites\\store.local",
     });
+  });
+
+  it("calls native desktop API endpoints when __DOCKPANEL__ is present", async () => {
+    (window as any).__DOCKPANEL__ = true;
+    const postSpy = vi.spyOn(api, "post").mockResolvedValue({ ok: true });
+
+    expect(await openDesktopFolder("localwp.test")).toBe(true);
+    expect(postSpy).toHaveBeenNthCalledWith(1, "/desktop/open-folder", { domain: "localwp.test" });
+
+    expect(await openDesktopVSCode("localwp.test")).toBe(true);
+    expect(postSpy).toHaveBeenNthCalledWith(2, "/desktop/open-vscode", { domain: "localwp.test" });
+
+    postSpy.mockRestore();
   });
 
   it("falls back gracefully when Tauri invoke throws an error", async () => {

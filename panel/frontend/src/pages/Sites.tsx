@@ -17,6 +17,7 @@ import PortConflictModal, {
   buildSiteExternalUrl,
 } from "../components/PortConflictModal";
 import { isDesktopApp, formatDesktopDomain } from "../utils/desktop";
+import { showGlobalNotification } from "../context/NotificationContext";
 import { useAuth } from "../context/AuthContext";
 
 interface SiteMetrics {
@@ -97,6 +98,10 @@ export default function Sites() {
   const [adminEmail, setAdminEmail] = useState("");
   const [adminUser, setAdminUser] = useState("admin");
   const [adminPassword, setAdminPassword] = useState("");
+  const [wpDbEngine, setWpDbEngine] = useState<"sqlite" | "mariadb">("sqlite");
+  const [customRootPath, setCustomRootPath] = useState("");
+  const [defaultSitesDir, setDefaultSitesDir] = useState("");
+  const [sslPort, setSslPort] = useState<number | null>(null);
   const [enableBackup, setEnableBackup] = useState(false);
   const [backupFrequency, setBackupFrequency] = useState("daily");
   const [backupRetention, setBackupRetention] = useState(7);
@@ -108,6 +113,11 @@ export default function Sites() {
   };
 
   const getSiteExternalUrl = (site: Site) => {
+    if (isDesktopApp()) {
+      return sslPort && site.ssl_enabled
+        ? buildSiteExternalUrl(site.domain, sslPort, true)
+        : buildSiteExternalUrl(site.domain, conflictInfo?.active_port, false);
+    }
     return buildSiteExternalUrl(site.domain, conflictInfo?.active_port, site.ssl_enabled);
   };
 
@@ -163,6 +173,15 @@ export default function Sites() {
   useEffect(() => {
     if (!isDesktopApp()) return;
     api.get<PortConflictInfo>("/system/ports/conflict").then(setConflictInfo).catch(() => {});
+    api.get<{ ssl_port?: number | null }>("/health")
+      .then((h) => { if (typeof h?.ssl_port === "number") setSslPort(h.ssl_port); })
+      .catch(() => {});
+    api.get<{ default_php_version?: string; default_sites_dir?: string }>("/settings")
+      .then((s) => {
+        if (s?.default_php_version) setPhpVersion(s.default_php_version);
+        if (s?.default_sites_dir) setDefaultSitesDir(s.default_sites_dir);
+      })
+      .catch(() => {});
   }, []);
 
   // The transfer recipient is picked, not typed. A free-text email could only
@@ -181,7 +200,11 @@ export default function Sites() {
       const effectiveRuntime = cms ? "php" : runtime;
       const effectivePreset = cms || phpPreset;
       const effectiveDomainToCreate = isDesktopApp() ? formatDesktopDomain(domain, domainSuffix) : domain;
-      const body: Record<string, unknown> = { domain: effectiveDomainToCreate, runtime: effectiveRuntime };
+      const body: Record<string, unknown> = {
+        domain: effectiveDomainToCreate,
+        runtime: effectiveRuntime,
+        ...(isDesktopApp() ? { stream: true } : {}),
+      };
       if (effectiveRuntime === "proxy") body.proxy_port = parseInt(proxyPort);
       if (effectiveRuntime === "node" || effectiveRuntime === "python") {
         body.app_command = appCommand;
@@ -190,22 +213,29 @@ export default function Sites() {
         body.php_version = phpVersion;
         body.php_preset = effectivePreset;
       }
+      if (isDesktopApp() && customRootPath.trim()) {
+        body.document_root = customRootPath.trim();
+      }
       if (cms) {
         body.cms = cms;
+        if (cms === "wordpress" && isDesktopApp()) body.db_engine = wpDbEngine;
         if (siteTitle) body.site_title = siteTitle;
         if (adminEmail) body.admin_email = adminEmail;
         if (adminUser) body.admin_user = adminUser;
         if (adminPassword) body.admin_password = adminPassword;
       }
-      body.enable_backup_schedule = enableBackup;
-      if (enableBackup) {
-        body.backup_frequency = backupFrequency;
-        body.backup_retention = backupRetention;
+      if (!isDesktopApp()) {
+        body.enable_backup_schedule = enableBackup;
+        if (enableBackup) {
+          body.backup_frequency = backupFrequency;
+          body.backup_retention = backupRetention;
+        }
       }
 
       const created = await api.post<Site>("/sites", body);
       setShowForm(false);
       setProvisioningSiteId(created.id);
+      showGlobalNotification("info", `Creating local site ${created.domain}...`);
       setDomain("");
       setDomainSuffix(".test");
       setRuntime("static");
@@ -215,6 +245,8 @@ export default function Sites() {
       setAdminEmail("");
       setAdminUser("admin");
       setAdminPassword("");
+      setWpDbEngine("sqlite");
+      setCustomRootPath("");
       setEnableBackup(false);
       setBackupFrequency("daily");
       setBackupRetention(7);
@@ -228,6 +260,7 @@ export default function Sites() {
 
   const handleProvisionComplete = () => {
     setProvisioningSiteId(null);
+    showGlobalNotification("success", "Site provisioning complete");
     fetchSites();
   };
 
@@ -465,9 +498,9 @@ export default function Sites() {
                 >
                   <option value="static">Static (HTML/CSS/JS)</option>
                   <option value="php">PHP</option>
-                  <option value="node">Node.js</option>
-                  <option value="python">Python</option>
-                  <option value="proxy">Reverse Proxy</option>
+                  {!isDesktopApp() && <option value="node">Node.js</option>}
+                  {!isDesktopApp() && <option value="python">Python</option>}
+                  {!isDesktopApp() && <option value="proxy">Reverse Proxy</option>}
                 </select>
                 <p className="text-xs text-dark-400 mt-1.5">
                   {runtime === "node" ? "Node.js app with managed process (systemd + nginx reverse proxy)" :
@@ -508,7 +541,45 @@ export default function Sites() {
                 <FieldHelp id="sites.create.admin_password" />
               </div>
             </div>
+            {cms === "wordpress" && isDesktopApp() && (
+              <div>
+                <label htmlFor="site-wp-db" className="block text-sm font-medium text-dark-100 mb-1">Database Engine</label>
+                <select
+                  id="site-wp-db"
+                  value={wpDbEngine}
+                  onChange={(e) => setWpDbEngine(e.target.value as "sqlite" | "mariadb")}
+                  className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm bg-dark-800 max-w-md"
+                >
+                  <option value="sqlite">SQLite (Instant — zero database setup)</option>
+                  <option value="mariadb">MariaDB (Open-source MySQL server — auto-downloads if needed)</option>
+                </select>
+                <p className="text-xs text-dark-400 mt-1">Choose SQLite for zero-config speed or MariaDB for full MySQL compatibility.</p>
+              </div>
+            )}
             </>
+          )}
+
+          {isDesktopApp() && (
+            <div>
+              <label htmlFor="site-custom-root" className="block text-sm font-medium text-dark-100 mb-1">
+                Website Folder Path <span className="text-xs text-dark-400 font-normal">(optional custom location)</span>
+              </label>
+              <input
+                id="site-custom-root"
+                type="text"
+                value={customRootPath}
+                onChange={(e) => setCustomRootPath(e.target.value)}
+                placeholder={
+                  defaultSitesDir
+                    ? `${defaultSitesDir}\\${effectiveDomain || "mysite.test"}`
+                    : `C:\\Users\\...\\DockPanel\\sites\\${effectiveDomain || "mysite.test"}`
+                }
+                className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm font-mono"
+              />
+              <p className="text-xs text-dark-400 mt-1">
+                Leave empty to use your default websites directory.
+              </p>
+            </div>
           )}
 
           {runtime === "proxy" && (
@@ -594,7 +665,8 @@ export default function Sites() {
             </div>
           )}
 
-          {/* Scheduled Backups Option */}
+          {/* Scheduled Backups Option (server-only) */}
+          {!isDesktopApp() && (
           <div className="bg-dark-850 p-4 rounded-lg border border-dark-600/70 space-y-3">
             <div className="flex items-center justify-between">
               <div>
@@ -650,6 +722,7 @@ export default function Sites() {
               </div>
             )}
           </div>
+          )}
 
           <div className="flex items-center gap-3 pt-2">
             <button
@@ -831,6 +904,7 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                                 </svg>
                               </Link>
+                              {!isDesktopApp() && (
                               <Link
                                 to={`/mail?domain=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
@@ -840,6 +914,7 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                                 </svg>
                               </Link>
+                              )}
                               <Link
                                 to={`/databases?search=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}
@@ -1025,6 +1100,7 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                                 </svg>
                               </Link>
+                              {!isDesktopApp() && (
                               <Link
                                 to={`/mail?domain=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
@@ -1034,6 +1110,7 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                                 </svg>
                               </Link>
+                              )}
                               <Link
                                 to={`/databases?search=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}
@@ -1201,7 +1278,7 @@ export default function Sites() {
         isOpen={showPortModal}
         onClose={() => setShowPortModal(false)}
         conflictInfo={conflictInfo}
-        onResolved={(newPort) =>
+        onResolved={(newPort) => {
           setConflictInfo((prev) =>
             prev
               ? {
@@ -1210,8 +1287,9 @@ export default function Sites() {
                   in_use: newPort === prev.preferred_port ? false : prev.in_use,
                 }
               : null
-          )
-        }
+          );
+          showGlobalNotification("success", `Local site router switched to port ${newPort}`);
+        }}
       />
       </div>
     </div>

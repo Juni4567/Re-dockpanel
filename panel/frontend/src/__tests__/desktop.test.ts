@@ -37,12 +37,12 @@ describe("Desktop Mode Utils", () => {
     expect(isDesktopApp()).toBe(true);
   });
 
-  it("constructs valid Windows WSL UNC path for local sites", () => {
+  it("constructs default Windows site path for local sites", () => {
     const path = getDesktopSitePath("mysite.test");
-    expect(path).toBe("\\\\wsl.localhost\\dockpanel-desktop\\var\\www\\mysite.test");
+    expect(path).toBe("%USERPROFILE%\\DockPanel\\sites\\mysite.test");
   });
 
-  it("prunes server-only navigation items when in desktop mode", () => {
+  it("prunes server-only and VPS-only navigation items when in desktop mode", () => {
     (window as any).__TAURI__ = {};
     expect(isDesktopApp()).toBe(true);
 
@@ -54,6 +54,11 @@ describe("Desktop Mode Utils", () => {
       "/reseller",
       "/reseller/users",
       "/resellers",
+      "/apps",
+      "/git-deploys",
+      "/mail",
+      "/terminal",
+      "/users",
     ];
     for (const group of navGroups) {
       for (const item of group.items) {

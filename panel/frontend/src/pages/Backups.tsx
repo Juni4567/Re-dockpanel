@@ -3,6 +3,7 @@ import { useParams, Link } from "react-router-dom";
 import { api } from "../api";
 import { useAuth } from "../context/AuthContext";
 import { formatSize, formatDate } from "../utils/format";
+import { isDesktopApp } from "../utils/desktop";
 import ProvisionLog from "../components/ProvisionLog";
 
 interface Backup {
@@ -124,16 +125,19 @@ export default function Backups() {
   const [destinationsFailed, setDestinationsFailed] = useState(false);
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
+  const desktop = isDesktopApp();
 
   useEffect(() => {
     api.get<Site>(`/sites/${id}`).then(setSite).catch(() => {});
     loadBackups();
-    loadSchedule();
-    api.get<BackupDestination[]>("/backup-destinations/selectable")
-      .then((d) => { setDestinations(d); setDestinationsFailed(false); })
-      .catch(() => setDestinationsFailed(true));
+    if (!desktop) {
+      loadSchedule();
+      api.get<BackupDestination[]>("/backup-destinations/selectable")
+        .then((d) => { setDestinations(d); setDestinationsFailed(false); })
+        .catch(() => setDestinationsFailed(true));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, desktop]);
 
   const loadSchedule = async () => {
     try {
@@ -304,7 +308,8 @@ export default function Backups() {
         />
       )}
 
-      {/* Scheduled Backups */}
+      {/* Scheduled Backups (server-only) */}
+      {!desktop && (
       <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mb-6">
         <div className="px-5 py-3 border-b border-dark-600 flex items-center justify-between">
           <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Scheduled Backup</h3>
@@ -440,6 +445,7 @@ export default function Backups() {
           )}
         </div>
       </div>
+      )}
 
       {/* Backups list */}
       <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">
@@ -519,6 +525,13 @@ export default function Backups() {
                   </td>
                   <td className="px-5 py-4 text-right">
                     <div className="flex items-center justify-end gap-2 flex-wrap">
+                      <a
+                        href={`/api/sites/${id}/backups/${encodeURIComponent(backup.id)}/download`}
+                        download={backup.filename}
+                        className="px-3 py-1 bg-dark-700 text-dark-100 rounded-md text-xs font-medium hover:bg-dark-600 transition-colors"
+                      >
+                        Download
+                      </a>
                       {restoreTarget === backup.id ? (
                         <div className="inline-flex items-center gap-1.5">
                           <span className="text-[10px] text-danger-400 font-mono mr-1">

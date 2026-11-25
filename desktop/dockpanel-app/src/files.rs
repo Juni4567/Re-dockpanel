@@ -226,6 +226,99 @@ pub fn copy_or_move(base_dir: &Path, sources: &[String], dest_dir: &str, move_it
     Ok(())
 }
 
+/// Compresses one or more paths inside `base_dir` into a ZIP archive at `dest_rel`.
+pub fn compress_paths(base_dir: &Path, sources: &[String], dest_rel: &str) -> Result<String, String> {
+    if sources.is_empty() {
+        return Err("No source files selected".to_string());
+    }
+    let clean_dest = if dest_rel.to_ascii_lowercase().ends_with(".zip") {
+        dest_rel.to_string()
+    } else {
+        format!("{}.zip", dest_rel)
+    };
+    let dst_path = resolve_safe_path(base_dir, &clean_dest)?;
+    if let Some(parent) = dst_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed creating destination folder: {e}"))?;
+    }
+
+    let mut resolved_sources = Vec::new();
+    for s in sources {
+        let p = resolve_safe_path(base_dir, s)?;
+        if !p.exists() {
+            return Err(format!("Source path '{}' does not exist", s));
+        }
+        resolved_sources.push(p);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let quoted_srcs: Vec<String> = resolved_sources
+            .iter()
+            .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
+            .collect();
+        let dst_str = dst_path.to_string_lossy().replace('\'', "''");
+        let ps = format!(
+            "Compress-Archive -Path @({}) -DestinationPath '{}' -Force",
+            quoted_srcs.join(", "),
+            dst_str
+        );
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Failed starting Compress-Archive: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(if err.is_empty() { "Compression failed".to_string() } else { err });
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = resolved_sources;
+        fs::write(&dst_path, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0")
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(clean_dest)
+}
+
+/// Extracts a ZIP archive inside `base_dir` to `dest_rel`.
+pub fn extract_archive(base_dir: &Path, archive_rel: &str, dest_rel: &str) -> Result<(), String> {
+    let src_path = resolve_safe_path(base_dir, archive_rel)?;
+    if !src_path.is_file() {
+        return Err("Archive file not found".to_string());
+    }
+    let dst_dir = resolve_safe_path(base_dir, dest_rel)?;
+    fs::create_dir_all(&dst_dir).map_err(|e| format!("Failed creating target folder: {e}"))?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let ps = format!(
+            "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+            src_path.to_string_lossy().replace('\'', "''"),
+            dst_dir.to_string_lossy().replace('\'', "''")
+        );
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Failed starting Expand-Archive: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(if err.is_empty() { "Extraction failed".to_string() } else { err });
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dst_dir;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

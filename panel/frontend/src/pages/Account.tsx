@@ -1,4 +1,5 @@
 import { useAuth } from "../context/AuthContext";
+import { isDesktopApp } from "../utils/desktop";
 import {
   TwoFactorCard,
   PasskeysCard,
@@ -8,21 +9,9 @@ import {
   ExportMyDataCard,
 } from "../components/AccountSecurity";
 
-/**
- * A person's own account, reachable by every role.
- *
- * Until this page existed, all of it lived on `/settings`, whose nav row is
- * `adminOnly`, so a `client`, `user` or `reseller` had no way to change their own
- * password or enrol in 2FA — while the layout's own banner told them 2FA was
- * required and linked them to that same admin page. The endpoints were never the
- * obstacle: every one is `AuthUser` and scoped to the caller's own id.
- *
- * Deliberately NOT `adminOnly` in `data/navItems.ts`. If a future change makes it
- * admin-only again, the 2FA banner in all four layouts becomes a dead end for the
- * exact population it is aimed at.
- */
 export default function Account() {
   const { user } = useAuth();
+  const desktop = isDesktopApp();
 
   return (
     <div>
@@ -41,14 +30,28 @@ export default function Account() {
       </div>
 
       <div className="p-6 lg:p-8">
-        <div className="space-y-6">
-          <TwoFactorCard />
-          <PasskeysCard />
-          <ChangePasswordCard />
-          <SessionsCard />
-          <ApiKeysCard />
-          <ExportMyDataCard />
-        </div>
+        {desktop ? (
+          <div className="bg-dark-800 border border-dark-500 rounded-lg p-6 max-w-2xl space-y-3">
+            <h2 className="text-sm font-semibold text-dark-50 font-mono uppercase tracking-wider">
+              Local Workstation Session
+            </h2>
+            <p className="text-sm text-dark-200 leading-relaxed">
+              You are signed in automatically as{" "}
+              <span className="font-mono text-rust-400">{user?.email || "local@dockpanel.desktop"}</span>{" "}
+              in DockPanel Desktop. Multi-user authentication, 2FA, passkeys, SSH sessions, and API
+              tokens are only used on remote Linux server panels.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-6">
+            <TwoFactorCard />
+            <PasskeysCard />
+            <ChangePasswordCard />
+            <SessionsCard />
+            <ApiKeysCard />
+            <ExportMyDataCard />
+          </div>
+        )}
       </div>
     </div>
   );

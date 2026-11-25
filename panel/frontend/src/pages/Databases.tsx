@@ -3,7 +3,9 @@ import { useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import { useAuth } from "../context/AuthContext";
+import { isDesktopApp } from "../utils/desktop";
 import ConfirmDialog from "../components/ConfirmDialog";
+import ProvisionLog from "../components/ProvisionLog";
 import { showGlobalNotification } from "../context/NotificationContext";
 
 interface Site {
@@ -54,6 +56,7 @@ const engineLabels: Record<string, string> = {
   postgres: "PostgreSQL 16",
   mysql: "MySQL 8.0",
   mariadb: "MariaDB 11",
+  sqlite: "SQLite (Local)",
 };
 
 /* ─── Advanced Database Manager ───────────── */
@@ -103,8 +106,8 @@ function AdvancedDatabaseManager({
     t.toLowerCase().includes(tableSearch.toLowerCase())
   );
 
-  // Common quote char for identifiers: Postgres uses double-quotes, MySQL/MariaDB backticks
-  const q = database.engine === "postgres" ? '"' : "`";
+  // Common quote char for identifiers: Postgres and SQLite use double-quotes, MySQL/MariaDB backticks
+  const q = database.engine === "postgres" || database.engine === "sqlite" ? '"' : "`";
 
   // Lethal action confirmations
   const [confirmModal, setConfirmModal] = useState<{
@@ -184,6 +187,31 @@ function AdvancedDatabaseManager({
     originalVal: string;
   } | null>(null);
   const [savingCell, setSavingCell] = useState(false);
+  const [editingRowModal, setEditingRowModal] = useState<{
+    rIdx: number;
+    values: Record<string, string>;
+    originalRow: string[];
+  } | null>(null);
+  const [savingRowModal, setSavingRowModal] = useState(false);
+
+  const buildRowWhereClause = useCallback(
+    (columns: string[], row: string[]) => {
+      const idColIdx = columns.findIndex(
+        (c) => c.toLowerCase() === "id" || c.toLowerCase().endsWith("_id")
+      );
+      if (idColIdx !== -1 && row[idColIdx] !== "\\N" && row[idColIdx] !== "") {
+        return [`${q}${columns[idColIdx]}${q} = '${row[idColIdx].replace(/'/g, "''")}'`];
+      }
+      return columns.map((c, idx) => {
+        const v = row[idx];
+        if (v === "\\N" || v === undefined) {
+          return `${q}${c}${q} IS NULL`;
+        }
+        return `${q}${c}${q} = '${v.replace(/'/g, "''")}'`;
+      });
+    },
+    [q]
+  );
 
   const handleSaveCell = async () => {
     if (!editingCell || !browseRows || !selectedTable) return;
@@ -197,29 +225,12 @@ function AdvancedDatabaseManager({
     try {
       const col = browseRows.columns[cIdx];
       const row = browseRows.rows[rIdx];
-      const isNull = val === "" || val.toUpperCase() === "NULL";
+      const isNull = val === "\\N" || val.toUpperCase() === "NULL";
 
-      let whereConditions: string[] = [];
-      const idColIdx = browseRows.columns.findIndex(
-        (c) => c.toLowerCase() === "id" || c.toLowerCase().endsWith("_id")
-      );
-
-      if (idColIdx !== -1 && row[idColIdx] !== "\\N" && row[idColIdx] !== "") {
-        whereConditions.push(`${q}${browseRows.columns[idColIdx]}${q} = '${row[idColIdx].replace(/'/g, "''")}'`);
-      } else {
-        browseRows.columns.forEach((c, idx) => {
-          const v = row[idx];
-          if (v === "\\N" || v === "") {
-            whereConditions.push(`${q}${c}${q} IS NULL`);
-          } else {
-            whereConditions.push(`${q}${c}${q} = '${v.replace(/'/g, "''")}'`);
-          }
-        });
-      }
-
+      const whereConditions = buildRowWhereClause(browseRows.columns, row);
       const escapedVal = val.replace(/'/g, "''");
       const setClause = isNull ? `${q}${col}${q} = NULL` : `${q}${col}${q} = '${escapedVal}'`;
-      const limitClause = database.engine === "postgres" ? "" : " LIMIT 1";
+      const limitClause = database.engine === "postgres" || database.engine === "sqlite" ? "" : " LIMIT 1";
       const sql = `UPDATE ${q}${selectedTable}${q} SET ${setClause} WHERE ${whereConditions.join(" AND ")}${limitClause}`;
 
       await api.post(`/databases/${database.id}/query`, { sql });
@@ -238,6 +249,57 @@ function AdvancedDatabaseManager({
       );
     } finally {
       setSavingCell(false);
+    }
+  };
+
+  const handleSaveRowModal = async () => {
+    if (!editingRowModal || !browseRows || !selectedTable) return;
+    setSavingRowModal(true);
+    try {
+      const setParts: string[] = [];
+      browseRows.columns.forEach((col, idx) => {
+        const newVal = editingRowModal.values[col] ?? "";
+        const origRaw = editingRowModal.originalRow[idx];
+        const origVal = origRaw === "\\N" ? "NULL" : origRaw;
+        if (newVal !== origVal) {
+          if (newVal === "\\N" || newVal.toUpperCase() === "NULL") {
+            setParts.push(`${q}${col}${q} = NULL`);
+          } else {
+            setParts.push(`${q}${col}${q} = '${newVal.replace(/'/g, "''")}'`);
+          }
+        }
+      });
+      if (setParts.length === 0) {
+        setEditingRowModal(null);
+        return;
+      }
+      const whereConditions = buildRowWhereClause(browseRows.columns, editingRowModal.originalRow);
+      const limitClause = database.engine === "postgres" || database.engine === "sqlite" ? "" : " LIMIT 1";
+      const sql = `UPDATE ${q}${selectedTable}${q} SET ${setParts.join(", ")} WHERE ${whereConditions.join(" AND ")}${limitClause}`;
+      await api.post(`/databases/${database.id}/query`, { sql });
+      showGlobalNotification("success", "Row updated successfully");
+      setEditingRowModal(null);
+      loadBrowseData();
+    } catch (err) {
+      showGlobalNotification("error", err instanceof Error ? err.message : "Failed to update row");
+    } finally {
+      setSavingRowModal(false);
+    }
+  };
+
+  const handleDeleteRow = async (rIdx: number) => {
+    if (!browseRows || !selectedTable) return;
+    const row = browseRows.rows[rIdx];
+    const whereConditions = buildRowWhereClause(browseRows.columns, row);
+    const limitClause = database.engine === "postgres" || database.engine === "sqlite" ? "" : " LIMIT 1";
+    try {
+      const sql = `DELETE FROM ${q}${selectedTable}${q} WHERE ${whereConditions.join(" AND ")}${limitClause}`;
+      await api.post(`/databases/${database.id}/query`, { sql });
+      showGlobalNotification("success", "Row deleted successfully");
+      loadBrowseData();
+      loadTables();
+    } catch (err) {
+      showGlobalNotification("error", err instanceof Error ? err.message : "Failed to delete row");
     }
   };
 
@@ -303,7 +365,12 @@ function AdvancedDatabaseManager({
       confirmLabel: "Empty Table (Truncate)",
       onConfirm: async () => {
         try {
-          const sql = database.engine === "postgres" ? `TRUNCATE TABLE ${q}${tbl}${q} CASCADE` : `TRUNCATE TABLE ${q}${tbl}${q}`;
+          const sql =
+            database.engine === "postgres"
+              ? `TRUNCATE TABLE ${q}${tbl}${q} CASCADE`
+              : database.engine === "sqlite"
+                ? `DELETE FROM ${q}${tbl}${q}`
+                : `TRUNCATE TABLE ${q}${tbl}${q}`;
           await api.post(`/databases/${database.id}/query`, { sql });
           showGlobalNotification("success", `Table "${tbl}" emptied successfully`);
           loadBrowseData();
@@ -397,6 +464,10 @@ function AdvancedDatabaseManager({
           if (database.engine === "postgres") {
             const tableList = selectedTables.map((t) => `${q}${t}${q}`).join(", ");
             await api.post(`/databases/${database.id}/query`, { sql: `TRUNCATE TABLE ${tableList} CASCADE` });
+          } else if (database.engine === "sqlite") {
+            for (const t of selectedTables) {
+              await api.post(`/databases/${database.id}/query`, { sql: `DELETE FROM ${q}${t}${q}` });
+            }
           } else {
             for (const t of selectedTables) {
               await api.post(`/databases/${database.id}/query`, { sql: `TRUNCATE TABLE ${q}${t}${q}` });
@@ -530,7 +601,9 @@ function AdvancedDatabaseManager({
       const sql =
         database.engine === "postgres"
           ? `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} SERIAL PRIMARY KEY, ${q}created_at${q} TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
-          : `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} INT AUTO_INCREMENT PRIMARY KEY, ${q}created_at${q} TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`;
+          : database.engine === "sqlite"
+            ? `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} INTEGER PRIMARY KEY AUTOINCREMENT, ${q}created_at${q} DATETIME DEFAULT CURRENT_TIMESTAMP)`
+            : `CREATE TABLE ${q}${newTableName.trim()}${q} (${q}id${q} INT AUTO_INCREMENT PRIMARY KEY, ${q}created_at${q} TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`;
       await api.post(`/databases/${database.id}/query`, { sql });
       showGlobalNotification("success", `Table "${newTableName}" created successfully`);
       setShowCreateTableModal(false);
@@ -1224,94 +1297,121 @@ function AdvancedDatabaseManager({
                       <table className="w-full text-left">
                         <thead>
                           <tr className="border-b border-dark-600 bg-dark-900/80 sticky top-0">
-                            <th className="px-3 py-2 text-[10px] text-dark-400 uppercase font-mono w-10">#</th>
-                            {browseRows.columns.map((col) => (
-                              <th
-                                key={col}
-                                onClick={() => handleSort(col)}
-                                className="px-3 py-2 text-xs font-semibold text-dark-200 font-mono whitespace-nowrap cursor-pointer hover:text-rust-400 select-none"
-                              >
-                                <div className="flex items-center gap-1">
-                                  <span>{col}</span>
-                                  {sortCol === col && (
-                                    <span className="text-rust-400">{sortDir === "ASC" ? "▲" : "▼"}</span>
-                                  )}
-                                </div>
-                              </th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-dark-700/60 font-mono text-xs">
-                          {browseRows.rows.map((row, rIdx) => (
-                            <tr key={rIdx} className="hover:bg-dark-700/30 transition-colors">
-                              <td className="px-3 py-2 text-[10px] text-dark-500 font-mono">
-                                {browsePage * pageSize + rIdx + 1}
-                              </td>
-                              {row.map((val, cIdx) => {
-                                const isEditing = editingCell?.rIdx === rIdx && editingCell?.cIdx === cIdx;
-                                return (
-                                  <td
-                                    key={cIdx}
-                                    onDoubleClick={() => {
-                                      setEditingCell({
-                                        rIdx,
-                                        cIdx,
-                                        val: val === "\\N" ? "" : val,
-                                        originalVal: val === "\\N" ? "" : val,
-                                      });
-                                    }}
-                                    className={`px-3 py-2 whitespace-nowrap max-w-sm truncate relative transition-colors ${
-                                      isEditing
-                                        ? "p-1 bg-dark-900 border border-rust-500 rounded"
-                                        : "text-dark-200 cursor-pointer hover:bg-dark-700/50 hover:text-white"
-                                    }`}
-                                    title={isEditing ? undefined : `Double-click to edit (current: ${val})`}
-                                  >
-                                    {isEditing ? (
-                                      <div className="flex items-center gap-1 min-w-[160px]">
-                                        <input
-                                          autoFocus
-                                          type="text"
-                                          value={editingCell.val}
-                                          onChange={(e) =>
-                                            setEditingCell({ ...editingCell, val: e.target.value })
-                                          }
-                                          onKeyDown={(e) => {
-                                            if (e.key === "Enter") handleSaveCell();
-                                            if (e.key === "Escape") setEditingCell(null);
-                                          }}
-                                          disabled={savingCell}
-                                          className="flex-1 bg-dark-950 border border-dark-600 rounded px-2 py-0.5 text-xs text-white focus:outline-none focus:border-rust-500 font-mono"
-                                        />
-                                        <button
-                                          type="button"
-                                          onClick={handleSaveCell}
-                                          disabled={savingCell}
-                                          className="p-1 text-emerald-400 hover:text-emerald-300 transition-colors"
-                                          title="Save (Enter)"
-                                        >
-                                          ✓
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={() => setEditingCell(null)}
-                                          className="p-1 text-dark-400 hover:text-dark-200 transition-colors"
-                                          title="Cancel (Esc)"
-                                        >
-                                          ✕
-                                        </button>
-                                      </div>
-                                    ) : val === "" || val === "\\N" ? (
-                                      <span className="text-dark-500 italic text-[10px]">NULL</span>
-                                    ) : (
-                                      val
+                              <th className="px-3 py-2 text-[10px] text-dark-400 uppercase font-mono w-10">#</th>
+                              {browseRows.columns.map((col) => (
+                                <th
+                                  key={col}
+                                  onClick={() => handleSort(col)}
+                                  className="px-3 py-2 text-xs font-semibold text-dark-200 font-mono whitespace-nowrap cursor-pointer hover:text-rust-400 select-none"
+                                >
+                                  <div className="flex items-center gap-1">
+                                    <span>{col}</span>
+                                    {sortCol === col && (
+                                      <span className="text-rust-400">{sortDir === "ASC" ? "▲" : "▼"}</span>
                                     )}
-                                  </td>
-                                );
-                              })}
+                                  </div>
+                                </th>
+                              ))}
+                              <th className="px-3 py-2 text-[10px] text-dark-400 uppercase font-mono text-right">Actions</th>
                             </tr>
-                          ))}
-                        </tbody>
+                          </thead>
+                          <tbody className="divide-y divide-dark-700/60 font-mono text-xs">
+                            {browseRows.rows.map((row, rIdx) => (
+                              <tr key={rIdx} className="hover:bg-dark-700/30 transition-colors">
+                                <td className="px-3 py-2 text-[10px] text-dark-500 font-mono">
+                                  {browsePage * pageSize + rIdx + 1}
+                                </td>
+                                {row.map((val, cIdx) => {
+                                  const isEditing = editingCell?.rIdx === rIdx && editingCell?.cIdx === cIdx;
+                                  return (
+                                    <td
+                                      key={cIdx}
+                                      onDoubleClick={() => {
+                                        setEditingCell({
+                                          rIdx,
+                                          cIdx,
+                                          val: val === "\\N" ? "" : val,
+                                          originalVal: val === "\\N" ? "" : val,
+                                        });
+                                      }}
+                                      className={`px-3 py-2 whitespace-nowrap max-w-sm truncate relative transition-colors ${
+                                        isEditing
+                                          ? "p-1 bg-dark-900 border border-rust-500 rounded"
+                                          : "text-dark-200 cursor-pointer hover:bg-dark-700/50 hover:text-white"
+                                      }`}
+                                      title={isEditing ? undefined : `Double-click to edit (current: ${val})`}
+                                    >
+                                      {isEditing ? (
+                                        <div className="flex items-center gap-1 min-w-[160px]">
+                                          <input
+                                            autoFocus
+                                            type="text"
+                                            value={editingCell.val}
+                                            onChange={(e) =>
+                                              setEditingCell({ ...editingCell, val: e.target.value })
+                                            }
+                                            onKeyDown={(e) => {
+                                              if (e.key === "Enter") handleSaveCell();
+                                              if (e.key === "Escape") setEditingCell(null);
+                                            }}
+                                            disabled={savingCell}
+                                            className="flex-1 bg-dark-950 border border-dark-600 rounded px-2 py-0.5 text-xs text-white focus:outline-none focus:border-rust-500 font-mono"
+                                          />
+                                          <button
+                                            type="button"
+                                            onClick={handleSaveCell}
+                                            disabled={savingCell}
+                                            className="p-1 text-emerald-400 hover:text-emerald-300 transition-colors"
+                                            title="Save (Enter)"
+                                          >
+                                            ✓
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => setEditingCell(null)}
+                                            className="p-1 text-dark-400 hover:text-dark-200 transition-colors"
+                                            title="Cancel (Esc)"
+                                          >
+                                            ✕
+                                          </button>
+                                        </div>
+                                      ) : val === "\\N" ? (
+                                        <span className="text-dark-500 italic text-[10px]">NULL</span>
+                                      ) : val === "" ? (
+                                        <span className="text-dark-600 italic text-[10px]">(empty)</span>
+                                      ) : (
+                                        val
+                                      )}
+                                    </td>
+                                  );
+                                })}
+                                <td className="px-3 py-2 text-right whitespace-nowrap">
+                                  <div className="inline-flex items-center gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const vals: Record<string, string> = {};
+                                        browseRows.columns.forEach((col, ci) => {
+                                          vals[col] = row[ci] === "\\N" ? "NULL" : (row[ci] ?? "");
+                                        });
+                                        setEditingRowModal({ rIdx, values: vals, originalRow: row });
+                                      }}
+                                      className="text-xs text-accent-400 hover:text-accent-300 font-sans"
+                                    >
+                                      Edit
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteRow(rIdx)}
+                                      className="text-xs text-danger-400 hover:text-danger-300 font-sans"
+                                    >
+                                      Delete
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
                       </table>
                     )}
 
@@ -1924,6 +2024,55 @@ function AdvancedDatabaseManager({
         </div>
       </div>
 
+      {/* Edit Row Modal */}
+      {editingRowModal && browseRows && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-dark-800 rounded-xl border border-dark-600 p-6 w-full max-w-xl max-h-[85vh] overflow-y-auto space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-600 pb-3">
+              <h3 className="text-sm font-semibold text-dark-100 font-mono">Edit Row in {selectedTable}</h3>
+              <button onClick={() => setEditingRowModal(null)} className="text-dark-400 hover:text-dark-200 text-sm">
+                &times;
+              </button>
+            </div>
+            <div className="space-y-3">
+              {browseRows.columns.map((col) => (
+                <div key={col}>
+                  <label className="block text-xs font-mono text-dark-300 mb-1">{col}</label>
+                  <textarea
+                    rows={String(editingRowModal.values[col] || "").length > 80 ? 3 : 1}
+                    value={editingRowModal.values[col] ?? ""}
+                    onChange={(e) =>
+                      setEditingRowModal((prev) =>
+                        prev ? { ...prev, values: { ...prev.values, [col]: e.target.value } } : prev
+                      )
+                    }
+                    placeholder="Type NULL to set SQL NULL"
+                    className="w-full bg-dark-900 border border-dark-600 rounded px-3 py-1.5 text-xs font-mono text-dark-100 focus:outline-none focus:border-rust-500"
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2 pt-3 border-t border-dark-600">
+              <button
+                type="button"
+                onClick={() => setEditingRowModal(null)}
+                className="px-3 py-1.5 text-xs text-dark-300 hover:text-dark-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveRowModal}
+                disabled={savingRowModal}
+                className="px-4 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50"
+              >
+                {savingRowModal ? "Saving..." : "Save Changes"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Insert Row Modal */}
       {showInsertModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -2107,11 +2256,12 @@ export default function Databases() {
   // Form state. GH #64: a database is now owned by a Site OR a Stack — never both
   // (chk_databases_owner). Stacks are admin-only throughout the panel, so ownerType
   // only ever offers "stack" for admins; a non-admin's request is unaffected.
+  const desktop = isDesktopApp();
   const [ownerType, setOwnerType] = useState<"site" | "stack">("site");
   const [siteId, setSiteId] = useState("");
   const [stackId, setStackId] = useState("");
   const [dbName, setDbName] = useState("");
-  const [engine, setEngine] = useState("mariadb");
+  const [engine, setEngine] = useState(desktop ? "sqlite" : "mariadb");
   const [submitting, setSubmitting] = useState(false);
   const [dbSizes, setDbSizes] = useState<Record<string, number>>({});
 
@@ -2125,10 +2275,13 @@ export default function Databases() {
   const [credentialsLoading, setCredentialsLoading] = useState(false);
   const [copied, setCopied] = useState("");
   const [searchParams] = useSearchParams();
+  const dbIdParam = searchParams.get("dbId") || "";
   const searchParam = searchParams.get("search") || "";
   const autoOpenParam = searchParams.get("autoOpen") === "true";
   const [search, setSearch] = useState(searchParam);
   const [displayCount, setDisplayCount] = useState(25);
+  const [mariadbStatus, setMariadbStatus] = useState<{ installed?: boolean; running?: boolean; port?: number } | null>(null);
+  const [mariadbInstallId, setMariadbInstallId] = useState<string | null>(null);
 
   useEffect(() => {
     if (searchParam) {
@@ -2156,9 +2309,9 @@ export default function Databases() {
       const [dbs, sitesData, stacksData] = await Promise.all([
         api.get<Database[]>("/databases"),
         api.get<Site[]>("/sites"),
-        // Stacks are admin-only server-side (require_admin) — skip the call
-        // entirely for non-admins rather than surfacing its 403 as a page error.
-        isAdmin ? api.get<Stack[]>("/stacks") : Promise.resolve([] as Stack[]),
+        !desktop && isAdmin
+          ? api.get<Stack[]>("/stacks").catch(() => [] as Stack[])
+          : Promise.resolve([] as Stack[]),
       ]);
       setDatabases(dbs);
       setSites(sitesData);
@@ -2175,19 +2328,30 @@ export default function Databases() {
 
   useEffect(() => {
     fetchData();
+    if (desktop) {
+      api.get<{ installed?: boolean; running?: boolean; port?: number }>("/mariadb/status")
+        .then(setMariadbStatus)
+        .catch(() => {});
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAdmin]);
+  }, [isAdmin, desktop]);
 
   useEffect(() => {
-    if (autoOpenParam && searchParam && databases.length > 0) {
-      const match = databases.find(
-        (db) => db.name.toLowerCase() === searchParam.toLowerCase()
-      );
+    if (autoOpenParam && databases.length > 0 && (dbIdParam || searchParam)) {
+      const match =
+        (dbIdParam ? databases.find((db) => db.id === dbIdParam) : undefined) ||
+        (searchParam
+          ? databases.find((db) => db.name.toLowerCase() === searchParam.toLowerCase()) ||
+            databases.find((db) => db.name.toLowerCase().includes(searchParam.toLowerCase()))
+          : undefined);
       if (match) {
         setManageDb({ db: match, tab: "browse" });
+        if (searchParam && !match.name.toLowerCase().includes(searchParam.toLowerCase())) {
+          setSearch("");
+        }
       }
     }
-  }, [autoOpenParam, searchParam, databases]);
+  }, [autoOpenParam, dbIdParam, searchParam, databases]);
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();
@@ -2203,6 +2367,7 @@ export default function Databases() {
       });
       setShowForm(false);
       setSuccessMsg(`Database "${dbName}" created`);
+      showGlobalNotification("success", `Database "${dbName}" created`);
       setDbName("");
       fetchData();
     } catch (err) {
@@ -2520,10 +2685,15 @@ export default function Databases() {
                 onChange={(e) => setEngine(e.target.value)}
                 className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none text-sm bg-dark-800"
               >
+                {desktop && <option value="sqlite">SQLite (Local embedded DB)</option>}
                 <option value="mariadb">MariaDB 11 (MySQL-compatible)</option>
                 <option value="postgres">PostgreSQL 16</option>
               </select>
-              <p className="text-xs text-dark-300 mt-1">MariaDB 11 (MySQL-compatible) or PostgreSQL 16</p>
+              <p className="text-xs text-dark-300 mt-1">
+                {desktop
+                  ? "SQLite runs zero-config locally; MariaDB or PostgreSQL if installed locally"
+                  : "MariaDB 11 (MySQL-compatible) or PostgreSQL 16"}
+              </p>
             </div>
           </div>
           <div className="flex gap-3">
@@ -2544,6 +2714,97 @@ export default function Databases() {
             </button>
           </div>
         </form>
+      )}
+
+      {desktop && mariadbStatus && (
+        <div className="mb-4 rounded-lg border border-dark-600 bg-dark-800/80 p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold text-dark-50">Portable MariaDB (Open-Source MySQL Server)</h2>
+                <span className={`px-2 py-0.5 rounded text-[11px] font-medium ${mariadbStatus.running ? "bg-rust-500/15 text-rust-400" : mariadbStatus.installed ? "bg-warn-500/15 text-warn-400" : "bg-dark-700 text-dark-300"}`}>
+                  {mariadbStatus.running ? `Running on port ${mariadbStatus.port || 3306}` : mariadbStatus.installed ? "Installed (Stopped)" : "Not Installed"}
+                </span>
+              </div>
+              <p className="text-xs text-dark-300 mt-1">
+                Install and run a bundled portable MariaDB server for WordPress and MySQL-compatible databases alongside SQLite.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {!mariadbStatus.installed ? (
+                <button
+                  type="button"
+                  disabled={Boolean(mariadbInstallId)}
+                  onClick={async () => {
+                    setError("");
+                    try {
+                      const res = await api.post<{ install_id?: string }>("/mariadb/install", {});
+                      if (res.install_id) setMariadbInstallId(res.install_id);
+                    } catch (e) {
+                      setError(e instanceof Error ? e.message : "Failed to install MariaDB");
+                    }
+                  }}
+                  className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 disabled:opacity-50 text-white rounded-lg text-xs font-medium transition-colors"
+                >
+                  {mariadbInstallId ? "Installing..." : "Download & Install MariaDB"}
+                </button>
+              ) : mariadbStatus.running ? (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await api.post("/mariadb/stop", {});
+                      const st = await api.get<{ installed?: boolean; running?: boolean; port?: number }>("/mariadb/status");
+                      setMariadbStatus(st);
+                      showGlobalNotification("info", "MariaDB stopped");
+                    } catch (e) {
+                      setError(e instanceof Error ? e.message : "Failed to stop MariaDB");
+                    }
+                  }}
+                  className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded-lg text-xs font-medium border border-dark-500 transition-colors"
+                >
+                  Stop MariaDB
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await api.post("/mariadb/start", {});
+                      const st = await api.get<{ installed?: boolean; running?: boolean; port?: number }>("/mariadb/status");
+                      setMariadbStatus(st);
+                      fetchData();
+                      showGlobalNotification("success", "MariaDB started");
+                    } catch (e) {
+                      setError(e instanceof Error ? e.message : "Failed to start MariaDB");
+                    }
+                  }}
+                  className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium transition-colors"
+                >
+                  Start MariaDB
+                </button>
+              )}
+            </div>
+          </div>
+          {mariadbInstallId && (
+            <ProvisionLog
+              sseUrl={`/api/services/install/${mariadbInstallId}/log`}
+              title="MariaDB Download & Setup"
+              onComplete={() => {
+                setMariadbInstallId(null);
+                api.get<{ installed?: boolean; running?: boolean; port?: number }>("/mariadb/status")
+                  .then((st) => {
+                    setMariadbStatus(st);
+                    if (st.installed) {
+                      fetchData();
+                      showGlobalNotification("success", "Portable MariaDB installed and ready");
+                    }
+                  })
+                  .catch(() => {});
+              }}
+            />
+          )}
+        </div>
       )}
 
       {/* Database list */}
@@ -2625,8 +2886,8 @@ export default function Databases() {
                             </div>
                             <div className="flex flex-col items-end text-xs font-mono text-dark-300">
                               <span>Port: {db.port || "—"}</span>
-                              {dbSizes[db.name] !== undefined && (
-                                <span className="text-rust-400 font-medium text-[11px] mt-0.5">{formatBytes(dbSizes[db.name])}</span>
+                              {(dbSizes[db.id] ?? dbSizes[db.name]) !== undefined && (
+                                <span className="text-rust-400 font-medium text-[11px] mt-0.5">{formatBytes(dbSizes[db.id] ?? dbSizes[db.name])}</span>
                               )}
                             </div>
                           </div>
@@ -2740,7 +3001,7 @@ export default function Databases() {
                           {db.port || "\u2014"}
                         </td>
                         <td className="px-5 py-4 text-xs font-mono text-dark-200 hidden sm:table-cell">
-                          {dbSizes[db.name] !== undefined ? formatBytes(dbSizes[db.name]) : "—"}
+                          {(dbSizes[db.id] ?? dbSizes[db.name]) !== undefined ? formatBytes(dbSizes[db.id] ?? dbSizes[db.name]) : "—"}
                         </td>
                         <td className="px-5 py-4 text-xs text-dark-200 hidden lg:table-cell">
                           {formatDate(db.created_at)}

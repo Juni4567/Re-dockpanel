@@ -7,6 +7,7 @@ import { isNavVisible, navFlagsFor } from "../data/navItems";
 import { formatSize, formatRate, formatUptime, timeAgo } from "../utils/format";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { showGlobalNotification } from "../context/NotificationContext";
+import { isDesktopApp } from "../utils/desktop";
 
 interface SiteDetail {
   id: string;
@@ -278,6 +279,7 @@ export default function Dashboard() {
   // way on #51, twice, by an operator who was testing a client account.
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
+  const desktop = isDesktopApp();
 
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [sites, setSites] = useState<SiteSummary>({ total: 0, active: 0 });
@@ -377,7 +379,7 @@ export default function Dashboard() {
     // Every handler in `routes/docker_apps.rs` calls `require_admin`, this one
     // included — containers on the box belong to nobody in particular, so there is
     // no tenant view of them to ask for. Same reasoning as the reads below.
-    if (isAdmin) {
+    if (isAdmin && !desktop) {
       api
         .get<{ container_id: string }[]>("/apps")
         .then((list) => setAppCount(list.length))
@@ -385,7 +387,7 @@ export default function Dashboard() {
     }
     // Admin-gated in `routes/system.rs`. Asking as anybody else produced the
     // page's second error banner, beside the one from `/system/info`.
-    if (isAdmin) {
+    if (isAdmin && !desktop) {
       api
         .get<{ count: number; security: number; reboot_required: boolean }>("/system/updates/count")
         .then((d) => { setUpdateCount(d.count); setRebootRequired(d.reboot_required); })
@@ -395,17 +397,19 @@ export default function Dashboard() {
       .get<{ points: MetricPoint[] }>("/dashboard/metrics-history")
       .then((d) => setMetricsHistory(d.points || []))
       .catch(() => {});
-    api
-      .get<{ enabled: boolean }>("/auth/2fa/status")
-      .then((d) => setTwoFaEnabled(d.enabled))
-      .catch(() => {});
+    if (!desktop) {
+      api
+        .get<{ enabled: boolean }>("/auth/2fa/status")
+        .then((d) => setTwoFaEnabled(d.enabled))
+        .catch(() => {});
+    }
     api
       .get<{ has_schedule: boolean; has_backup: boolean }>("/backup-setup-status")
       .then(setBackupSetup)
       .catch(() => {});
     // Feature #1: Docker container overview. Admin-gated in the backend since
     // v2.77.0 — it asks the agent for the same `/apps` the list above does.
-    if (isAdmin) {
+    if (isAdmin && !desktop) {
       api
         .get<{ total: number; running: number; stopped: number }>("/dashboard/docker")
         .then(setDockerInfo)
@@ -427,14 +431,14 @@ export default function Dashboard() {
       .then(setTimeline)
       .catch(() => {});
     // Fleet-wide health overview — admin only in the backend (AdminUser).
-    if (isAdmin) {
+    if (isAdmin && !desktop) {
       api
         .get<FleetOverview>("/dashboard/fleet")
         .then(setFleetOverview)
         .catch(() => {});
     }
     // Feature #8: Docker image disk usage — `docker_apps` again, so admin only.
-    if (isAdmin) {
+    if (isAdmin && !desktop) {
       api
         .get<DockerImage[] | DockerImagesResponse>("/apps/images")
         .then((d) => {
@@ -457,7 +461,7 @@ export default function Dashboard() {
     }
     // Feature #3: Disk I/O metrics (endpoint takes ~1s due to sampling)
     // Admin-gated in `routes/system.rs` like the rest of that module.
-    if (isAdmin) {
+    if (isAdmin && !desktop) {
       api
         .get<DiskIoResponse>("/system/disk-io")
         .then(setDiskIo)
@@ -466,7 +470,7 @@ export default function Dashboard() {
     // Feature #9: Mail queue count
     // Admin-gated in the backend; asking as anybody else is a refusal
     // every 5s that this page then swallows (mail queue).
-    if (isAdmin) {
+    if (isAdmin && !desktop) {
       api
         .get<MailQueueResponse>("/mail/queue")
         .then((d) => {
@@ -475,7 +479,7 @@ export default function Dashboard() {
         })
         .catch(() => {});
     }
-  }, [isAdmin]);
+  }, [isAdmin, desktop]);
 
   // Update check. Refetched every time the tab regains focus, because the row
   // behind this banner is cleared server-side — on the first boot after an
@@ -485,6 +489,7 @@ export default function Dashboard() {
   // nobody is looking at costs nothing, and the banner is only wrong to a
   // person who is looking at it.
   useEffect(() => {
+    if (desktop) return;
     const loadUpdateInfo = () => {
       // Admin-gated in the backend; asking as anybody else is a refusal this
       // page then swallows (update status).
@@ -498,7 +503,7 @@ export default function Dashboard() {
     loadUpdateInfo();
     window.addEventListener("focus", loadUpdateInfo);
     return () => window.removeEventListener("focus", loadUpdateInfo);
-  }, []);
+  }, [desktop, isAdmin]);
 
   // Fetch real-time system endpoints (only needed when WS is disconnected)
   const fetchRealtimeData = useCallback(() => {
@@ -514,15 +519,17 @@ export default function Dashboard() {
       // page that forwarded it, and what it forwarded was an authorization
       // refusal aimed at the operator rather than the reader.
       .catch(() => setError("Failed to load system info"));
-    api
-      .get<Process[]>("/system/processes")
-      .then(setProcesses)
-      .catch(() => {});
-    api
-      .get<NetworkIface[]>("/system/network")
-      .then(setNetwork)
-      .catch(() => {});
-  }, [isAdmin]);
+    if (!desktop) {
+      api
+        .get<Process[]>("/system/processes")
+        .then(setProcesses)
+        .catch(() => {});
+      api
+        .get<NetworkIface[]>("/system/network")
+        .then(setNetwork)
+        .catch(() => {});
+    }
+  }, [isAdmin, desktop]);
 
   // WebSocket connection for live metrics — PANEL HOST ONLY, deliberately.
   //
@@ -542,7 +549,7 @@ export default function Dashboard() {
   // every 5s through the header, so leaving the socket shut makes a member's
   // tiles CORRECT, not merely honest.
   useEffect(() => {
-    if (serversLoading || !isLocal) {
+    if (desktop || serversLoading || !isLocal) {
       // Not an error state — the live-tile poll below owns this case, and it is
       // guarded on `wsConnected`, so the flag must be cleared here: the teardown
       // deliberately nulls `onclose` before closing, so nothing else resets it.
@@ -794,7 +801,7 @@ export default function Dashboard() {
               back here, and every handler in `routes/docker_apps.rs` requires
               admin. Docker Apps is an operator capability, so say so by not
               offering it. */}
-          {isAdmin && (
+          {isAdmin && !desktop && (
             <Link to="/apps" className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
               Deploy App
@@ -809,21 +816,24 @@ export default function Dashboard() {
               Add Site
             </Link>
           )}
-          {isAdmin && (
+          {desktop && (
+            <>
+              <Link to="/logs" className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
+                Activity Logs
+              </Link>
+              <Link to="/settings" className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
+                Services & Settings
+              </Link>
+            </>
+          )}
+          {isAdmin && !desktop && (
             <Link to={REC_ACTION_ROUTES.diagnostics} className="hidden sm:flex px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs font-medium items-center gap-1.5 transition-colors">
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21.75 6.75a4.5 4.5 0 01-4.884 4.484c-1.076-.091-2.264.071-2.95.904l-7.152 8.684a2.548 2.548 0 11-3.586-3.586l8.684-7.152c.833-.686.995-1.874.904-2.95a4.5 4.5 0 016.336-4.486l-3.276 3.276a3.004 3.004 0 002.25 2.25l3.276-3.276c.256.565.398 1.192.398 1.852z" /></svg>
               Diagnostics
             </Link>
           )}
-          {/* Feature #4: Quick Server Actions — hidden on mobile.
-              Shown only once there is something to restart. On a brand-new box
-              these sat next to "Add Site" as the first thing an operator met,
-              three server-level destructive verbs offered before a single site
-              existed. Restart Nginx / Restart PHP remain available any time from
-              Diagnostics (they post the same restart-service fix); Reboot has no
-              other home, so it also appears whenever the system reports one is
-              actually required. */}
-          {isAdmin && (sites.total > 0 || appCount > 0) && (
+          {/* Feature #4: Quick Server Actions — hidden on mobile and desktop. */}
+          {isAdmin && !desktop && (sites.total > 0 || appCount > 0) && (
             <>
               <div className="h-4 w-px bg-dark-600 hidden sm:block" />
               <button onClick={() => setConfirmAction("nginx")} className="hidden sm:inline-block px-3 py-1.5 bg-dark-800 text-dark-300 hover:bg-dark-700 hover:text-dark-100 border border-dark-600 rounded-lg text-xs transition-colors">
@@ -834,7 +844,7 @@ export default function Dashboard() {
               </button>
             </>
           )}
-          {isAdmin && (rebootRequired || sites.total > 0 || appCount > 0) && (
+          {isAdmin && !desktop && (rebootRequired || sites.total > 0 || appCount > 0) && (
             <button onClick={() => setConfirmAction("reboot")} className="hidden sm:inline-block px-2.5 py-1.5 bg-danger-500/10 border border-danger-500/20 rounded-lg text-xs text-danger-400 hover:bg-danger-500/20">
               {rebootRequired ? "Reboot required" : "Reboot"}
             </button>
@@ -853,22 +863,22 @@ export default function Dashboard() {
                 fourteen were exactly that. */}
             {[
               { id: "metrics", label: "CPU / Memory / Disk", hostOnly: true },
-              { id: "disk_io", label: "Disk I/O", hostOnly: true },
-              { id: "charts", label: "Historical Charts", hostOnly: true },
+              { id: "disk_io", label: "Disk I/O", hostOnly: true, serverOnly: true },
+              { id: "charts", label: "Historical Charts", hostOnly: true, serverOnly: true },
               { id: "status_bar", label: "Status Bar" },
               { id: "health_banner", label: "Health Indicator" },
               { id: "sites_grid", label: "Sites Grid" },
               { id: "activity", label: "Recent Activity", hostOnly: true },
-              { id: "timeline", label: "Timeline" },
-              { id: "fleet", label: "Fleet Health", hostOnly: true },
+              { id: "timeline", label: "Timeline", serverOnly: true },
+              { id: "fleet", label: "Fleet Health", hostOnly: true, serverOnly: true },
               { id: "issues", label: "Active Issues" },
-              { id: "ssl_countdown", label: "SSL Countdown" },
-              { id: "network", label: "Network I/O", hostOnly: true },
-              { id: "processes", label: "Top Processes", hostOnly: true },
+              { id: "ssl_countdown", label: "SSL Countdown", serverOnly: true },
+              { id: "network", label: "Network I/O", hostOnly: true, serverOnly: true },
+              { id: "processes", label: "Top Processes", hostOnly: true, serverOnly: true },
               { id: "system_info", label: "System Info", hostOnly: true },
               { id: "onboarding", label: "Getting Started", hostOnly: true },
               { id: "bookmarks", label: "Quick Links" },
-            ].filter(w => isAdmin || !w.hostOnly).map(w => (
+            ].filter(w => (isAdmin || !w.hostOnly) && (!desktop || !w.serverOnly)).map(w => (
               <label key={w.id} className="flex items-center gap-2 text-xs text-dark-200 cursor-pointer hover:text-dark-100">
                 <input type="checkbox" checked={isVisible(w.id)} onChange={() => toggleWidget(w.id)}
                   className="w-3.5 h-3.5 accent-rust-500" />
@@ -884,7 +894,7 @@ export default function Dashboard() {
       {/* Health banner moved to page header */}
 
       {/* Update available banner */}
-      {updateInfo?.update_available && updateInfo.update_available_version && (
+      {!desktop && updateInfo?.update_available && updateInfo.update_available_version && (
         <div className="rounded-lg border border-rust-500/30 bg-rust-500/10 px-4 py-3 mb-6 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <svg className="w-5 h-5 text-rust-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
@@ -999,16 +1009,24 @@ export default function Dashboard() {
         // sit here with `check: () => true`, so a box where nothing had been done
         // still reported 1/5 — a checklist that counts a step nobody performed
         // teaches the operator not to trust the other four.
-        const steps: OnboardingStep[] = [
-          { id: "site", label: "Create your first site", description: "Set up a website with Nginx, PHP, or reverse proxy", link: "/sites", check: () => sites.total > 0 },
-          // The prerequisite that gates everything else, and the one the list
-          // never mentioned. A live certificate is the proof: HTTPS cannot be
-          // issued until the domain actually resolves to this server.
-          { id: "dns", label: "Point your domain here", description: "HTTPS is issued once your domain resolves to this server", link: "/sites", check: () => (intel?.ssl_countdowns.length ?? 0) > 0 },
-          { id: "app", label: "Deploy a Docker app", description: "One-click deploy from the app catalogue", link: "/apps", check: () => appCount > 0 },
-          { id: "2fa", label: "Enable 2FA", description: "Protect your panel with two-factor authentication", link: "/account", check: () => twoFaEnabled },
-          { id: "backup", label: "Set up backups", description: "Schedule recurring backups or run one manually", link: "/backup-orchestrator", check: () => backupSetup.has_schedule || backupSetup.has_backup },
-        ];
+        const steps: OnboardingStep[] = desktop
+          ? [
+              { id: "site", label: "Create your first local site", description: "Launch a local PHP, static, or WordPress site", link: "/sites", check: () => sites.total > 0 },
+              { id: "db", label: "Create or inspect a database", description: "Manage local SQLite databases & run SQL queries", link: "/databases", check: () => dbCount > 0 },
+              { id: "php", label: "Manage PHP & Router settings", description: "Install PHP versions or configure local site router ports", link: "/settings", check: () => sites.total > 0 },
+              { id: "backup", label: "Create a local backup", description: "Snapshot and download site backups locally", link: "/backups", check: () => backupSetup.has_schedule || backupSetup.has_backup },
+              { id: "logs", label: "Review live activity logs", description: "Inspect provisioning and router event logs", link: "/logs", check: () => recentActivity.length > 0 },
+            ]
+          : [
+              { id: "site", label: "Create your first site", description: "Set up a website with Nginx, PHP, or reverse proxy", link: "/sites", check: () => sites.total > 0 },
+              // The prerequisite that gates everything else, and the one the list
+              // never mentioned. A live certificate is the proof: HTTPS cannot be
+              // issued until the domain actually resolves to this server.
+              { id: "dns", label: "Point your domain here", description: "HTTPS is issued once your domain resolves to this server", link: "/sites", check: () => (intel?.ssl_countdowns.length ?? 0) > 0 },
+              { id: "app", label: "Deploy a Docker app", description: "One-click deploy from the app catalogue", link: "/apps", check: () => appCount > 0 },
+              { id: "2fa", label: "Enable 2FA", description: "Protect your panel with two-factor authentication", link: "/account", check: () => twoFaEnabled },
+              { id: "backup", label: "Set up backups", description: "Schedule recurring backups or run one manually", link: "/backup-orchestrator", check: () => backupSetup.has_schedule || backupSetup.has_backup },
+            ];
         const completed = steps.filter(s => s.check()).length;
         const isCollapsed = onboardingCollapsed || (completed >= 3 && localStorage.getItem('dp-onboarding-collapsed') !== '0');
         const toggleCollapse = () => {
@@ -1196,7 +1214,7 @@ export default function Dashboard() {
                 count comes from an admin endpoint, and the cell links to a page
                 that redirects anybody else. Rendered ungated it read "0/0 running"
                 to a client — a number, not a blank, and a false one. */}
-            {isAdmin && (
+            {isAdmin && !desktop && (
               <Link to="/apps" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Docker</span>
                 <span className="text-sm text-dark-50 font-medium">
@@ -1206,45 +1224,48 @@ export default function Dashboard() {
               </Link>
             )}
             {intel && <>
-              {/* /security is adminOnly. For anybody else the score is now built
-                  purely from their own alerts, certificates and backups (the host
-                  diagnostics term is admin-only since v2.77.0), so /monitoring is
-                  both reachable and the right explanation of the number. */}
-              <Link to={isAdmin ? "/security?tab=diagnostics" : "/monitoring"} title={isAdmin ? "View system diagnostics that drive this score" : "View the alerts and certificates behind this score"} className={`px-4 py-3 flex flex-col card-interactive ${
-                intel.health_score < 60 ? "bg-danger-500/5" : "bg-dark-800"
-              }`}>
-                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Health</span>
-                <span className={`text-sm font-bold ${
-                  intel.health_score >= 90 ? "text-rust-400" :
-                  intel.health_score >= 75 ? "text-accent-400" :
-                  intel.health_score >= 60 ? "text-warn-400" : "text-danger-400"
-                }`}>{intel.health_score}/100 {intel.grade}</span>
-              </Link>
-              <Link to="/monitoring?tab=alerts" className={`px-4 py-3 flex flex-col card-interactive ${
-                intel.firing_alerts > 0 ? "bg-danger-500/5" : "bg-dark-800"
-              }`}>
-                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Alerts</span>
-                {intel.firing_alerts > 0
-                  ? <span className="text-sm text-danger-400 font-bold">{intel.firing_alerts} firing</span>
-                  : <span className="text-sm text-rust-400 font-medium">0</span>
-                }
-              </Link>
-              <Link to="/monitoring?tab=certificates" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
-                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">SSL</span>
-                <span className="text-sm text-dark-50 font-medium">{intel.ssl_countdowns.length} certs</span>
-              </Link>
-              <Link to="/monitoring?tab=statuspage" className={`px-4 py-3 flex flex-col card-interactive ${
-                intel.open_incidents > 0 ? "bg-danger-500/5" : "bg-dark-800"
-              }`}>
-                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Incidents</span>
-                {intel.open_incidents > 0
-                  ? <span className="text-sm text-danger-400 font-bold">{intel.open_incidents} open</span>
-                  : <span className="text-sm text-rust-400 font-medium">0</span>
-                }
-              </Link>
-              {/* /backup-orchestrator is adminOnly; a client's backups live per-site,
-                  so send them where they can actually act on this count. */}
-              <Link to={isAdmin ? "/backup-orchestrator" : "/sites"} className={`px-4 py-3 flex flex-col card-interactive ${
+              {!desktop && (
+                <Link to={isAdmin ? "/security?tab=diagnostics" : "/monitoring"} title={isAdmin ? "View system diagnostics that drive this score" : "View the alerts and certificates behind this score"} className={`px-4 py-3 flex flex-col card-interactive ${
+                  intel.health_score < 60 ? "bg-danger-500/5" : "bg-dark-800"
+                }`}>
+                  <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Health</span>
+                  <span className={`text-sm font-bold ${
+                    intel.health_score >= 90 ? "text-rust-400" :
+                    intel.health_score >= 75 ? "text-accent-400" :
+                    intel.health_score >= 60 ? "text-warn-400" : "text-danger-400"
+                  }`}>{intel.health_score}/100 {intel.grade}</span>
+                </Link>
+              )}
+              {!desktop && (
+                <Link to="/monitoring?tab=alerts" className={`px-4 py-3 flex flex-col card-interactive ${
+                  intel.firing_alerts > 0 ? "bg-danger-500/5" : "bg-dark-800"
+                }`}>
+                  <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Alerts</span>
+                  {intel.firing_alerts > 0
+                    ? <span className="text-sm text-danger-400 font-bold">{intel.firing_alerts} firing</span>
+                    : <span className="text-sm text-rust-400 font-medium">0</span>
+                  }
+                </Link>
+              )}
+              {!desktop && (
+                <Link to="/monitoring?tab=certificates" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+                  <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">SSL</span>
+                  <span className="text-sm text-dark-50 font-medium">{intel.ssl_countdowns.length} certs</span>
+                </Link>
+              )}
+              {!desktop && (
+                <Link to="/monitoring?tab=statuspage" className={`px-4 py-3 flex flex-col card-interactive ${
+                  intel.open_incidents > 0 ? "bg-danger-500/5" : "bg-dark-800"
+                }`}>
+                  <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Incidents</span>
+                  {intel.open_incidents > 0
+                    ? <span className="text-sm text-danger-400 font-bold">{intel.open_incidents} open</span>
+                    : <span className="text-sm text-rust-400 font-medium">0</span>
+                  }
+                </Link>
+              )}
+              {/* /backup-orchestrator is adminOnly; on desktop go to /backups. */}
+              <Link to={desktop ? "/backups" : isAdmin ? "/backup-orchestrator" : "/sites"} className={`px-4 py-3 flex flex-col card-interactive ${
                 intel.stale_backups > 0 ? "bg-warn-500/5" : "bg-dark-800"
               }`}>
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Backups</span>
@@ -1257,7 +1278,7 @@ export default function Dashboard() {
             {/* `updateCount` is only ever fetched for an admin, so for anybody else
                 this cell asserted "up to date" about a machine it had not asked
                 about. An unhidden blank is honest; an unhidden zero is a claim. */}
-            {isAdmin && (
+            {isAdmin && !desktop && (
               <Link to="/updates" className={`px-4 py-3 flex flex-col card-interactive ${
                 updateCount > 0 ? "bg-warn-500/5" : "bg-dark-800"
               }`}>
@@ -1269,7 +1290,7 @@ export default function Dashboard() {
               </Link>
             )}
             {/* Disk I/O */}
-            {diskIo && isVisible("disk_io") && <>
+            {!desktop && diskIo && isVisible("disk_io") && <>
               <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Disk Read</span>
                 <span className="text-sm text-dark-50 font-medium font-mono">{formatRate(diskIo.read_bytes_sec)}</span>
@@ -1279,10 +1300,8 @@ export default function Dashboard() {
                 <span className="text-sm text-dark-50 font-medium font-mono">{formatRate(diskIo.write_bytes_sec)}</span>
               </div>
             </>}
-            {/* Feature #6: Bandwidth usage summary. Derived from `network`, which
-                `fetchRealtimeData` only fetches for an admin \u2014 so this read
-                "0 B / 0 B" to everybody else, host traffic reported as none. */}
-            {isAdmin && (
+            {/* Feature #6: Bandwidth usage summary. */}
+            {isAdmin && !desktop && (
               <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Bandwidth</span>
                 <span className="text-sm text-dark-50 font-medium">
@@ -1291,9 +1310,8 @@ export default function Dashboard() {
                 </span>
               </div>
             )}
-            {/* Feature #9: Mail queue widget. `/mail/queue` is admin-gated, so the
-                same false zero \u2014 and mail is admin-only end to end anyway. */}
-            {isAdmin && (
+            {/* Feature #9: Mail queue widget. */}
+            {isAdmin && !desktop && (
               <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Mail Queue</span>
                 <span className={`text-sm font-medium ${(mailQueue ?? 0) > 0 ? "text-warn-400" : "text-dark-50"}`}>

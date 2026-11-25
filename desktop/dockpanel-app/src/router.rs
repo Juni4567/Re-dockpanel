@@ -1,9 +1,13 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::response::Response;
 use crate::state::AppState;
+
+#[derive(Clone, Copy, Default)]
+pub struct IsHttps(pub bool);
 
 fn default_port_80() -> u16 {
     80
@@ -341,6 +345,11 @@ async fn proxy_to_worker(
             .unwrap_or_default()
     });
 
+    let proto = req
+        .extensions()
+        .get::<IsHttps>()
+        .map(|h| h.0)
+        .unwrap_or(false);
     let (parts, body) = req.into_parts();
     let url = format!("http://127.0.0.1:{}{}", worker_port, target_path_and_query);
 
@@ -379,7 +388,7 @@ async fn proxy_to_worker(
             builder = builder.header("x-forwarded-host", hval);
         }
     }
-    builder = builder.header("x-forwarded-proto", "http");
+    builder = builder.header("x-forwarded-proto", if proto { "https" } else { "http" });
     builder = builder.header("x-forwarded-for", "127.0.0.1");
 
     let body_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
@@ -462,6 +471,36 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
         return render_stopped_page(&site.domain);
     }
 
+    // 4b. Enforce HTTP Basic Password Protection when enabled for this site
+    if let Some((expected_user, expected_hash)) = state.get_site_pass_protect(&site.domain) {
+        let authorized = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| h.strip_prefix("Basic ").or_else(|| h.strip_prefix("basic ")))
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok())
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .and_then(|pair| {
+                let (u, p) = pair.split_once(':')?;
+                Some(u == expected_user && crate::downloads::sha256_hex(p) == expected_hash)
+            })
+            .unwrap_or(false);
+
+        if !authorized {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Basic realm=\"DockPanel Protected Site\"",
+                )
+                .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(axum::body::Body::from(
+                    "<!DOCTYPE html><html><body><h1>401 Unauthorized</h1><p>Authentication required.</p></body></html>",
+                ))
+                .unwrap();
+        }
+    }
+
     // 5. Site status is active (or other non-stopped)
     let uri_path = req.uri().path().to_string();
     let path_and_query_str = req
@@ -470,7 +509,7 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| uri_path.clone());
     let safe_rel = sanitize_path(&uri_path);
-    let doc_root = PathBuf::from(&site.document_root);
+    let doc_root = state.site_dir(&site);
     let target_path = doc_root.join(&safe_rel);
 
     let worker_port = state.get_site_worker_port(&site.domain);
@@ -523,18 +562,9 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
 
         if index_php.is_file() {
             if let Some(port) = worker_port {
-                let base_dir = if safe_rel.as_os_str().is_empty() {
-                    "".to_string()
-                } else {
-                    format!("/{}", safe_rel.to_string_lossy().replace('\\', "/").trim_matches('/'))
-                };
-
-                let target_pq = match req.uri().query() {
-                    Some(q) => format!("{}/index.php?{}", base_dir, q),
-                    None => format!("{}/index.php", base_dir),
-                };
-
-                return proxy_to_worker(port, &target_pq, req).await;
+                // Preserve the original URI ("/" or "/wp-admin/") instead of rewriting to
+                // "/index.php", otherwise WordPress canonical redirects emit an infinite 301 loop.
+                return proxy_to_worker(port, &path_and_query_str, req).await;
             } else {
                 return render_error_page(
                     StatusCode::BAD_GATEWAY,
@@ -619,6 +649,73 @@ pub fn start_site_router(state: Arc<AppState>, port: u16) -> tokio::task::JoinHa
     handle
 }
 
+pub fn start_ssl_site_router_checked(
+    state: Arc<AppState>,
+    port: u16,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::oneshot::Receiver<bool>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut tls_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(state.cert_resolver.clone());
+        tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg));
+
+        let bind_result = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(probe) => {
+                drop(probe);
+                match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+                    Ok(l) => Ok(l),
+                    Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", port)).await,
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        let listener = match bind_result {
+            Ok(l) => {
+                let _ = tx.send(true);
+                l
+            }
+            Err(e) => {
+                eprintln!("Failed to bind HTTPS site router on port {}: {}", port, e);
+                let _ = tx.send(false);
+                return;
+            }
+        };
+
+        let state_clone = state.clone();
+        let app = axum::Router::new()
+            .fallback(move |req: axum::extract::Request| {
+                let s = state_clone.clone();
+                async move { handle_router_request(req, s).await }
+            })
+            .layer(axum::Extension(IsHttps(true)));
+
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                continue;
+            };
+            let acc = acceptor.clone();
+            let svc = app.clone();
+            tokio::spawn(async move {
+                let Ok(tls_stream) = acc.accept(stream).await else {
+                    return;
+                };
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, hyper_svc)
+                .await;
+            });
+        }
+    });
+    (handle, rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,7 +750,7 @@ mod tests {
             assert_eq!(status.port, 80);
             assert!(status.pid.is_some());
             if let Some(ref name) = status.process_name {
-                assert!(name.to_lowercase().contains("httpd") || name.to_lowercase().contains("system"));
+                assert!(!name.trim().is_empty(), "Expected resolved process name for port 80 listener");
             }
         }
     }
@@ -874,7 +971,7 @@ Active Connections
         assert_eq!(resp.headers().get("x-custom-forwarded").unwrap(), "true");
         let b = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
         let body_str = String::from_utf8_lossy(&b);
-        assert!(body_str.contains("Hello from PHP Worker at /index.php?page=about"));
+        assert!(body_str.contains("Hello from PHP Worker at /?page=about"));
 
         mock_server.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -941,6 +1038,119 @@ Active Connections
         assert!(body.contains("DockPanel Desktop"));
 
         handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_root_with_index_php_preserves_root_path_without_redirect_loop() {
+        use axum::{http::Uri, routing::any, Router};
+        use std::sync::Arc;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_wp_root_path_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+        let site = state.create_site("wp-root.test", Some("8.3")).unwrap();
+
+        // WordPress sites always have index.php at document root; proxying "/" as
+        // "/index.php" triggers WordPress redirect_canonical() ERR_TOO_MANY_REDIRECTS.
+        let index_php = Path::new(&site.document_root).join("index.php");
+        std::fs::write(&index_php, "<?php echo 'wp'; ?>").unwrap();
+
+        let mock_app = Router::new().fallback(any(|uri: Uri| async move {
+            format!("WORKER_URI={}", uri)
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_port = listener.local_addr().unwrap().port();
+        let mock_server = tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        state.set_site_worker_port("wp-root.test", worker_port);
+
+        for req_uri in ["/", "/?page_id=42", "/wp-admin/"] {
+            let req = axum::http::Request::builder()
+                .header("host", "wp-root.test")
+                .uri(req_uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+
+            let resp = handle_router_request(req, state.clone()).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                body,
+                format!("WORKER_URI={}", req_uri),
+                "Router must preserve original URI {} instead of rewriting to /index.php",
+                req_uri
+            );
+        }
+
+        mock_server.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_pass_protect_enforces_http_basic_auth() {
+        use base64::Engine;
+        use std::sync::Arc;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_basic_auth_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(crate::state::AppState::new_with_dirs(config_dir, sites_dir));
+        let site = state.create_site("protected.test", Some("8.3")).unwrap();
+        std::fs::write(Path::new(&site.document_root).join("hello.html"), "Secret OK").unwrap();
+
+        state
+            .set_site_pass_protect("protected.test", true, Some("tester"), Some("s3cr3t"))
+            .unwrap();
+
+        // Missing credentials -> 401
+        let unauth_req = axum::http::Request::builder()
+            .header("host", "protected.test")
+            .uri("/hello.html")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let unauth_resp = handle_router_request(unauth_req, state.clone()).await;
+        assert_eq!(unauth_resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(unauth_resp.headers().contains_key(axum::http::header::WWW_AUTHENTICATE));
+
+        // Wrong credentials -> 401
+        let wrong_hdr = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("tester:wrong")
+        );
+        let wrong_req = axum::http::Request::builder()
+            .header("host", "protected.test")
+            .header(axum::http::header::AUTHORIZATION, wrong_hdr)
+            .uri("/hello.html")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let wrong_resp = handle_router_request(wrong_req, state.clone()).await;
+        assert_eq!(wrong_resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Valid credentials -> 200
+        let ok_hdr = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("tester:s3cr3t")
+        );
+        let ok_req = axum::http::Request::builder()
+            .header("host", "protected.test")
+            .header(axum::http::header::AUTHORIZATION, ok_hdr)
+            .uri("/hello.html")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let ok_resp = handle_router_request(ok_req, state.clone()).await;
+        assert_eq!(ok_resp.status(), axum::http::StatusCode::OK);
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

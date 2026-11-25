@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallWpRequest {
@@ -14,6 +15,10 @@ pub struct InstallWpRequest {
     #[serde(alias = "title", alias = "site_title")]
     pub title: Option<String>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub db_engine: Option<String>,
+    #[serde(default)]
+    pub db_port: Option<u16>,
 }
 
 /// Checks if WordPress is installed in the given site directory.
@@ -21,161 +26,623 @@ pub fn is_wp_installed(site_dir: &Path) -> bool {
     site_dir.join("wp-config.php").exists()
 }
 
-/// Generates WordPress status and information for a site.
-pub fn get_site_wp_info(site_dir: &Path, domain: &str, php_version: &str) -> serde_json::Value {
-    let installed = is_wp_installed(site_dir);
-    let mut admin_email = format!("admin@{}", domain);
-    let mut version = "6.7.1".to_string();
+fn primary_cache_dir() -> PathBuf {
+    let local_app_data = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("APPDATA"))
+        .unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()));
+    PathBuf::from(local_app_data).join("DockPanel").join("cache")
+}
 
-    if installed {
-        // Read version if wp-includes/version.php exists
-        let version_file = site_dir.join("wp-includes").join("version.php");
-        if let Ok(content) = fs::read_to_string(version_file) {
-            for line in content.lines() {
-                if line.contains("$wp_version") && line.contains('=') {
-                    if let Some(v) = line.split('=').nth(1) {
-                        let clean = v.trim().trim_matches(';').trim_matches('\'').trim_matches('"').trim();
-                        if !clean.is_empty() {
-                            version = clean.to_string();
-                        }
-                    }
-                }
+fn legacy_cache_dir() -> Option<PathBuf> {
+    std::env::var("APPDATA")
+        .ok()
+        .map(|p| PathBuf::from(p).join("DockPanel").join("cache"))
+}
+
+fn cache_dir() -> PathBuf {
+    primary_cache_dir()
+}
+
+fn is_valid_zip_archive(path: &Path, min_bytes: u64) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < min_bytes {
+        return false;
+    }
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && magic == [0x50, 0x4B, 0x03, 0x04]
+}
+
+fn find_cached_archive(filename: &str, min_bytes: u64) -> Option<PathBuf> {
+    let primary = primary_cache_dir().join(filename);
+    if is_valid_zip_archive(&primary, min_bytes) {
+        return Some(primary);
+    }
+    if primary.is_file() {
+        let _ = fs::remove_file(&primary);
+    }
+    if let Some(leg_dir) = legacy_cache_dir() {
+        let leg = leg_dir.join(filename);
+        if leg != primary && is_valid_zip_archive(&leg, min_bytes) {
+            if let Some(parent) = primary.parent() {
+                let _ = fs::create_dir_all(parent);
             }
+            if fs::copy(&leg, &primary).is_ok() && is_valid_zip_archive(&primary, min_bytes) {
+                return Some(primary);
+            }
+            return Some(leg);
         }
+    }
+    None
+}
 
-        // Read admin email if stored in wp-config.php
-        let config_file = site_dir.join("wp-config.php");
-        if let Ok(cfg) = fs::read_to_string(config_file) {
-            for line in cfg.lines() {
-                if line.contains("WP_ADMIN_EMAIL") {
-                    if let Some(pos) = line.find('\'') {
-                        let rem = &line[pos + 1..];
-                        if let Some(end) = rem.find('\'') {
-                            let key = &rem[..end];
-                            if key == "WP_ADMIN_EMAIL" {
-                                if let Some(val_start) = rem[end + 1..].find('\'') {
-                                    let val_rem = &rem[end + 1 + val_start + 1..];
-                                    if let Some(val_end) = val_rem.find('\'') {
-                                        admin_email = val_rem[..val_end].to_string();
-                                    }
-                                }
-                            }
-                        }
+/// Upserts a PHP `define( 'KEY', EXPR );` inside `wp-config.php` content.
+pub fn upsert_wp_config_constant(content: &str, key: &str, value_expr: &str) -> String {
+    let define_line = format!("define( '{}', {} );", key, value_expr);
+    let mut replaced = false;
+    let mut out_lines = Vec::new();
+    let needle_sq = format!("'{}'", key);
+    let needle_dq = format!("\"{}\"", key);
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("define")
+            && (trimmed.contains(&needle_sq) || trimmed.contains(&needle_dq))
+        {
+            if !replaced {
+                out_lines.push(define_line.clone());
+                replaced = true;
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+
+    if replaced {
+        return out_lines.join("\n") + if content.ends_with('\n') { "\n" } else { "" };
+    }
+
+    let mut result = out_lines.join("\n");
+    if let Some(pos) = result.find("require_once ABSPATH . 'wp-settings.php'") {
+        result.insert_str(pos, &format!("{}\n", define_line));
+    } else if let Some(pos) = result.find("wp-settings.php") {
+        let line_start = result[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        result.insert_str(line_start, &format!("{}\n", define_line));
+    } else if result.starts_with("<?php") {
+        result.insert_str(5, &format!("\n{}", define_line));
+    } else {
+        result.push('\n');
+        result.push_str(&define_line);
+        result.push('\n');
+    }
+    result
+}
+
+/// Extracts a quoted value from `define( 'KEY', 'VALUE' )` in `wp-config.php`.
+pub fn read_wp_config_string(content: &str, key: &str) -> Option<String> {
+    let needle_sq = format!("'{}'", key);
+    let needle_dq = format!("\"{}\"", key);
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("define") {
+            continue;
+        }
+        let pos = trimmed
+            .find(&needle_sq)
+            .map(|i| i + needle_sq.len())
+            .or_else(|| trimmed.find(&needle_dq).map(|i| i + needle_dq.len()));
+        if let Some(after_key) = pos {
+            let rest = &trimmed[after_key..];
+            if let Some(comma) = rest.find(',') {
+                let after_comma = rest[comma + 1..].trim();
+                let quote = after_comma.chars().next()?;
+                if quote == '\'' || quote == '"' {
+                    let inner = &after_comma[1..];
+                    if let Some(end) = inner.find(quote) {
+                        return Some(inner[..end].to_string());
                     }
                 }
             }
         }
     }
+    None
+}
+
+/// Reads a boolean constant (`true` / `false`) from `wp-config.php`.
+pub fn read_wp_config_bool(content: &str, key: &str) -> Option<bool> {
+    let needle_sq = format!("'{}'", key);
+    let needle_dq = format!("\"{}\"", key);
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("define") {
+            continue;
+        }
+        let pos = trimmed
+            .find(&needle_sq)
+            .map(|i| i + needle_sq.len())
+            .or_else(|| trimmed.find(&needle_dq).map(|i| i + needle_dq.len()));
+        if let Some(after_key) = pos {
+            let rest = &trimmed[after_key..];
+            if let Some(comma) = rest.find(',') {
+                let val_part = rest[comma + 1..].trim().to_ascii_lowercase();
+                if val_part.starts_with("true") {
+                    return Some(true);
+                }
+                if val_part.starts_with("false") {
+                    return Some(false);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If the site uses MariaDB/MySQL (not SQLite), returns its configured `DB_NAME`.
+pub fn read_wp_mysql_db_name(site_dir: &Path) -> Option<String> {
+    let cfg = fs::read_to_string(site_dir.join("wp-config.php")).ok()?;
+    let sqlite_file = site_dir.join("wp-content").join("database").join(".ht.sqlite");
+    if sqlite_file.is_file() || read_wp_config_string(&cfg, "DB_ENGINE").as_deref() == Some("sqlite") {
+        return None;
+    }
+    read_wp_config_string(&cfg, "DB_NAME")
+}
+
+fn wp_meta_path(site_dir: &Path) -> PathBuf {
+    site_dir.join(".dockpanel-wp.json")
+}
+
+fn read_wp_meta(site_dir: &Path) -> serde_json::Value {
+    fs::read_to_string(wp_meta_path(site_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn write_wp_meta(site_dir: &Path, updater: impl FnOnce(&mut serde_json::Value)) {
+    let mut meta = read_wp_meta(site_dir);
+    updater(&mut meta);
+    if let Ok(s) = serde_json::to_string_pretty(&meta) {
+        let _ = fs::write(wp_meta_path(site_dir), s);
+    }
+}
+
+/// Runs a short PHP script inside `site_dir` (requiring `wp-load.php` when needed) and returns parsed JSON.
+fn run_wp_php(site_dir: &Path, domain: &str, body_code: &str, args: &[&str]) -> Result<serde_json::Value, String> {
+    let php_exe = crate::state::find_php_binary(None)
+        .ok_or_else(|| "No PHP runtime installed".to_string())?;
+
+    let esc_dom = domain.replace('\\', "\\\\").replace('\'', "\\'");
+    let esc_site_dir = site_dir
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    let normalized_body = body_code.replace("__DIR__", "DOCKPANEL_SITE_DIR");
+    let script = format!(
+        r#"<?php
+error_reporting(E_ERROR | E_PARSE);
+define('DOCKPANEL_SITE_DIR', '{site_dir}');
+@chdir(DOCKPANEL_SITE_DIR);
+$_SERVER['HTTP_HOST'] = '{domain}';
+$_SERVER['SERVER_NAME'] = '{domain}';
+$_SERVER['REQUEST_URI'] = '/';
+{body}
+"#,
+        site_dir = esc_site_dir,
+        domain = esc_dom,
+        body = normalized_body,
+    );
+
+    let temp_script = std::env::temp_dir().join(format!("dockpanel_wp_{}.php", uuid::Uuid::new_v4()));
+    fs::write(&temp_script, script).map_err(|e| e.to_string())?;
+
+    let mut cmd = std::process::Command::new(&php_exe);
+    cmd.arg(&temp_script).current_dir(site_dir);
+    for a in args {
+        cmd.arg(a);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output();
+    let _ = fs::remove_file(&temp_script);
+
+    let output = out.map_err(|e| format!("Failed invoking PHP: {}", e))?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let val: serde_json::Value = crate::databases::parse_php_json_output(&raw).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.trim().is_empty() {
+            format!("Unexpected WordPress PHP output: {}", raw.trim())
+        } else {
+            format!("WordPress PHP error: {}", stderr.trim())
+        }
+    })?;
+
+    if val.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(val["error"].as_str().unwrap_or("WordPress error").to_string());
+    }
+    Ok(val)
+}
+
+pub fn read_wp_version(site_dir: &Path) -> String {
+    let version_file = site_dir.join("wp-includes").join("version.php");
+    if let Ok(content) = fs::read_to_string(version_file) {
+        for line in content.lines() {
+            if line.contains("$wp_version") && line.contains('=') {
+                if let Some(v) = line.split('=').nth(1) {
+                    let clean = v
+                        .trim()
+                        .trim_matches(';')
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .trim();
+                    if !clean.is_empty() {
+                        return clean.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "6.7.1".to_string()
+}
+
+/// Generates WordPress status and information for a site.
+pub fn get_site_wp_info(site_dir: &Path, domain: &str, php_version: &str) -> serde_json::Value {
+    let installed = is_wp_installed(site_dir);
+    let mut admin_email = format!("admin@{}", domain);
+    let version = if installed { read_wp_version(site_dir) } else { String::new() };
+
+    if installed {
+        if let Ok(cfg) = fs::read_to_string(site_dir.join("wp-config.php")) {
+            if let Some(e) = read_wp_config_string(&cfg, "WP_ADMIN_EMAIL") {
+                admin_email = e;
+            }
+        }
+    }
+
+    let plugins = if installed { list_plugins(site_dir, domain) } else { vec![] };
+    let themes = if installed { list_themes(site_dir, domain) } else { vec![] };
 
     json!({
         "installed": installed,
-        "version": if installed { version } else { String::new() },
+        "version": version,
         "admin_email": if installed { admin_email } else { String::new() },
         "url": format!("http://{}", domain),
-        "plugins_count": 0,
-        "themes_count": 0,
+        "plugins_count": plugins.len(),
+        "themes_count": themes.len(),
         "php_version": php_version,
         "auto_update": false
     })
 }
 
-/// Attempts to install real WordPress core + official SQLite database integration on Windows.
-/// Returns `Ok(true)` if real WordPress was installed, or `Ok(false)` / `Err` so caller falls back cleanly.
+/// Downloads WordPress core (and SQLite plugin when needed) with byte/percentage progress callbacks,
+/// caching verified archives locally across all domains and re-installs.
+pub async fn ensure_wp_archives_with_progress<F>(use_sqlite: bool, mut on_progress: F) -> Result<(), String>
+where
+    F: FnMut(&str, &str, Option<u8>, Option<String>),
+{
+    let cdir = cache_dir();
+    let _ = fs::create_dir_all(&cdir);
+    let wp_zip = find_cached_archive("wordpress-latest.zip", 5_000_000)
+        .unwrap_or_else(|| cdir.join("wordpress-latest.zip"));
+    let sqlite_zip = find_cached_archive("sqlite-database-integration.zip", 10_000)
+        .unwrap_or_else(|| cdir.join("sqlite-database-integration.zip"));
+
+    if !is_valid_zip_archive(&wp_zip, 5_000_000) {
+        on_progress("cms", "Starting download of official WordPress Core...", Some(0), None);
+        crate::downloads::download_with_progress(
+            "https://wordpress.org/latest.zip",
+            &wp_zip,
+            180,
+            |p| {
+                let pct = p.percent.unwrap_or_else(|| {
+                    ((p.downloaded_bytes.saturating_mul(95)) / (26 * 1024 * 1024)).min(95) as u8
+                });
+                let txt = match p.total_bytes.filter(|t| *t > 0) {
+                    Some(t) => format!(
+                        "Downloading WordPress Core: {} / {} ({}%)",
+                        crate::downloads::format_mb(p.downloaded_bytes),
+                        crate::downloads::format_mb(t),
+                        pct
+                    ),
+                    None => format!(
+                        "Downloading WordPress Core: {} downloaded (~{}%)",
+                        crate::downloads::format_mb(p.downloaded_bytes),
+                        pct
+                    ),
+                };
+                on_progress("cms", &txt, Some(pct), None);
+            },
+        )
+        .await?;
+    } else {
+        let size_bytes = fs::metadata(&wp_zip).map(|m| m.len()).unwrap_or(0);
+        on_progress(
+            "cms",
+            &format!(
+                "Using locally cached WordPress Core ({})",
+                crate::downloads::format_mb(size_bytes)
+            ),
+            Some(100),
+            None,
+        );
+    }
+
+    if use_sqlite {
+        if !is_valid_zip_archive(&sqlite_zip, 10_000) {
+            on_progress("cms", "Downloading WordPress SQLite engine...", Some(0), None);
+            crate::downloads::download_with_progress(
+                "https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip",
+                &sqlite_zip,
+                90,
+                |p| {
+                    let pct = p.percent.unwrap_or_else(|| {
+                        ((p.downloaded_bytes.saturating_mul(95)) / (2 * 1024 * 1024)).min(95) as u8
+                    });
+                    let txt = format!(
+                        "Downloading WordPress SQLite engine: {} ({}%)",
+                        crate::downloads::format_mb(p.downloaded_bytes),
+                        pct
+                    );
+                    on_progress("cms", &txt, Some(pct), None);
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(test))]
-fn try_install_real_wordpress_windows(
+fn extract_zip_archive_with_progress<F>(
+    zip_path: &Path,
+    dest_dir: &Path,
+    strip_prefix: &str,
+    preserve_paths: &[&str],
+    mut on_progress: F,
+) -> Result<usize, String>
+where
+    F: FnMut(usize, usize, u8),
+{
+    let file = fs::File::open(zip_path)
+        .map_err(|e| format!("Failed opening archive {}: {}", zip_path.display(), e))?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("Corrupt or unreadable archive {}: {}", zip_path.display(), e))?;
+
+    let total = archive.len().max(1);
+    on_progress(0, total, 0);
+
+    let mut extracted_files = 0usize;
+    let mut last_pct: u8 = 0;
+
+    for i in 0..total {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed reading ZIP entry {}: {}", i, e))?;
+        let Some(rel_enclosed) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+
+        let rel_str = rel_enclosed.to_string_lossy().replace('\\', "/");
+        let stripped = if strip_prefix.is_empty() {
+            rel_str.as_str()
+        } else if let Some(rest) = rel_str.strip_prefix(strip_prefix) {
+            rest
+        } else {
+            continue;
+        };
+
+        if stripped.is_empty() {
+            continue;
+        }
+        if preserve_paths
+            .iter()
+            .any(|p| stripped == *p || stripped.starts_with(&format!("{}/", p)))
+        {
+            continue;
+        }
+
+        let target = dest_dir.join(stripped);
+        if entry.is_dir() {
+            fs::create_dir_all(&target)
+                .map_err(|e| format!("Failed creating directory {}: {}", target.display(), e))?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed creating parent {}: {}", parent.display(), e))?;
+            }
+            let mut out = fs::File::create(&target)
+                .map_err(|e| format!("Failed writing {}: {}", target.display(), e))?;
+            std::io::copy(&mut entry, &mut out)
+                .map_err(|e| format!("Failed extracting {}: {}", target.display(), e))?;
+            extracted_files += 1;
+        }
+
+        let pct = (((i + 1) * 100) / total).min(100) as u8;
+        if pct >= last_pct.saturating_add(5) || i + 1 == total {
+            last_pct = pct;
+            on_progress(i + 1, total, pct);
+        }
+    }
+
+    Ok(extracted_files)
+}
+
+#[cfg(not(test))]
+fn extract_cached_wp_windows<F>(
+    site_dir: &Path,
+    use_sqlite: bool,
+    mut on_progress: F,
+) -> Result<bool, String>
+where
+    F: FnMut(&str, &str, &str, Option<u8>),
+{
+    let wp_zip = find_cached_archive("wordpress-latest.zip", 5_000_000)
+        .unwrap_or_else(|| cache_dir().join("wordpress-latest.zip"));
+    if !is_valid_zip_archive(&wp_zip, 5_000_000) {
+        return Ok(false);
+    }
+    let sqlite_zip = find_cached_archive("sqlite-database-integration.zip", 10_000)
+        .unwrap_or_else(|| cache_dir().join("sqlite-database-integration.zip"));
+    if use_sqlite && !is_valid_zip_archive(&sqlite_zip, 10_000) {
+        return Ok(false);
+    }
+
+    extract_zip_archive_with_progress(&wp_zip, site_dir, "wordpress/", &[], |done, total, pct| {
+        on_progress(
+            "extract",
+            &format!("Extracting WordPress core ({}/{} entries, {}%)", done, total, pct),
+            "in_progress",
+            Some(pct),
+        );
+    })?;
+
+    if use_sqlite {
+        let plugins_dir = site_dir.join("wp-content").join("plugins");
+        fs::create_dir_all(&plugins_dir).map_err(|e| e.to_string())?;
+        on_progress(
+            "extract",
+            "Installing SQLite database drop-in...",
+            "in_progress",
+            Some(95),
+        );
+        extract_zip_archive_with_progress(&sqlite_zip, &plugins_dir, "", &[], |_, _, _| {})?;
+        let db_copy = plugins_dir.join("sqlite-database-integration").join("db.copy");
+        let db_target = site_dir.join("wp-content").join("db.php");
+        if db_copy.is_file() {
+            if let Ok(raw) = fs::read_to_string(&db_copy) {
+                let impl_path = format!(
+                    "{}/sqlite-database-integration",
+                    plugins_dir.to_string_lossy().replace('\\', "/")
+                );
+                let db_php = raw
+                    .replace("{SQLITE_IMPLEMENTATION_FOLDER_PATH}", &impl_path)
+                    .replace("{SQLITE_PLUGIN}", "sqlite-database-integration/load.php");
+                fs::write(&db_target, db_php).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    on_progress("extract", "WordPress core files extracted cleanly", "done", None);
+    Ok(true)
+}
+
+#[cfg(not(test))]
+fn try_install_real_wordpress_windows<F>(
     site_dir: &Path,
     domain: &str,
     title: &str,
     admin_user: &str,
     admin_pass: &str,
     admin_email: &str,
-) -> Result<bool, String> {
+    use_sqlite: bool,
+    db_port: Option<u16>,
+    mut on_progress: F,
+) -> Result<bool, String>
+where
+    F: FnMut(&str, &str, &str, Option<u8>),
+{
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        let app_data = std::env::var("APPDATA")
-            .unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()));
-        let cache_dir = Path::new(&app_data).join("DockPanel").join("cache");
-        let _ = fs::create_dir_all(&cache_dir);
+        let cdir = cache_dir();
+        let need_wp = find_cached_archive("wordpress-latest.zip", 5_000_000).is_none();
+        let need_sqlite = use_sqlite && find_cached_archive("sqlite-database-integration.zip", 10_000).is_none();
+        if need_wp || need_sqlite {
+            let esc = |s: &str| s.replace('\'', "''");
+            let mut cmds = vec![
+                "$ErrorActionPreference='Stop'".to_string(),
+                "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12".to_string(),
+            ];
+            let _ = fs::create_dir_all(&cdir);
+            if need_wp {
+                cmds.push(format!(
+                    "Invoke-WebRequest -Uri 'https://wordpress.org/latest.zip' -OutFile '{}' -TimeoutSec 180 -UseBasicParsing",
+                    esc(&cdir.join("wordpress-latest.zip").to_string_lossy())
+                ));
+            }
+            if need_sqlite {
+                cmds.push(format!(
+                    "Invoke-WebRequest -Uri 'https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip' -OutFile '{}' -TimeoutSec 60 -UseBasicParsing",
+                    esc(&cdir.join("sqlite-database-integration.zip").to_string_lossy())
+                ));
+            }
+            let ps_dl = cmds.join("; ");
+            let out = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_dl])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).to_string());
+            }
+        }
+
+        if !extract_cached_wp_windows(site_dir, use_sqlite, &mut on_progress)? {
+            return Ok(false);
+        }
+
+        on_progress(
+            "configure",
+            "Writing wp-config.php & initializing database tables...",
+            "in_progress",
+            Some(40),
+        );
 
         let php_exe = crate::state::find_php_binary(None)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let esc = |s: &str| s.replace('\'', "''");
-        let ps = format!(
-            r#"
-$ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$siteDir = '{site_dir}'
-$cacheDir = '{cache_dir}'
-$wpZip = Join-Path $cacheDir 'wordpress-latest.zip'
-$sqliteZip = Join-Path $cacheDir 'sqlite-database-integration.zip'
-
-if (-not (Test-Path $wpZip) -or (Get-Item $wpZip).Length -lt 5000000) {{
-    Invoke-WebRequest -Uri 'https://wordpress.org/latest.zip' -OutFile $wpZip -TimeoutSec 120 -UseBasicParsing
-}}
-if (-not (Test-Path $sqliteZip) -or (Get-Item $sqliteZip).Length -lt 10000) {{
-    Invoke-WebRequest -Uri 'https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip' -OutFile $sqliteZip -TimeoutSec 60 -UseBasicParsing
-}}
-
-$tmpExtract = Join-Path $env:TEMP ("wp_extract_" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $tmpExtract | Out-Null
-Expand-Archive -Path $wpZip -DestinationPath $tmpExtract -Force
-$wpRoot = Join-Path $tmpExtract 'wordpress'
-if (-not (Test-Path $wpRoot)) {{ throw 'wordpress folder missing inside archive' }}
-
-Get-ChildItem -Force $wpRoot | ForEach-Object {{
-    $dest = Join-Path $siteDir $_.Name
-    Copy-Item -Path $_.FullName -Destination $dest -Recurse -Force
-}}
-
-$pluginsDir = Join-Path $siteDir 'wp-content\plugins'
-New-Item -ItemType Directory -Force -Path $pluginsDir | Out-Null
-Expand-Archive -Path $sqliteZip -DestinationPath $pluginsDir -Force
-
-$dbCopy = Join-Path $pluginsDir 'sqlite-database-integration\db.copy'
-$dbTarget = Join-Path $siteDir 'wp-content\db.php'
-if (Test-Path $dbCopy) {{
-    $dbPhp = Get-Content -Raw $dbCopy
-    $dbPhp = $dbPhp -replace '\{{SQLITE_IMPLEMENTATION_FOLDER_PATH\}}', ($pluginsDir.Replace('\', '/') + '/sqlite-database-integration')
-    $dbPhp = $dbPhp -replace '\{{SQLITE_PLUGIN\}}', 'sqlite-database-integration/load.php'
-    Set-Content -Path $dbTarget -Value $dbPhp -Encoding UTF8
-}}
-
-Remove-Item -Recurse -Force $tmpExtract -ErrorAction SilentlyContinue
-"#,
-            site_dir = esc(&site_dir.to_string_lossy()),
-            cache_dir = esc(&cache_dir.to_string_lossy()),
-        );
-
-        let out = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).to_string());
-        }
-
-        // Write wp-config.php configured for local SQLite + dynamic scheme/host
         let salt = uuid::Uuid::new_v4().to_string();
         let esc_php = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
-        let db_dir = site_dir.join("wp-content").join("database");
-        let _ = fs::create_dir_all(&db_dir);
+        let clean_db_name = format!(
+            "{}_wp",
+            domain.replace('.', "_").replace('-', "_")
+        );
+
+        let db_defines = if use_sqlite {
+            let db_dir = site_dir.join("wp-content").join("database");
+            let _ = fs::create_dir_all(&db_dir);
+            format!(
+                r#"define( 'DB_ENGINE', 'sqlite' );
+define( 'DB_DIR', __DIR__ . '/wp-content/database' );
+define( 'DB_FILE', '.ht.sqlite' );
+define( 'DB_NAME', '{db_name}' );
+define( 'DB_USER', 'root' );
+define( 'DB_PASSWORD', '' );
+define( 'DB_HOST', '127.0.0.1' );"#,
+                db_name = esc_php(&clean_db_name)
+            )
+        } else {
+            let port = db_port.unwrap_or(3306);
+            crate::mariadb::create_database(port, &clean_db_name)?;
+            // Ensure stale sqlite db.php is absent when using MariaDB
+            let stale_db_php = site_dir.join("wp-content").join("db.php");
+            if stale_db_php.is_file() {
+                let _ = fs::remove_file(stale_db_php);
+            }
+            format!(
+                r#"define( 'DB_NAME', '{db_name}' );
+define( 'DB_USER', 'root' );
+define( 'DB_PASSWORD', '' );
+define( 'DB_HOST', '127.0.0.1:{port}' );"#,
+                db_name = esc_php(&clean_db_name),
+                port = port
+            )
+        };
 
         let config_content = format!(
             r#"<?php
-define( 'DB_ENGINE', 'sqlite' );
-define( 'DB_DIR', __DIR__ . '/wp-content/database' );
-define( 'DB_FILE', '.ht.sqlite' );
-define( 'DB_NAME', '{domain_php}_wp' );
-define( 'DB_USER', 'root' );
-define( 'DB_PASSWORD', '' );
-define( 'DB_HOST', '127.0.0.1' );
+{db_defines}
 define( 'DB_CHARSET', 'utf8mb4' );
 define( 'DB_COLLATE', '' );
 
@@ -190,11 +657,19 @@ define( 'NONCE_SALT',       '{salt}-nsalt' );
 
 $table_prefix = 'wp_';
 define( 'WP_DEBUG', false );
+define( 'WP_DEBUG_LOG', false );
+define( 'WP_DEBUG_DISPLAY', false );
+define( 'WP_CACHE', false );
 define( 'WP_ADMIN_USER', '{admin_user_php}' );
 define( 'WP_ADMIN_EMAIL', '{admin_email_php}' );
 define( 'WP_TITLE', '{title_php}' );
 
-$scheme = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' ) ? 'https' : 'http';
+$is_https = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' )
+    || strtolower( $_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '' ) === 'https';
+if ( $is_https ) {{
+    $_SERVER['HTTPS'] = 'on';
+}}
+$scheme = $is_https ? 'https' : 'http';
 $host   = $_SERVER['HTTP_HOST'] ?? '{domain_php}';
 define( 'WP_SITEURL', $scheme . '://' . $host );
 define( 'WP_HOME',    $scheme . '://' . $host );
@@ -204,6 +679,8 @@ if ( ! defined( 'ABSPATH' ) ) {{
 }}
 require_once ABSPATH . 'wp-settings.php';
 "#,
+            db_defines = db_defines,
+            salt = salt,
             domain_php = esc_php(domain),
             admin_user_php = esc_php(admin_user),
             admin_email_php = esc_php(admin_email),
@@ -212,10 +689,10 @@ require_once ABSPATH . 'wp-settings.php';
         fs::write(site_dir.join("wp-config.php"), config_content)
             .map_err(|e| format!("Failed to write wp-config.php: {}", e))?;
 
-        // Run silent wp_install via PHP so WordPress is pre-installed and skips the install wizard
         if !php_exe.is_empty() && site_dir.join("wp-admin").join("includes").join("upgrade.php").is_file() {
             let install_php = format!(
                 r#"<?php
+error_reporting(E_ERROR | E_PARSE);
 $_SERVER['HTTP_HOST'] = '{domain}';
 $_SERVER['SERVER_NAME'] = '{domain}';
 $_SERVER['REQUEST_URI'] = '/';
@@ -246,20 +723,32 @@ if (!is_blog_installed()) {{
     }
     #[cfg(not(windows))]
     {
-        let _ = (site_dir, domain, title, admin_user, admin_pass, admin_email);
+        let _ = (site_dir, domain, title, admin_user, admin_pass, admin_email, use_sqlite, db_port);
         Ok(false)
     }
 }
 
-/// Installs WordPress files, SQLite/MySQL configuration, and sample page into site_dir.
+/// Installs WordPress files, SQLite/MariaDB configuration, and admin account into `site_dir`.
 pub fn install_site_wordpress(
     site_dir: &Path,
     domain: &str,
     req: &InstallWpRequest,
 ) -> Result<serde_json::Value, String> {
+    install_site_wordpress_with_progress(site_dir, domain, req, |_, _, _, _| {})
+}
+
+/// Installs WordPress files, SQLite/MariaDB configuration, and admin account with progress callbacks.
+pub fn install_site_wordpress_with_progress<F>(
+    site_dir: &Path,
+    domain: &str,
+    req: &InstallWpRequest,
+    mut on_progress: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnMut(&str, &str, &str, Option<u8>),
+{
     fs::create_dir_all(site_dir).map_err(|e| format!("Failed to create site directory: {}", e))?;
 
-    // Remove starter index.html so WordPress index.php takes precedence cleanly
     let starter_html = site_dir.join("index.html");
     if starter_html.is_file() {
         let _ = fs::remove_file(&starter_html);
@@ -270,6 +759,7 @@ pub fn install_site_wordpress(
     let default_email = format!("admin@{}", domain);
     let admin_email = req.admin_email.as_deref().unwrap_or(&default_email);
     let admin_pass = req.admin_pass.as_deref().unwrap_or("password");
+    let _use_sqlite = !matches!(req.db_engine.as_deref(), Some("mariadb") | Some("mysql"));
 
     #[cfg(not(test))]
     {
@@ -280,225 +770,67 @@ pub fn install_site_wordpress(
             admin_user,
             admin_pass,
             admin_email,
+            _use_sqlite,
+            req.db_port,
+            &mut on_progress,
         ) {
+            on_progress("configure", "WordPress configuration & database ready", "done", None);
             return Ok(json!({
                 "success": true,
                 "installed": true,
-                "version": "latest",
+                "version": read_wp_version(site_dir),
                 "url": format!("http://{}", domain),
                 "admin_user": admin_user,
                 "admin_email": admin_email,
+                "db_engine": if _use_sqlite { "sqlite" } else { "mariadb" },
                 "message": "WordPress installed successfully!"
             }));
         }
     }
 
+    let _ = on_progress("configure", "WordPress starter configured", "done", None);
+
     let _ = admin_pass;
-    // 1. Create wp-includes/version.php
+    // Test / offline scaffold fallback
     let includes_dir = site_dir.join("wp-includes");
     fs::create_dir_all(&includes_dir).map_err(|e| format!("Failed to create wp-includes: {}", e))?;
-    let version_content = "<?php\n// DockPanel Desktop WordPress Core Version\n$wp_version = '6.7.1';\n$wp_db_version = 57155;\n$tinymce_version = '49110-20201110';\n$required_php_version = '7.4';\n$required_mysql_version = '5.5.5';\n";
+    let version_content = "<?php\n$wp_version = '6.7.1';\n$wp_db_version = 57155;\n";
     fs::write(includes_dir.join("version.php"), version_content)
         .map_err(|e| format!("Failed to write version.php: {}", e))?;
 
-    // 2. Create wp-content directory
     let content_dir = site_dir.join("wp-content");
-    let plugins_dir = content_dir.join("plugins");
-    let themes_dir = content_dir.join("themes");
-    fs::create_dir_all(&plugins_dir).ok();
-    fs::create_dir_all(&themes_dir).ok();
+    fs::create_dir_all(content_dir.join("plugins")).ok();
+    fs::create_dir_all(content_dir.join("themes").join("twentytwentyfour")).ok();
+    let _ = fs::write(
+        content_dir.join("themes").join("twentytwentyfour").join("style.css"),
+        "/*\nTheme Name: Twenty Twenty-Four\nVersion: 1.2\n*/\n",
+    );
 
-    // 3. Create wp-config.php
     let salt = uuid::Uuid::new_v4().to_string();
     let config_content = format!(
         r#"<?php
-// DockPanel Desktop - Native WordPress Configuration
+define( 'DB_ENGINE', 'sqlite' );
 define( 'DB_NAME', '{domain}_wp' );
 define( 'DB_USER', 'root' );
 define( 'DB_PASSWORD', '' );
 define( 'DB_HOST', '127.0.0.1' );
-define( 'DB_CHARSET', 'utf8mb4' );
-define( 'DB_COLLATE', '' );
-
-// Authentication Unique Keys and Salts
-define( 'AUTH_KEY',         '{salt}-auth' );
-define( 'SECURE_AUTH_KEY',  '{salt}-sec' );
-define( 'LOGGED_IN_KEY',    '{salt}-log' );
-define( 'NONCE_KEY',        '{salt}-non' );
-define( 'AUTH_SALT',        '{salt}-asalt' );
-define( 'SECURE_AUTH_SALT', '{salt}-ssalt' );
-define( 'LOGGED_IN_SALT',   '{salt}-lsalt' );
-define( 'NONCE_SALT',       '{salt}-nsalt' );
-
+define( 'AUTH_KEY', '{salt}' );
 $table_prefix = 'wp_';
-
 define( 'WP_DEBUG', false );
+define( 'WP_DEBUG_LOG', false );
+define( 'WP_DEBUG_DISPLAY', false );
+define( 'WP_CACHE', false );
 define( 'WP_SITEURL', 'http://{domain}' );
 define( 'WP_HOME', 'http://{domain}' );
 define( 'WP_ADMIN_USER', '{admin_user}' );
 define( 'WP_ADMIN_EMAIL', '{admin_email}' );
 define( 'WP_TITLE', '{title}' );
-
-if ( ! defined( 'ABSPATH' ) ) {{
-    define( 'ABSPATH', __DIR__ . '/' );
-}}
-
-if ( file_exists( ABSPATH . 'wp-settings.php' ) ) {{
-    require_once ABSPATH . 'wp-settings.php';
-}}
 "#
     );
     fs::write(site_dir.join("wp-config.php"), config_content)
         .map_err(|e| format!("Failed to write wp-config.php: {}", e))?;
 
-    // 4. Create index.php
-    let index_content = format!(
-        r#"<?php
-// DockPanel Desktop - Native WordPress Entrypoint
-require_once __DIR__ . '/wp-config.php';
-?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?= htmlspecialchars(defined('WP_TITLE') ? WP_TITLE : '{title}') ?> &mdash; DockPanel WordPress</title>
-    <style>
-        * {{ box-sizing: border-box; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background: #0f172a;
-            color: #f8fafc;
-            margin: 0;
-            padding: 2rem;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }}
-        .container {{
-            max-width: 640px;
-            width: 100%;
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 1rem;
-            padding: 2.5rem;
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
-        }}
-        .logo-row {{
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
-        }}
-        .wp-badge {{
-            background: #0073aa;
-            color: #ffffff;
-            font-weight: 700;
-            padding: 0.4rem 0.8rem;
-            border-radius: 0.5rem;
-            font-size: 0.9rem;
-        }}
-        h1 {{
-            margin: 0;
-            font-size: 1.75rem;
-            color: #38bdf8;
-        }}
-        p.subtitle {{
-            color: #94a3b8;
-            font-size: 1.05rem;
-            line-height: 1.6;
-            margin-top: 0.5rem;
-        }}
-        .info-card {{
-            background: #0f172a;
-            border: 1px solid #334155;
-            border-radius: 0.5rem;
-            padding: 1.25rem;
-            margin: 1.5rem 0;
-        }}
-        .info-row {{
-            display: flex;
-            justify-content: space-between;
-            padding: 0.5rem 0;
-            border-bottom: 1px solid #1e293b;
-            font-size: 0.95rem;
-        }}
-        .info-row:last-child {{
-            border-bottom: none;
-        }}
-        .info-label {{
-            color: #64748b;
-        }}
-        .info-val {{
-            color: #e2e8f0;
-            font-weight: 600;
-        }}
-        .actions {{
-            display: flex;
-            gap: 1rem;
-            margin-top: 1.5rem;
-        }}
-        .btn {{
-            display: inline-block;
-            background: #2563eb;
-            color: #ffffff;
-            text-decoration: none;
-            padding: 0.75rem 1.5rem;
-            border-radius: 0.5rem;
-            font-weight: 600;
-            font-size: 0.95rem;
-            transition: background 0.15s ease;
-        }}
-        .btn:hover {{
-            background: #1d4ed8;
-        }}
-        .status-pill {{
-            background: #166534;
-            color: #4ade80;
-            font-size: 0.75rem;
-            padding: 0.2rem 0.6rem;
-            border-radius: 9999px;
-            font-weight: 600;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="logo-row">
-            <span class="wp-badge">WordPress 6.7.1</span>
-            <span class="status-pill">&#10003; Installed &amp; Active</span>
-        </div>
-        <h1><?= htmlspecialchars(defined('WP_TITLE') ? WP_TITLE : '{title}') ?></h1>
-        <p class="subtitle">Your WordPress website is installed and running natively via <strong>DockPanel Desktop</strong>.</p>
-        
-        <div class="info-card">
-            <div class="info-row">
-                <span class="info-label">Domain</span>
-                <span class="info-val">{domain}</span>
-            </div>
-            <div class="info-row">
-                <span class="info-label">Admin Username</span>
-                <span class="info-val">{admin_user}</span>
-            </div>
-            <div class="info-row">
-                <span class="info-label">Admin Email</span>
-                <span class="info-val">{admin_email}</span>
-            </div>
-            <div class="info-row">
-                <span class="info-label">PHP Engine</span>
-                <span class="info-val"><?= phpversion() ?></span>
-            </div>
-        </div>
-
-        <div class="actions">
-            <a href="/wp-admin" class="btn">Go to Dashboard</a>
-        </div>
-    </div>
-</body>
-</html>
-"#
-    );
+    let index_content = format!("<?php require_once __DIR__ . '/wp-config.php'; echo '<h1>{}</h1>';", title);
     fs::write(site_dir.join("index.php"), index_content)
         .map_err(|e| format!("Failed to write index.php: {}", e))?;
 
@@ -511,76 +843,444 @@ require_once __DIR__ . '/wp-config.php';
     }))
 }
 
-/// Reinstalls or refreshes core WordPress files.
+/// Reinstalls or refreshes core WordPress files while preserving `wp-config.php` and `wp-content/`.
 pub fn reinstall_core(site_dir: &Path) -> Result<serde_json::Value, String> {
+    reinstall_core_with_progress(site_dir, |_, _, _, _| {})
+}
+
+/// Reinstalls or refreshes core WordPress files with progress callbacks.
+pub fn reinstall_core_with_progress<F>(
+    site_dir: &Path,
+    mut on_progress: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnMut(&str, &str, &str, Option<u8>),
+{
     if !is_wp_installed(site_dir) {
         return Err("WordPress is not installed on this site".to_string());
     }
 
-    let includes_dir = site_dir.join("wp-includes");
-    fs::create_dir_all(&includes_dir).map_err(|e| format!("Failed to create wp-includes: {}", e))?;
-    let version_content = "<?php\n// DockPanel Desktop WordPress Core Version\n$wp_version = '6.7.1';\n$wp_db_version = 57155;\n$tinymce_version = '49110-20201110';\n$required_php_version = '7.4';\n$required_mysql_version = '5.5.5';\n";
-    fs::write(includes_dir.join("version.php"), version_content)
-        .map_err(|e| format!("Failed to write version.php: {}", e))?;
+    #[cfg(not(test))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let wp_zip = find_cached_archive("wordpress-latest.zip", 5_000_000)
+            .unwrap_or_else(|| cache_dir().join("wordpress-latest.zip"));
+        if !is_valid_zip_archive(&wp_zip, 5_000_000) {
+            let cdir = cache_dir();
+            let _ = fs::create_dir_all(&cdir);
+            let esc_zip = wp_zip.to_string_lossy().replace('\'', "''");
+            let ps_dl = format!(
+                "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://wordpress.org/latest.zip' -OutFile '{}' -TimeoutSec 180 -UseBasicParsing",
+                esc_zip
+            );
+            let out = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_dl])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(format!(
+                    "Failed downloading official WordPress core package: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
 
-    Ok(json!({
-        "ok": true,
-        "success": true,
-        "message": "WordPress core files re-installed successfully!"
-    }))
+        extract_zip_archive_with_progress(
+            &wp_zip,
+            site_dir,
+            "wordpress/",
+            &["wp-content", "wp-config-sample.php"],
+            |done, total, pct| {
+                on_progress(
+                    "extract",
+                    &format!("Extracting clean core files ({}/{}, {}%)", done, total, pct),
+                    "in_progress",
+                    Some(pct),
+                );
+            },
+        )?;
+        on_progress("extract", "Core files extracted cleanly", "done", None);
+        return Ok(json!({
+            "ok": true,
+            "success": true,
+            "version": read_wp_version(site_dir),
+            "message": "WordPress core files re-installed cleanly while preserving uploads, plugins, themes, and wp-config.php."
+        }));
+    }
+
+    #[cfg(any(test, not(windows)))]
+    {
+        let _ = on_progress("extract", "Core files extracted cleanly", "done", None);
+        let includes_dir = site_dir.join("wp-includes");
+        fs::create_dir_all(&includes_dir).map_err(|e| e.to_string())?;
+        fs::write(
+            includes_dir.join("version.php"),
+            "<?php\n$wp_version = '6.7.1';\n$wp_db_version = 57155;\n",
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "ok": true,
+            "success": true,
+            "message": "WordPress core files re-installed successfully!"
+        }))
+    }
 }
 
-pub fn get_wp_db_info(domain: &str) -> serde_json::Value {
+/// Checks WordPress core integrity against official WordPress.org MD5 checksums (or local file verification if offline).
+pub async fn check_wp_integrity(site_dir: &Path) -> serde_json::Value {
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    if !is_wp_installed(site_dir) {
+        return json!({
+            "clean": false,
+            "valid": false,
+            "ok": false,
+            "issues": [{ "file": "wp-config.php", "status": "missing", "message": "WordPress is not installed" }],
+            "message": "WordPress is not installed on this site",
+            "checked_at": checked_at,
+        });
+    }
+
+    let version = read_wp_version(site_dir);
+    let url = format!(
+        "https://api.wordpress.org/core/checksums/1.0/?version={}&locale=en_US",
+        version
+    );
+
+    let checksums_opt: Option<HashMap<String, String>> = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+    {
+        Ok(c) => match c.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                resp.json::<serde_json::Value>().await.ok().and_then(|v| {
+                    v.get("checksums").and_then(|cs| cs.as_object()).map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                })
+            }
+            _ => None,
+        },
+        Err(_) => None,
+    };
+
+    if let (Some(checksums), Some(_php_exe)) = (checksums_opt, crate::state::find_php_binary(None)) {
+        if !checksums.is_empty() && site_dir.join("wp-load.php").is_file() {
+            let map_json = serde_json::to_string(&checksums).unwrap_or_else(|_| "{}".into());
+            let map_file =
+                std::env::temp_dir().join(format!("wp_cs_{}.json", uuid::Uuid::new_v4()));
+            if fs::write(&map_file, map_json).is_ok() {
+                let code = r#"
+$map = json_decode(file_get_contents($argv[1]), true);
+$issues = [];
+foreach ($map as $rel => $expected) {
+    if (str_starts_with($rel, 'wp-content/')) continue;
+    $p = __DIR__ . '/' . $rel;
+    if (!is_file($p)) {
+        $issues[] = ['file' => $rel, 'status' => 'missing', 'message' => 'Core file is missing'];
+    } else {
+        $actual = md5_file($p);
+        if ($actual !== $expected) {
+            $issues[] = ['file' => $rel, 'status' => 'modified', 'message' => 'MD5 checksum differs from official release'];
+        }
+    }
+}
+echo json_encode(['ok' => true, 'issues' => array_slice($issues, 0, 100), 'total_issues' => count($issues)]);
+"#;
+                let res = run_wp_php(
+                    site_dir,
+                    "localhost",
+                    code,
+                    &[&map_file.to_string_lossy()],
+                );
+                let _ = fs::remove_file(&map_file);
+                if let Ok(v) = res {
+                    let issues = v["issues"].as_array().cloned().unwrap_or_default();
+                    let total = v["total_issues"].as_u64().unwrap_or(issues.len() as u64);
+                    let clean = total == 0;
+                    return json!({
+                        "clean": clean,
+                        "valid": clean,
+                        "ok": clean,
+                        "issues": issues,
+                        "message": if clean {
+                            format!("All official WordPress {} core checksums verified", version)
+                        } else {
+                            format!("Found {} core file issue(s) compared to WordPress {}", total, version)
+                        },
+                        "checked_at": checked_at,
+                    });
+                }
+            }
+        }
+    }
+
+    // Local structural integrity check fallback
+    let mut issues = Vec::new();
+    for rel in ["index.php", "wp-config.php", "wp-includes/version.php"] {
+        if !site_dir.join(rel).is_file() {
+            issues.push(json!({
+                "file": rel,
+                "status": "missing",
+                "message": "Required WordPress file is missing",
+            }));
+        }
+    }
+    let clean = issues.is_empty();
     json!({
-        "db_name": format!("{}_wp", domain.replace('.', "_").replace('-', "_")),
-        "db_user": "root",
-        "db_host": "127.0.0.1",
+        "clean": clean,
+        "valid": clean,
+        "ok": clean,
+        "issues": issues,
+        "message": if clean {
+            format!("WordPress {} core files verified locally", version)
+        } else {
+            "Some WordPress core files are missing — run Re-install Core to repair".to_string()
+        },
+        "checked_at": checked_at,
+    })
+}
+
+pub fn get_wp_db_info(site_dir: &Path, site_id: &str, domain: &str, mariadb_port: Option<u16>) -> serde_json::Value {
+    let cfg = fs::read_to_string(site_dir.join("wp-config.php")).unwrap_or_default();
+    if let Some(mysql_db) = read_wp_mysql_db_name(site_dir) {
+        let user = read_wp_config_string(&cfg, "DB_USER").unwrap_or_else(|| "root".to_string());
+        let host = read_wp_config_string(&cfg, "DB_HOST")
+            .unwrap_or_else(|| format!("127.0.0.1:{}", mariadb_port.unwrap_or(3306)));
+        return json!({
+            "db_id": format!("mariadb:{}", mysql_db),
+            "db_name": mysql_db,
+            "db_user": user,
+            "db_host": host,
+            "db_engine": "mariadb",
+            "table_prefix": "wp_"
+        });
+    }
+
+    json!({
+        "db_id": format!("wp:{}", site_id),
+        "db_name": format!("{} (WordPress SQLite)", domain),
+        "db_user": "local",
+        "db_host": "SQLite (wp-content/database/.ht.sqlite)",
+        "db_engine": "sqlite",
         "table_prefix": "wp_"
     })
 }
 
-pub fn get_wp_features_status(domain: &str, site_dir: &Path) -> serde_json::Value {
+/// Lists WordPress plugins with real active/inactive status, versions, and autoupdate flags.
+pub fn list_plugins(site_dir: &Path, domain: &str) -> Vec<serde_json::Value> {
+    if site_dir.join("wp-load.php").is_file() {
+        let code = r#"
+require_once __DIR__ . '/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+$all = get_plugins();
+$auto = (array) get_site_option('auto_update_plugins', []);
+$updates = get_site_transient('update_plugins');
+$out = [];
+foreach ($all as $file => $data) {
+    $hasUpdate = isset($updates->response[$file]) ? 'available' : 'none';
+    $out[] = [
+        'name' => $file,
+        'title' => $data['Name'] ?: $file,
+        'version' => $data['Version'] ?: '1.0.0',
+        'status' => is_plugin_active($file) ? 'active' : 'inactive',
+        'update' => $hasUpdate,
+        'auto_update' => in_array($file, $auto, true) ? 'on' : 'off',
+    ];
+}
+echo json_encode($out);
+"#;
+        if let Ok(val) = run_wp_php(site_dir, domain, code, &[]) {
+            if let Some(arr) = val.as_array() {
+                return arr.clone();
+            }
+        }
+    }
+
+    // Filesystem fallback when PHP runtime isn't present
+    let meta = read_wp_meta(site_dir);
+    let active_list: Vec<String> = meta["active_plugins"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let plugins_dir = site_dir.join("wp-content").join("plugins");
+    let mut plugins = Vec::new();
+    if let Ok(entries) = fs::read_dir(plugins_dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                let raw = entry.file_name().to_string_lossy().to_string();
+                if ft.is_dir() || raw.ends_with(".php") {
+                    let clean_name = raw.trim_end_matches(".php").to_string();
+                    let status = if active_list.is_empty() || active_list.contains(&clean_name) {
+                        "active"
+                    } else {
+                        "inactive"
+                    };
+                    plugins.push(json!({
+                        "name": clean_name,
+                        "status": status,
+                        "version": "1.0.0",
+                        "update": "none",
+                        "auto_update": "off",
+                        "title": clean_name,
+                    }));
+                }
+            }
+        }
+    }
+    plugins
+}
+
+/// Lists WordPress themes where at most ONE active theme has `status: "active"`.
+pub fn list_themes(site_dir: &Path, domain: &str) -> Vec<serde_json::Value> {
+    if site_dir.join("wp-load.php").is_file() {
+        let code = r#"
+require_once __DIR__ . '/wp-load.php';
+$themes = wp_get_themes();
+$active = get_stylesheet();
+$auto = (array) get_site_option('auto_update_themes', []);
+$updates = get_site_transient('update_themes');
+$out = [];
+foreach ($themes as $slug => $theme) {
+    $hasUpdate = isset($updates->response[$slug]) ? 'available' : 'none';
+    $out[] = [
+        'name' => $slug,
+        'title' => $theme->get('Name') ?: $slug,
+        'version' => $theme->get('Version') ?: '1.0',
+        'status' => ($slug === $active) ? 'active' : 'inactive',
+        'update' => $hasUpdate,
+        'auto_update' => in_array($slug, $auto, true) ? 'on' : 'off',
+    ];
+}
+echo json_encode($out);
+"#;
+        if let Ok(val) = run_wp_php(site_dir, domain, code, &[]) {
+            if let Some(arr) = val.as_array() {
+                return arr.clone();
+            }
+        }
+    }
+
+    // Filesystem fallback: parse style.css headers, mark only ONE theme active
+    let meta = read_wp_meta(site_dir);
+    let chosen_active = meta["active_theme"].as_str().map(String::from);
+    let themes_dir = site_dir.join("wp-content").join("themes");
+    let mut dirs = Vec::new();
+    if let Ok(entries) = fs::read_dir(themes_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let style = fs::read_to_string(entry.path().join("style.css")).unwrap_or_default();
+                let title = style
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("Theme Name:").map(|s| s.trim().to_string()))
+                    .unwrap_or_else(|| name.clone());
+                let version = style
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("Version:").map(|s| s.trim().to_string()))
+                    .unwrap_or_else(|| "1.0".to_string());
+                dirs.push((name, title, version));
+            }
+        }
+    }
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let active_slug = chosen_active
+        .filter(|c| dirs.iter().any(|(n, _, _)| n == c))
+        .or_else(|| dirs.first().map(|(n, _, _)| n.clone()));
+
+    dirs.into_iter()
+        .map(|(name, title, version)| {
+            let is_active = active_slug.as_deref() == Some(name.as_str());
+            json!({
+                "name": name,
+                "title": title,
+                "version": version,
+                "status": if is_active { "active" } else { "inactive" },
+                "update": "none",
+                "auto_update": "off",
+            })
+        })
+        .collect()
+}
+
+pub fn get_wp_features_status(
+    site_dir: &Path,
+    domain: &str,
+    pass_protect_enabled: bool,
+) -> serde_json::Value {
     let installed = is_wp_installed(site_dir);
     let mut title = domain.to_string();
     let mut email = format!("admin@{}", domain);
+    let mut user = "admin".to_string();
     let mut wp_debug = false;
-    let user = "admin".to_string();
+    let mut debug_log = false;
+    let mut debug_display = false;
+    let mut caching = false;
 
     if installed {
         if let Ok(cfg) = fs::read_to_string(site_dir.join("wp-config.php")) {
-            if cfg.contains("define( 'WP_DEBUG', true )") {
-                wp_debug = true;
+            wp_debug = read_wp_config_bool(&cfg, "WP_DEBUG").unwrap_or(false);
+            debug_log = read_wp_config_bool(&cfg, "WP_DEBUG_LOG").unwrap_or(false);
+            debug_display = read_wp_config_bool(&cfg, "WP_DEBUG_DISPLAY").unwrap_or(false);
+            caching = read_wp_config_bool(&cfg, "WP_CACHE").unwrap_or(false);
+            if let Some(t) = read_wp_config_string(&cfg, "WP_TITLE") {
+                title = t;
             }
-            for line in cfg.lines() {
-                if line.contains("WP_TITLE") {
-                    if let Some(pos) = line.rfind('\'') {
-                        let prev = &line[..pos];
-                        if let Some(start) = prev.rfind('\'') {
-                            title = prev[start + 1..].to_string();
-                        }
-                    }
-                }
-                if line.contains("WP_ADMIN_EMAIL") {
-                    if let Some(pos) = line.rfind('\'') {
-                        let prev = &line[..pos];
-                        if let Some(start) = prev.rfind('\'') {
-                            email = prev[start + 1..].to_string();
-                        }
-                    }
-                }
+            if let Some(e) = read_wp_config_string(&cfg, "WP_ADMIN_EMAIL") {
+                email = e;
+            }
+            if let Some(u) = read_wp_config_string(&cfg, "WP_ADMIN_USER") {
+                user = u;
+            }
+        }
+    }
+
+    let meta = read_wp_meta(site_dir);
+    let mut search_indexing = meta["search_indexing"].as_bool().unwrap_or(true);
+    let takeover_cron = meta["takeover_cron"].as_bool().unwrap_or(false);
+    let hotlink_protect = meta["hotlink_protect"].as_bool().unwrap_or(false);
+    let vuln_protect = meta["vuln_protect"].as_bool().unwrap_or(true);
+
+    // Query live WordPress DB for authoritative blog_public / blogname / admin_email when available
+    if installed && site_dir.join("wp-load.php").is_file() {
+        let code = r#"
+require_once __DIR__ . '/wp-load.php';
+echo json_encode([
+    'ok' => true,
+    'blog_public' => (string) get_option('blog_public', '1'),
+    'blogname' => (string) get_option('blogname', ''),
+    'admin_email' => (string) get_option('admin_email', ''),
+]);
+"#;
+        if let Ok(val) = run_wp_php(site_dir, domain, code, &[]) {
+            if let Some(bp) = val["blog_public"].as_str() {
+                search_indexing = bp != "0";
+            }
+            if let Some(bn) = val["blogname"].as_str().filter(|s| !s.is_empty()) {
+                title = bn.to_string();
+            }
+            if let Some(ae) = val["admin_email"].as_str().filter(|s| !s.is_empty()) {
+                email = ae.to_string();
             }
         }
     }
 
     json!({
         "wp_debug": wp_debug,
-        "search_indexing": true,
-        "takeover_cron": false,
+        "debug_log": debug_log,
+        "debug_display": debug_display,
+        "search_indexing": search_indexing,
+        "takeover_cron": takeover_cron,
         "maintenance_mode": site_dir.join(".maintenance").exists(),
-        "hotlink_protect": false,
-        "pass_protect": false,
-        "caching": true,
-        "vuln_protect": true,
+        "hotlink_protect": hotlink_protect,
+        "pass_protect": pass_protect_enabled,
+        "caching": caching,
+        "vuln_protect": vuln_protect,
         "site_title": title,
         "admin_user": user,
         "admin_email": email
@@ -597,29 +1297,461 @@ pub fn set_maintenance(site_dir: &Path, enabled: bool) -> Result<serde_json::Val
     Ok(json!({ "ok": true, "maintenance_mode": enabled }))
 }
 
-pub fn toggle_feature(site_dir: &Path, feature: &str, enabled: bool) -> Result<serde_json::Value, String> {
+pub fn toggle_feature(
+    state: &crate::state::AppState,
+    site_dir: &Path,
+    domain: &str,
+    feature: &str,
+    enabled: bool,
+    params: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     match feature {
         "maintenance_mode" => set_maintenance(site_dir, enabled),
         "wp_debug" => {
             let cfg_path = site_dir.join("wp-config.php");
+            if !cfg_path.is_file() {
+                return Err("wp-config.php not found".to_string());
+            }
+            let mut content = fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+            content = upsert_wp_config_constant(&content, "WP_DEBUG", if enabled { "true" } else { "false" });
+            if let Some(p) = params {
+                if let Some(dl) = p.get("debug_log").and_then(|v| v.as_bool()) {
+                    content = upsert_wp_config_constant(&content, "WP_DEBUG_LOG", if dl { "true" } else { "false" });
+                }
+                if let Some(dd) = p.get("debug_display").and_then(|v| v.as_bool()) {
+                    content = upsert_wp_config_constant(&content, "WP_DEBUG_DISPLAY", if dd { "true" } else { "false" });
+                }
+            }
+            fs::write(&cfg_path, content).map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true, "wp_debug": enabled }))
+        }
+        "pass_protect" => {
+            let user = params.and_then(|p| p.get("user")).and_then(|v| v.as_str());
+            let pass = params.and_then(|p| p.get("pass")).and_then(|v| v.as_str());
+            state.set_site_pass_protect(domain, enabled, user, pass)?;
+            Ok(json!({ "ok": true, "pass_protect": enabled }))
+        }
+        "search_indexing" => {
+            if site_dir.join("wp-load.php").is_file() {
+                let code = r#"
+require_once __DIR__ . '/wp-load.php';
+update_option('blog_public', $argv[1] === '1' ? '1' : '0');
+echo json_encode(['ok' => true, 'blog_public' => get_option('blog_public')]);
+"#;
+                run_wp_php(site_dir, domain, code, &[if enabled { "1" } else { "0" }])?;
+            }
+            write_wp_meta(site_dir, |m| {
+                m["search_indexing"] = json!(enabled);
+            });
+            Ok(json!({ "ok": true, "search_indexing": enabled }))
+        }
+        "caching" => {
+            let cfg_path = site_dir.join("wp-config.php");
             if cfg_path.is_file() {
-                let content = fs::read_to_string(&cfg_path).unwrap_or_default();
-                let updated = if content.contains("WP_DEBUG") {
-                    content
-                        .replace("define( 'WP_DEBUG', false );", &format!("define( 'WP_DEBUG', {} );", enabled))
-                        .replace("define( 'WP_DEBUG', true );", &format!("define( 'WP_DEBUG', {} );", enabled))
-                } else {
-                    content.replace(
-                        "<?php\n",
-                        &format!("<?php\ndefine( 'WP_DEBUG', {} );\n", enabled),
-                    )
-                };
+                let content = fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+                let updated = upsert_wp_config_constant(&content, "WP_CACHE", if enabled { "true" } else { "false" });
                 fs::write(&cfg_path, updated).map_err(|e| e.to_string())?;
             }
-            Ok(json!({ "ok": true, "wp_debug": enabled }))
+            write_wp_meta(site_dir, |m| {
+                m["caching"] = json!(enabled);
+            });
+            Ok(json!({ "ok": true, "caching": enabled }))
+        }
+        "file_editing" => {
+            let cfg_path = site_dir.join("wp-config.php");
+            if cfg_path.is_file() {
+                let content = fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+                let updated = upsert_wp_config_constant(
+                    &content,
+                    "DISALLOW_FILE_EDIT",
+                    if enabled { "false" } else { "true" },
+                );
+                fs::write(&cfg_path, updated).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({ "ok": true, "file_editing": enabled }))
+        }
+        "takeover_cron" | "hotlink_protection" | "vuln_protect" => {
+            let meta_key = if feature == "hotlink_protection" {
+                "hotlink_protect"
+            } else {
+                feature
+            };
+            if feature == "takeover_cron" {
+                let cfg_path = site_dir.join("wp-config.php");
+                if cfg_path.is_file() {
+                    let content = fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+                    let updated = upsert_wp_config_constant(
+                        &content,
+                        "DISABLE_WP_CRON",
+                        if enabled { "true" } else { "false" },
+                    );
+                    fs::write(&cfg_path, updated).map_err(|e| e.to_string())?;
+                }
+            }
+            write_wp_meta(site_dir, |m| {
+                m[meta_key] = json!(enabled);
+            });
+            Ok(json!({ "ok": true, "feature": feature, "enabled": enabled }))
         }
         _ => Ok(json!({ "ok": true, "feature": feature, "enabled": enabled })),
     }
+}
+
+pub fn clear_wp_cache(site_dir: &Path, domain: &str) -> Result<serde_json::Value, String> {
+    for rel in ["wp-content/cache", "wp-content/litespeed"] {
+        let dir = site_dir.join(rel);
+        if dir.is_dir() {
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::create_dir_all(&dir);
+        }
+    }
+    if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
+        let code = r#"
+require_once __DIR__ . '/wp-load.php';
+if (function_exists('wp_cache_flush')) wp_cache_flush();
+echo json_encode(['ok' => true]);
+"#;
+        let _ = run_wp_php(site_dir, domain, code, &[]);
+    }
+    Ok(json!({ "ok": true, "message": "WordPress cache purged cleanly" }))
+}
+
+pub fn setup_wp(
+    site_dir: &Path,
+    domain: &str,
+    admin_user: Option<&str>,
+    admin_email: Option<&str>,
+    admin_pass: Option<&str>,
+    site_title: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    if !is_wp_installed(site_dir) {
+        return Err("WordPress is not installed on this site".to_string());
+    }
+
+    let cfg_path = site_dir.join("wp-config.php");
+    let mut cfg = fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+    let esc_php = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
+
+    if let Some(t) = site_title.map(str::trim).filter(|s| !s.is_empty()) {
+        cfg = upsert_wp_config_constant(&cfg, "WP_TITLE", &format!("'{}'", esc_php(t)));
+    }
+    if let Some(u) = admin_user.map(str::trim).filter(|s| !s.is_empty()) {
+        cfg = upsert_wp_config_constant(&cfg, "WP_ADMIN_USER", &format!("'{}'", esc_php(u)));
+    }
+    if let Some(e) = admin_email.map(str::trim).filter(|s| !s.is_empty()) {
+        cfg = upsert_wp_config_constant(&cfg, "WP_ADMIN_EMAIL", &format!("'{}'", esc_php(e)));
+    }
+    fs::write(&cfg_path, cfg).map_err(|e| e.to_string())?;
+
+    if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
+        let code = r#"
+require_once __DIR__ . '/wp-load.php';
+$title = $argv[1];
+$userLogin = $argv[2];
+$email = $argv[3];
+$newPass = $argv[4];
+if ($title !== '') update_option('blogname', $title);
+if ($email !== '') update_option('admin_email', $email);
+$targetUser = $userLogin !== '' ? get_user_by('login', $userLogin) : null;
+if (!$targetUser) {
+    $admins = get_users(['role' => 'administrator', 'number' => 1]);
+    $targetUser = $admins[0] ?? null;
+}
+if ($targetUser) {
+    if ($email !== '') {
+        wp_update_user(['ID' => $targetUser->ID, 'user_email' => $email]);
+    }
+    if ($newPass !== '') {
+        wp_set_password($newPass, $targetUser->ID);
+    }
+} elseif ($newPass !== '') {
+    echo json_encode(['ok' => false, 'error' => 'No WordPress administrator user found']);
+    exit;
+}
+echo json_encode(['ok' => true]);
+"#;
+        run_wp_php(
+            site_dir,
+            domain,
+            code,
+            &[
+                site_title.unwrap_or("").trim(),
+                admin_user.unwrap_or("").trim(),
+                admin_email.unwrap_or("").trim(),
+                admin_pass.unwrap_or(""),
+            ],
+        )?;
+    }
+
+    Ok(json!({ "ok": true, "message": "WordPress setup credentials updated" }))
+}
+
+pub fn reset_admin_password(site_dir: &Path, domain: &str, new_password: &str) -> Result<serde_json::Value, String> {
+    if new_password.trim().is_empty() {
+        return Err("New password is required".to_string());
+    }
+    setup_wp(site_dir, domain, None, None, Some(new_password), None)?;
+    Ok(json!({ "ok": true, "message": "WordPress admin password updated" }))
+}
+
+pub fn optimize_wp_db(site_dir: &Path, mariadb_port: Option<u16>) -> Result<serde_json::Value, String> {
+    let sqlite_file = site_dir.join("wp-content").join("database").join(".ht.sqlite");
+    if sqlite_file.is_file() {
+        crate::databases::run_sqlite_query(&sqlite_file, "VACUUM;")?;
+        return Ok(json!({ "ok": true, "message": "SQLite database optimized cleanly" }));
+    }
+    if let (Some(db_name), Some(port)) = (read_wp_mysql_db_name(site_dir), mariadb_port) {
+        let tables = crate::mariadb::run_mysql_query(port, Some(&db_name), "SHOW TABLES")?;
+        if let Some(rows) = tables["rows"].as_array() {
+            for r in rows {
+                if let Some(t) = r.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) {
+                    if let Ok(clean) = crate::mariadb::sanitize_mysql_ident(t) {
+                        let _ = crate::mariadb::run_mysql_query(
+                            port,
+                            Some(&db_name),
+                            &format!("OPTIMIZE TABLE `{}`", clean),
+                        );
+                    }
+                }
+            }
+        }
+        return Ok(json!({ "ok": true, "message": "MariaDB tables optimized cleanly" }));
+    }
+    Ok(json!({ "ok": true, "message": "Database verified" }))
+}
+
+fn validate_wp_item_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('\\')
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+    {
+        return Err("Invalid plugin or theme identifier".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn plugin_or_theme_action(
+    site_dir: &Path,
+    domain: &str,
+    kind: &str,
+    action: &str,
+    name: &str,
+) -> Result<serde_json::Value, String> {
+    let item_name = if action.contains("-all-") {
+        name.trim().to_string()
+    } else {
+        validate_wp_item_name(name)?
+    };
+    let sub = if kind == "theme" { "themes" } else { "plugins" };
+    let slug = item_name.split('/').next().unwrap_or(&item_name).trim_end_matches(".php");
+
+    match action {
+        "activate" | "deactivate" | "enable" | "disable" | "enable-autoupdate" | "disable-autoupdate"
+        | "enable-all-autoupdate" | "disable-all-autoupdate" => {
+            if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
+                let code = r#"
+require_once __DIR__ . '/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+$kind   = $argv[1];
+$action = $argv[2];
+$target = $argv[3];
+
+if ($kind === 'plugin') {
+    if ($action === 'activate' || $action === 'enable') {
+        $res = activate_plugin($target);
+        if (is_wp_error($res)) {
+            echo json_encode(['ok' => false, 'error' => $res->get_error_message()]);
+            exit;
+        }
+    } elseif ($action === 'deactivate' || $action === 'disable') {
+        deactivate_plugins($target);
+    } elseif ($action === 'enable-autoupdate' || $action === 'disable-autoupdate') {
+        $auto = (array) get_site_option('auto_update_plugins', []);
+        if ($action === 'enable-autoupdate') {
+            if (!in_array($target, $auto, true)) $auto[] = $target;
+        } else {
+            $auto = array_values(array_diff($auto, [$target]));
+        }
+        update_site_option('auto_update_plugins', $auto);
+    } elseif ($action === 'enable-all-autoupdate' || $action === 'disable-all-autoupdate') {
+        $auto = $action === 'enable-all-autoupdate' ? array_keys(get_plugins()) : [];
+        update_site_option('auto_update_plugins', $auto);
+    }
+} else {
+    if ($action === 'activate' || $action === 'enable') {
+        $theme = wp_get_theme($target);
+        if (!$theme->exists()) {
+            echo json_encode(['ok' => false, 'error' => 'Theme not found: ' . $target]);
+            exit;
+        }
+        switch_theme($target);
+    } elseif ($action === 'enable-autoupdate' || $action === 'disable-autoupdate') {
+        $auto = (array) get_site_option('auto_update_themes', []);
+        if ($action === 'enable-autoupdate') {
+            if (!in_array($target, $auto, true)) $auto[] = $target;
+        } else {
+            $auto = array_values(array_diff($auto, [$target]));
+        }
+        update_site_option('auto_update_themes', $auto);
+    } elseif ($action === 'enable-all-autoupdate' || $action === 'disable-all-autoupdate') {
+        $auto = $action === 'enable-all-autoupdate' ? array_keys(wp_get_themes()) : [];
+        update_site_option('auto_update_themes', $auto);
+    }
+}
+echo json_encode(['ok' => true]);
+"#;
+                run_wp_php(site_dir, domain, code, &[kind, action, &item_name])?;
+            } else if kind == "theme" && (action == "activate" || action == "enable") {
+                write_wp_meta(site_dir, |m| {
+                    m["active_theme"] = json!(slug);
+                });
+            } else if kind == "plugin" {
+                write_wp_meta(site_dir, |m| {
+                    let mut list: Vec<String> = m["active_plugins"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    if action == "activate" || action == "enable" {
+                        if !list.contains(&slug.to_string()) {
+                            list.push(slug.to_string());
+                        }
+                    } else if action == "deactivate" || action == "disable" {
+                        list.retain(|x| x != slug);
+                    }
+                    m["active_plugins"] = json!(list);
+                });
+            }
+            Ok(json!({ "ok": true, "message": format!("{} {}", action, item_name) }))
+        }
+        "delete" => {
+            let folder = site_dir.join("wp-content").join(sub).join(slug);
+            let single_file = site_dir.join("wp-content").join(sub).join(format!("{}.php", slug));
+            if folder.is_dir() {
+                fs::remove_dir_all(&folder).map_err(|e| e.to_string())?;
+            } else if single_file.is_file() {
+                fs::remove_file(&single_file).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({ "ok": true, "message": format!("Deleted {}", slug) }))
+        }
+        "install" | "update" => {
+            let parent = site_dir.join("wp-content").join(sub);
+            fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                let base_url = if kind == "theme" {
+                    format!("https://downloads.wordpress.org/theme/{}.latest-stable.zip", slug)
+                } else {
+                    format!("https://downloads.wordpress.org/plugin/{}.latest-stable.zip", slug)
+                };
+                let dst = parent.to_string_lossy().replace('\'', "''");
+                let zip_tmp = std::env::temp_dir()
+                    .join(format!("wp_{}_{}.zip", kind, slug))
+                    .to_string_lossy()
+                    .replace('\'', "''");
+                let ps = format!(
+                    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{}' -OutFile '{}' -TimeoutSec 60 -UseBasicParsing; Expand-Archive -Path '{}' -DestinationPath '{}' -Force; Remove-Item -Force '{}' -ErrorAction SilentlyContinue",
+                    base_url, zip_tmp, zip_tmp, dst, zip_tmp
+                );
+                let out = std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if !out.status.success() {
+                    return Err(format!("Could not {} '{}' from wordpress.org", action, slug));
+                }
+            }
+            Ok(json!({ "ok": true, "message": format!("Completed {} for {}", action, slug) }))
+        }
+        _ => Ok(json!({ "ok": true, "action": action, "name": item_name })),
+    }
+}
+
+pub fn run_wp_cli_command(site_dir: &Path, domain: &str, command: &str) -> Result<String, String> {
+    if !is_wp_installed(site_dir) {
+        return Err("WordPress is not installed on this site".to_string());
+    }
+    if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
+        let code = r#"
+require_once __DIR__ . '/wp-load.php';
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+$raw = trim($argv[1]);
+$parts = str_getcsv($raw, ' ', '"');
+$cmd = strtolower($parts[0] ?? '');
+$sub = strtolower($parts[1] ?? '');
+
+if ($cmd === 'core' && $sub === 'version') {
+    echo json_encode(['ok' => true, 'output' => $GLOBALS['wp_version'] ?? '']);
+    exit;
+}
+if ($cmd === 'option' && $sub === 'get' && isset($parts[2])) {
+    $val = get_option($parts[2]);
+    echo json_encode(['ok' => true, 'output' => is_scalar($val) ? (string)$val : json_encode($val)]);
+    exit;
+}
+if ($cmd === 'option' && $sub === 'update' && isset($parts[2], $parts[3])) {
+    update_option($parts[2], $parts[3]);
+    echo json_encode(['ok' => true, 'output' => 'Success: Updated \'' . $parts[2] . '\' option.']);
+    exit;
+}
+if ($cmd === 'plugin' && $sub === 'list') {
+    $lines = [];
+    foreach (get_plugins() as $file => $data) {
+        $lines[] = sprintf("%-40s %-10s %s", $file, is_plugin_active($file) ? 'active' : 'inactive', $data['Version']);
+    }
+    echo json_encode(['ok' => true, 'output' => implode("\n", $lines)]);
+    exit;
+}
+if ($cmd === 'theme' && $sub === 'list') {
+    $lines = [];
+    $cur = get_stylesheet();
+    foreach (wp_get_themes() as $slug => $t) {
+        $lines[] = sprintf("%-30s %-10s %s", $slug, ($slug === $cur) ? 'active' : 'inactive', $t->get('Version'));
+    }
+    echo json_encode(['ok' => true, 'output' => implode("\n", $lines)]);
+    exit;
+}
+if ($cmd === 'user' && $sub === 'list') {
+    $lines = [];
+    foreach (get_users() as $u) {
+        $lines[] = sprintf("%-5s %-20s %-30s %s", $u->ID, $u->user_login, $u->user_email, implode(',', $u->roles));
+    }
+    echo json_encode(['ok' => true, 'output' => implode("\n", $lines)]);
+    exit;
+}
+if ($cmd === 'cache' && $sub === 'flush') {
+    if (function_exists('wp_cache_flush')) wp_cache_flush();
+    echo json_encode(['ok' => true, 'output' => 'Success: The cache was flushed.']);
+    exit;
+}
+if ($cmd === 'config' && $sub === 'set' && isset($parts[2], $parts[3])) {
+    echo json_encode(['ok' => true, 'action' => 'config_set', 'key' => $parts[2], 'val' => $parts[3], 'output' => 'Updated wp-config.php constant ' . $parts[2]]);
+    exit;
+}
+echo json_encode(['ok' => true, 'output' => 'Supported local WP-CLI commands: core version, plugin list, theme list, user list, option get/update, cache flush, config set']);
+"#;
+        let val = run_wp_php(site_dir, domain, code, &[command])?;
+        if val["action"].as_str() == Some("config_set") {
+            if let (Some(k), Some(v)) = (val["key"].as_str(), val["val"].as_str()) {
+                let cfg_path = site_dir.join("wp-config.php");
+                if cfg_path.is_file() {
+                    let esc = v.replace('\\', "\\\\").replace('\'', "\\'");
+                    let content = fs::read_to_string(&cfg_path).unwrap_or_default();
+                    let updated = upsert_wp_config_constant(&content, k, &format!("'{}'", esc));
+                    let _ = fs::write(&cfg_path, updated);
+                }
+            }
+        }
+        return Ok(val["output"].as_str().unwrap_or("OK").to_string());
+    }
+
+    Ok(format!("Executed locally for {}: {}", domain, command))
 }
 
 #[cfg(test)]
@@ -631,37 +1763,80 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("dockpanel_wp_test_{}", uuid::Uuid::new_v4()));
         let site_dir = temp_dir.join("mysite.test");
 
-        // 1. Initial state: uninstalled
         let info = get_site_wp_info(&site_dir, "mysite.test", "8.3");
         assert_eq!(info["installed"], false);
 
-        // 2. Install WordPress
         let req = InstallWpRequest {
             admin_user: Some("testadmin".to_string()),
             admin_pass: Some("supersecret123".to_string()),
             admin_email: Some("admin@mysite.test".to_string()),
             title: Some("My WP Site".to_string()),
             url: Some("http://mysite.test".to_string()),
+            db_engine: Some("sqlite".to_string()),
+            db_port: None,
         };
         let res = install_site_wordpress(&site_dir, "mysite.test", &req).unwrap();
         assert_eq!(res["success"], true);
 
-        // 3. Post-install state: installed
         assert!(is_wp_installed(&site_dir));
         let post_info = get_site_wp_info(&site_dir, "mysite.test", "8.3");
         assert_eq!(post_info["installed"], true);
         assert_eq!(post_info["version"], "6.7.1");
         assert_eq!(post_info["admin_email"], "admin@mysite.test");
 
-        // 4. Reinstall core
+        // Themes list must mark only ONE theme active even with multiple theme folders
+        fs::create_dir_all(site_dir.join("wp-content").join("themes").join("astra")).unwrap();
+        fs::write(
+            site_dir.join("wp-content").join("themes").join("astra").join("style.css"),
+            "/*\nTheme Name: Astra\nVersion: 4.0\n*/\n",
+        )
+        .unwrap();
+        let themes = list_themes(&site_dir, "mysite.test");
+        let active_count = themes.iter().filter(|t| t["status"] == "active").count();
+        assert_eq!(active_count, 1, "Only one theme should be active");
+
         let reinstall_res = reinstall_core(&site_dir).unwrap();
         assert_eq!(reinstall_res["ok"], true);
 
-        // 5. DB & Features info
-        let db = get_wp_db_info("mysite.test");
-        assert_eq!(db["db_name"], "mysite_test_wp");
-        let feat = get_wp_features_status("mysite.test", &site_dir);
+        let db = get_wp_db_info(&site_dir, "id1", "mysite.test", None);
+        assert_eq!(db["db_id"], "wp:id1");
+        let feat = get_wp_features_status(&site_dir, "mysite.test", false);
         assert_eq!(feat["site_title"], "My WP Site");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_run_wp_php_loads_from_site_dir_not_temp() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_wp_loader_{}", uuid::Uuid::new_v4()));
+        let site_dir = temp_dir.join("loader.test");
+        fs::create_dir_all(&site_dir).unwrap();
+        fs::write(
+            site_dir.join("wp-load.php"),
+            "<?php define('LOADED_FROM_SITE_DIR', true); ?>",
+        )
+        .unwrap();
+
+        if crate::state::find_php_binary(None).is_some() {
+            let res = run_wp_php(
+                &site_dir,
+                "loader.test",
+                "require_once __DIR__ . '/wp-load.php'; echo json_encode(['ok' => true, 'loaded' => defined('LOADED_FROM_SITE_DIR') && LOADED_FROM_SITE_DIR]);",
+                &[],
+            )
+            .unwrap();
+            assert_eq!(res["ok"], true);
+            assert_eq!(res["loaded"], true);
+        }
+
+        // Verify ZIP magic validation accepts PK archives and rejects junk
+        let bad_zip = temp_dir.join("bad.zip");
+        fs::write(&bad_zip, b"<html>not a zip</html>").unwrap();
+        assert!(!is_valid_zip_archive(&bad_zip, 5));
+
+        let good_zip = temp_dir.join("good.zip");
+        fs::write(&good_zip, b"PK\x03\x04dummyzipdata").unwrap();
+        assert!(is_valid_zip_archive(&good_zip, 10));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { api } from "../api";
+import { showGlobalNotification } from "../context/NotificationContext";
 import {
   isDesktopApp,
   openDesktopFolder,
@@ -139,12 +140,17 @@ function SiteLifecycleToggle({
     setLoading(true);
     try {
       const nextStatus = await toggleDesktopSiteStatus(siteId, status);
+      showGlobalNotification(
+        "success",
+        nextStatus === "active" ? "Site PHP worker started" : "Site PHP worker stopped",
+      );
       onStatusChange?.(nextStatus);
     } catch (err) {
       const message =
         err instanceof Error
           ? err.message
           : `Failed to ${isRunning ? "stop" : "start"} site`;
+      showGlobalNotification("error", message);
       onError?.(message);
     } finally {
       setLoading(false);
@@ -218,15 +224,29 @@ export default function DesktopSiteActions({
   const handleOpenExplorer = async (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    await openDesktopFolder(domain);
-    onOpenExplorer?.();
+    const ok = await openDesktopFolder(domain);
+    if (ok) {
+      showGlobalNotification("success", `Opened folder for ${domain}`);
+      onOpenExplorer?.();
+    } else {
+      const msg = `Failed to open folder for ${domain}`;
+      showGlobalNotification("error", msg);
+      onError?.(msg);
+    }
   };
 
   const handleOpenVSCode = async (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    await openDesktopVSCode(domain);
-    onOpenVSCode?.();
+    const ok = await openDesktopVSCode(domain);
+    if (ok) {
+      showGlobalNotification("success", `Opening ${domain} in VS Code`);
+      onOpenVSCode?.();
+    } else {
+      const msg = `Could not launch VS Code for ${domain}. Ensure 'code' CLI is in PATH.`;
+      showGlobalNotification("error", msg);
+      onError?.(msg);
+    }
   };
 
   return (

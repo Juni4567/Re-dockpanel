@@ -1,3 +1,5 @@
+import { api } from "../api";
+
 /**
  * Desktop Environment Detection & Path Utilities
  *
@@ -35,12 +37,81 @@ export function isDesktopApp(): boolean {
 }
 
 /**
- * Constructs the Windows WSL2 UNC path for a site's document root in the
- * dockpanel-desktop micro-instance:
- * \\wsl.localhost\dockpanel-desktop\var\www\<domain>
+ * Returns the default Windows folder path for a local site's document root.
  */
 export function getDesktopSitePath(domain: string): string {
-  return `\\\\wsl.localhost\\dockpanel-desktop\\var\\www\\${domain}`;
+  return `%USERPROFILE%\\DockPanel\\sites\\${domain}`;
+}
+
+function isPureRustDesktop(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    ((window as any).__DOCKPANEL__ !== undefined ||
+      (typeof import.meta !== "undefined" &&
+        import.meta.env &&
+        import.meta.env.VITE_APP_MODE === "desktop"))
+  );
+}
+
+/**
+ * Opens a local site folder in Windows File Explorer.
+ */
+export async function openDesktopFolder(domain: string): Promise<boolean> {
+  const path = getDesktopSitePath(domain);
+  if (isPureRustDesktop()) {
+    try {
+      await api.post("/desktop/open-folder", { domain });
+      return true;
+    } catch (err) {
+      console.warn("Failed to open folder in DockPanel Desktop:", err);
+      return false;
+    }
+  }
+  try {
+    const tauri = typeof window !== "undefined" ? (window as any).__TAURI__ : undefined;
+    if (!tauri) {
+      console.log(`[Desktop Fallback] Open folder: ${path}`);
+      return true;
+    }
+    await invokeDesktop("open_folder", { path });
+    return true;
+  } catch (primaryErr) {
+    try {
+      await invokeDesktop("open_site_folder", { path });
+      return true;
+    } catch {
+      console.warn("Failed to open folder in desktop environment:", primaryErr);
+      return false;
+    }
+  }
+}
+
+/**
+ * Opens a local site in VS Code.
+ */
+export async function openDesktopVSCode(domain: string): Promise<boolean> {
+  const path = getDesktopSitePath(domain);
+  if (isPureRustDesktop()) {
+    try {
+      await api.post("/desktop/open-vscode", { domain });
+      return true;
+    } catch (err) {
+      console.warn("Failed to open VS Code in DockPanel Desktop:", err);
+      return false;
+    }
+  }
+  try {
+    const tauri = typeof window !== "undefined" ? (window as any).__TAURI__ : undefined;
+    if (!tauri) {
+      console.log(`[Desktop Fallback] Open VS Code: ${path}`);
+      return true;
+    }
+    await invokeDesktop("open_vscode", { path });
+    return true;
+  } catch (err) {
+    console.warn("Failed to open VS Code in desktop environment:", err);
+    return false;
+  }
 }
 
 /**
@@ -62,49 +133,6 @@ export async function invokeDesktop(cmd: string, args?: Record<string, unknown>)
 }
 
 /**
- * Opens a local site folder in Windows File Explorer via Tauri WSL UNC path.
- */
-export async function openDesktopFolder(domain: string): Promise<boolean> {
-  const path = getDesktopSitePath(domain);
-  try {
-    const tauri = typeof window !== "undefined" ? (window as any).__TAURI__ : undefined;
-    if (!tauri) {
-      console.log(`[Desktop Fallback] Open folder: ${path}`);
-      return true;
-    }
-    await invokeDesktop("open_folder", { path });
-    return true;
-  } catch (primaryErr) {
-    try {
-      await invokeDesktop("open_site_folder", { path });
-      return true;
-    } catch {
-      console.warn("Failed to open folder in desktop environment:", primaryErr);
-      return false;
-    }
-  }
-}
-
-/**
- * Opens a local site in VS Code via Tauri WSL UNC path.
- */
-export async function openDesktopVSCode(domain: string): Promise<boolean> {
-  const path = getDesktopSitePath(domain);
-  try {
-    const tauri = typeof window !== "undefined" ? (window as any).__TAURI__ : undefined;
-    if (!tauri) {
-      console.log(`[Desktop Fallback] Open VS Code: ${path}`);
-      return true;
-    }
-    await invokeDesktop("open_vscode", { path });
-    return true;
-  } catch (err) {
-    console.warn("Failed to open VS Code in desktop environment:", err);
-    return false;
-  }
-}
-
-/**
  * Formats a local domain name ensuring the desired suffix (.test or .local) is present
  * without accidental duplication.
  */
@@ -116,13 +144,8 @@ export function formatDesktopDomain(name: string, suffix: string = ".test"): str
 }
 
 /**
- * Navigation paths that only make sense on a multi-tenant or internet-facing VPS
- * and are pruned from local desktop navigation:
- * - DNS (local hosts helper handles .test/.local)
- * - Security/Firewall (local developer workstation, no public attack surface)
- * - Monitoring (remote server uptime pinging not applicable locally)
- * - Reseller / My Users / Resellers (no multi-tenant client hosting)
- * - Fleet Servers (runs only on local WSL2 instance)
+ * Navigation paths that only make sense on a Linux VPS, Docker fleet, or multi-tenant server
+ * and are pruned from local Windows DockPanel Desktop navigation.
  */
 export const SERVER_ONLY_NAV_PATHS: readonly string[] = [
   "/dns",
@@ -132,6 +155,19 @@ export const SERVER_ONLY_NAV_PATHS: readonly string[] = [
   "/reseller",
   "/reseller/users",
   "/resellers",
+  "/apps",
+  "/git-deploys",
+  "/migration",
+  "/cdn",
+  "/mail",
+  "/backup-orchestrator",
+  "/container-policies",
+  "/integrations",
+  "/secrets",
+  "/telemetry",
+  "/terminal",
+  "/users",
+  "/updates",
 ];
 
 export function isServerOnlyPath(path: string): boolean {
