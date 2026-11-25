@@ -89,13 +89,19 @@ Assert-Condition (Test-Path $BannerPath) "Wizard banner exists at assets\banner.
 # -------------------------------------------------------------------
 # Test 4: PowerShell Syntax Validation
 # -------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Test 4: PowerShell Syntax Validation
+# -------------------------------------------------------------------
 Write-Host "`nTest 4: Verifying PowerShell syntax integrity..." -ForegroundColor Yellow
-$errors = $null
-$null = [System.Management.Automation.Language.Parser]::ParseFile($InstallPs1Path, [ref]$null, [ref]$errors)
-Assert-Condition ($errors.Count -eq 0) "install.ps1 parsed with 0 syntax errors"
+$tokens = $null
+$parseErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile($InstallPs1Path, [ref]$tokens, [ref]$parseErrors)
+Assert-Condition ($parseErrors.Count -eq 0) "install.ps1 parsed with 0 syntax errors"
 
-$null = [System.Management.Automation.Language.Parser]::ParseFile($UninstallPs1Path, [ref]$null, [ref]$errors)
-Assert-Condition ($errors.Count -eq 0) "uninstall.ps1 parsed with 0 syntax errors"
+$tokens = $null
+$parseErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile($UninstallPs1Path, [ref]$tokens, [ref]$parseErrors)
+Assert-Condition ($parseErrors.Count -eq 0) "uninstall.ps1 parsed with 0 syntax errors"
 
 # -------------------------------------------------------------------
 # Summary

@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     DockPanel Desktop - Native Standalone Windows Installer
 .DESCRIPTION
@@ -38,7 +38,7 @@ Start-Sleep -Seconds 1
 Write-Host "`n[2/5] Creating application directories..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path "$InstallDir\assets" | Out-Null
-Write-Host "✓ Directories created at $InstallDir" -ForegroundColor Green
+Write-Host "[OK] Directories created at $InstallDir" -ForegroundColor Green
 
 # 3. Locate & Copy Binaries
 Write-Host "`n[3/5] Copying binaries and runtime assets..." -ForegroundColor Yellow
@@ -73,14 +73,14 @@ if (Test-Path $SourceMkcert) {
 }
 Copy-Item -Force $SourceAppIcon "$InstallDir\assets\app.ico"
 Copy-Item -Force $SourceBanner "$InstallDir\assets\banner.bmp"
-Write-Host "✓ Application files copied successfully." -ForegroundColor Green
+Write-Host "[OK] Application files copied successfully." -ForegroundColor Green
 
 # 4. Register and Start Host Helper Windows Service & Configure Local Hosts
 Write-Host "`n[4/5] Registering Host Helper background service and local hosts..." -ForegroundColor Yellow
 if (Test-Path "$InstallDir\dockpanel-host-helper.exe") {
     sc.exe create DockPanelHostHelper binPath= "`"$InstallDir\dockpanel-host-helper.exe`"" start= auto obj= "LocalSystem" | Out-Null
     sc.exe start DockPanelHostHelper | Out-Null
-    Write-Host "✓ DockPanelHostHelper service registered and running." -ForegroundColor Green
+    Write-Host "[OK] DockPanelHostHelper service registered and running." -ForegroundColor Green
 }
 
 # Ensure seed test domains exist in hosts
@@ -97,7 +97,7 @@ if (Test-Path $hostsPath) {
     if ($needed.Count -gt 0) {
         $addStr = ($needed -join "`r`n") + "`r`n"
         Add-Content -Path $hostsPath -Value $addStr -NoNewline
-        Write-Host "✓ Initial test domains configured in hosts file ($($domainsToAdd -join ', '))." -ForegroundColor Green
+        Write-Host "[OK] Initial test domains configured in hosts file ($($domainsToAdd -join ', '))." -ForegroundColor Green
     }
 }
 
@@ -105,7 +105,7 @@ if (Test-Path $hostsPath) {
 if (Test-Path "$InstallDir\mkcert.exe") {
     Write-Host "`n[5/5] Installing local Root CA for green-padlock HTTPS..." -ForegroundColor Yellow
     & "$InstallDir\mkcert.exe" -install
-    Write-Host "✓ Local Root CA trusted in Windows system store." -ForegroundColor Green
+    Write-Host "[OK] Local Root CA trusted in Windows system store." -ForegroundColor Green
 }
 
 # 6. Create Shortcuts (Desktop & Start Menu)
@@ -130,3 +130,4 @@ Write-Host "  Installation Complete! DockPanel Desktop is ready to use." -Foregr
 Write-Host "==========================================================" -ForegroundColor Green
 Write-Host "Location: $InstallDir\DockPanel Desktop.exe" -ForegroundColor White
 Write-Host "Desktop shortcut created on your desktop." -ForegroundColor White
+
