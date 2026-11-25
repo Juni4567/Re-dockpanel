@@ -29,6 +29,28 @@ use wry::WebViewBuilder;
 #[folder = "../../panel/frontend/dist/"]
 struct Assets;
 
+pub fn open_external_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let res = std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", trimmed])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        res.is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = trimmed;
+        true
+    }
+}
+
 fn resolve_desktop_path(raw: &str) -> String {
     if raw.contains("dockpanel-desktop") {
         if let Some(domain) = raw.split('\\').filter(|s| !s.is_empty()).last() {
@@ -814,6 +836,43 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         };
+
+        window.addEventListener('error', function(e) {
+            try {
+                if (window.ipc) {
+                    window.ipc.postMessage(JSON.stringify({
+                        cmd: "log_error",
+                        args: { message: "WINDOW ERROR: " + (e.message || "unknown") + " at " + (e.filename || "unknown") + ":" + e.lineno + ":" + e.colno + " stack: " + (e.error ? e.error.stack : "") }
+                    }));
+                }
+            } catch (_) {}
+        });
+
+        window.addEventListener('unhandledrejection', function(e) {
+            try {
+                if (window.ipc) {
+                    window.ipc.postMessage(JSON.stringify({
+                        cmd: "log_error",
+                        args: { message: "UNHANDLED REJECTION: " + (e.reason ? (e.reason.stack || e.reason.message || e.reason) : e) }
+                    }));
+                }
+            } catch (_) {}
+        });
+
+        var _origConsoleError = console.error;
+        console.error = function() {
+            try {
+                var args = Array.prototype.slice.call(arguments);
+                _origConsoleError.apply(console, args);
+                if (window.ipc) {
+                    window.ipc.postMessage(JSON.stringify({
+                        cmd: "log_error",
+                        args: { message: "CONSOLE ERROR: " + args.join(" ") }
+                    }));
+                }
+            } catch (_) {}
+        };
+
         console.log("DockPanel Desktop (Pure Rust Edition) connected to embedded engine.");
     "#;
 
@@ -826,11 +885,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let _webview = WebViewBuilder::with_web_context(&mut web_context)
         .with_devtools(true)
         .with_initialization_script(init_script)
+        .with_new_window_req_handler(|uri| {
+            open_external_url(&uri);
+            false
+        })
         .with_ipc_handler(move |request| {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&request.body()) {
                 let cmd = val.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
                 let args = val.get("args");
                 match cmd {
+                    "log_error" | "log_info" => {
+                        if let Some(msg) = args.and_then(|a| a.get("message")).and_then(|m| m.as_str()) {
+                            use std::io::Write;
+                            let app_data = std::env::var("APPDATA")
+                                .unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()));
+                            let log_file = std::path::PathBuf::from(app_data).join("DockPanel").join("webview_console.log");
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {
+                                let _ = writeln!(f, "[{}] {}", cmd, msg);
+                            }
+                        }
+                    }
+                    "open_url" | "open_external" => {
+                        if let Some(url) = args.and_then(|a| a.get("url")).and_then(|u| u.as_str()) {
+                            open_external_url(url);
+                        }
+                    }
                     "open_folder" | "open_site_folder" => {
                         if let Some(path) = args.and_then(|a| a.get("path")).and_then(|p| p.as_str()) {
                             let resolved = resolve_desktop_path(path);
@@ -868,6 +947,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_open_external_url_validation() {
+        assert!(!open_external_url("file:///C:/Windows/System32/calc.exe"));
+        assert!(!open_external_url("javascript:alert(1)"));
+        assert!(!open_external_url(""));
+        assert!(!open_external_url("   "));
+        assert!(!open_external_url("cmd.exe /c calc"));
+    }
 
     #[tokio::test]
     async fn test_static_handler_serves_assets() {
