@@ -304,12 +304,28 @@ export default function WordPress() {
     setBusy("install");
     setWpInstallId(null);
     try {
+      // Only include DB fields in the payload if the user explicitly filled them in.
+      // Omitting them lets the backend auto-provision a MariaDB container for live sites,
+      // and avoids sending db_host:"localhost" which would cause wp-cli to try a Unix socket.
+      const hasExplicitDb =
+        installData.db_name.trim() !== "" &&
+        installData.db_user.trim() !== "" &&
+        installData.db_host.trim() !== "" &&
+        installData.db_host.trim() !== "localhost";
       const payload = {
-        ...installData,
+        admin_user: installData.admin_user,
         admin_pass: installData.admin_pass,
         title: installData.title || "My WordPress Site",
         url: installData.url || defaultInstallUrl,
         admin_email: installData.admin_email || (site?.domain ? `admin@${site.domain}` : ""),
+        ...(hasExplicitDb
+          ? {
+              db_name: installData.db_name,
+              db_user: installData.db_user,
+              db_pass: installData.db_pass,
+              db_host: installData.db_host,
+            }
+          : {}),
         ...(desktop ? { stream: true } : {}),
       };
       const res = await api.post<{ install_id?: string }>(`/sites/${id}/wordpress/install`, payload);

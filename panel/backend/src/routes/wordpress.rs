@@ -239,16 +239,22 @@ pub async fn install(
 
     // One-click installs from WP Toolkit omit DB fields; ensure a site MariaDB container
     // exists and pass 127.0.0.1:<port> so wp-cli does not fall back to localhost Unix socket.
+    // We also treat db_host = "localhost" as "not provided" because wp-cli would use
+    // a Unix socket for that value which does not exist on the live server.
     let needs_db_creds = body
         .as_object()
         .map(|obj| {
-            let has = |k: &str| {
+            let has_real = |k: &str| {
                 obj.get(k)
                     .and_then(|v| v.as_str())
-                    .map(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        let t = s.trim();
+                        !t.is_empty() && t != "localhost"
+                    })
                     .unwrap_or(false)
             };
-            !(has("db_host") && has("db_name") && has("db_user"))
+            // All three must be explicitly provided and non-"localhost" to skip provisioning
+            !(has_real("db_host") && has_real("db_name") && has_real("db_user"))
         })
         .unwrap_or(true);
 
