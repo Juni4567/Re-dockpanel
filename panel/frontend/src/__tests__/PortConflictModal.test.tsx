@@ -106,19 +106,19 @@ describe("PortConflictModal & Dynamic URL Helpers", () => {
     expect(isKillablePid(1234)).toBe(true);
   });
 
-  it("builds dynamic external site URLs with active port in desktop mode", () => {
+  it("builds dynamic external site URLs with active port and HTTPS in desktop mode", () => {
     (window as any).__TAURI__ = {};
     expect(buildSiteExternalUrl("mytestdomain.local", 8080, false)).toBe(
       "http://mytestdomain.local:8080"
     );
-    expect(buildSiteExternalUrl("mytestdomain.local", 3000, true)).toBe(
-      "http://mytestdomain.local:3000"
+    expect(buildSiteExternalUrl("mytestdomain.local", 8443, true)).toBe(
+      "https://mytestdomain.local:8443"
     );
     expect(buildSiteExternalUrl("mytestdomain.local", 80, false)).toBe(
       "http://mytestdomain.local"
     );
     expect(buildSiteExternalUrl("mytestdomain.local", 443, true)).toBe(
-      "http://mytestdomain.local"
+      "https://mytestdomain.local"
     );
   });
 

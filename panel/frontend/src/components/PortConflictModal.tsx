@@ -37,10 +37,10 @@ export function buildSiteExternalUrl(
   activePort?: number | null,
   sslEnabled?: boolean
 ): string {
-  const port = activePort || 80;
+  const protocol = sslEnabled ? "https" : "http";
+  const port = activePort || (sslEnabled ? 443 : 80);
   const desktop = isDesktopApp();
   const portSuffix = desktop && port !== 80 && port !== 443 ? `:${port}` : "";
-  const protocol = !desktop && sslEnabled ? "https" : "http";
   return `${protocol}://${domain}${portSuffix}`;
 }
 
