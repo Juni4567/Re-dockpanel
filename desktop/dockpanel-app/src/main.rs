@@ -5246,10 +5246,6 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--server-only") {
         let state = Arc::new(AppState::new());
-        if state.list_sites().is_empty() {
-            let _ = state.create_site("mytestdomain.local", Some("8.3"));
-            let _ = state.create_site("wordpress.test", Some("8.3"));
-        }
         let port = start_embedded_server(state);
         println!("DOCKPANEL_EMBEDDED_PORT={}", port);
         std::thread::park();
@@ -5263,12 +5259,6 @@ fn main() {
 
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState::new());
-
-    // Auto-seed demo sites if empty
-    if state.list_sites().is_empty() {
-        let _ = state.create_site("mytestdomain.local", Some("8.3"));
-        let _ = state.create_site("wordpress.test", Some("8.3"));
-    }
 
     // Start in-memory embedded HTTP server
     let port = start_embedded_server(state.clone());

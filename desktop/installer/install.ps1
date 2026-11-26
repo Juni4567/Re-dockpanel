@@ -75,30 +75,12 @@ Copy-Item -Force $SourceAppIcon "$InstallDir\assets\app.ico"
 Copy-Item -Force $SourceBanner "$InstallDir\assets\banner.bmp"
 Write-Host "[OK] Application files copied successfully." -ForegroundColor Green
 
-# 4. Register and Start Host Helper Windows Service & Configure Local Hosts
-Write-Host "`n[4/5] Registering Host Helper background service and local hosts..." -ForegroundColor Yellow
+# 4. Register and Start Host Helper Windows Service
+Write-Host "`n[4/5] Registering Host Helper background service..." -ForegroundColor Yellow
 if (Test-Path "$InstallDir\dockpanel-host-helper.exe") {
     sc.exe create DockPanelHostHelper binPath= "`"$InstallDir\dockpanel-host-helper.exe`"" start= auto obj= "LocalSystem" | Out-Null
     sc.exe start DockPanelHostHelper | Out-Null
     Write-Host "[OK] DockPanelHostHelper service registered and running." -ForegroundColor Green
-}
-
-# Ensure seed test domains exist in hosts
-$hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
-if (Test-Path $hostsPath) {
-    $hostsContent = Get-Content -Raw $hostsPath
-    $domainsToAdd = @("mytestdomain.local", "wordpress.test")
-    $needed = @()
-    foreach ($d in $domainsToAdd) {
-        if ($hostsContent -notmatch "(?m)^\s*127\.0\.0\.1\s+$([regex]::Escape($d))\b") {
-            $needed += "127.0.0.1 $d # dockpanel-desktop"
-        }
-    }
-    if ($needed.Count -gt 0) {
-        $addStr = ($needed -join "`r`n") + "`r`n"
-        Add-Content -Path $hostsPath -Value $addStr -NoNewline
-        Write-Host "[OK] Initial test domains configured in hosts file ($($domainsToAdd -join ', '))." -ForegroundColor Green
-    }
 }
 
 # 5. Trust Local Root CA with mkcert
