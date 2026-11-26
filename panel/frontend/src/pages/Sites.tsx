@@ -101,6 +101,24 @@ export default function Sites() {
   const [wpDbEngine, setWpDbEngine] = useState<"sqlite" | "mariadb">("sqlite");
   const [customRootPath, setCustomRootPath] = useState("");
   const [defaultSitesDir, setDefaultSitesDir] = useState("");
+  const [browsingFolder, setBrowsingFolder] = useState(false);
+  const [folderInspection, setFolderInspection] = useState<{
+    path: string;
+    exists: boolean;
+    is_dir: boolean;
+    is_empty: boolean;
+    file_count: number;
+    detected_type: string;
+    is_wordpress: boolean;
+    has_wp_config: boolean;
+    wp_version?: string | null;
+    wp_table_prefix?: string | null;
+    wp_db_name?: string | null;
+    wp_siteurl?: string | null;
+  } | null>(null);
+  const [wpDbFile, setWpDbFile] = useState<File | null>(null);
+  const [wpSourceUrl, setWpSourceUrl] = useState("");
+  const [skipWpDbUpload, setSkipWpDbUpload] = useState(false);
   const [sslPort, setSslPort] = useState<number | null>(null);
   const [enableBackup, setEnableBackup] = useState(false);
   const [backupFrequency, setBackupFrequency] = useState("daily");
@@ -184,6 +202,78 @@ export default function Sites() {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const trimmed = customRootPath.trim();
+    if (!trimmed) {
+      setFolderInspection(null);
+      setWpDbFile(null);
+      setWpSourceUrl("");
+      setSkipWpDbUpload(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      api
+        .post<NonNullable<typeof folderInspection>>("/desktop/inspect-folder", { path: trimmed })
+        .then((insp) => applyFolderInspection(insp))
+        .catch(() => {});
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [customRootPath]);
+
+  const applyFolderInspection = (insp: NonNullable<typeof folderInspection>) => {
+    setFolderInspection(insp);
+    if (insp.is_wordpress) {
+      setCms("");
+      setRuntime("php");
+      setPhpPreset("wordpress");
+      if (insp.wp_siteurl && !wpSourceUrl) {
+        setWpSourceUrl(insp.wp_siteurl);
+      }
+    } else if (!insp.is_empty && insp.exists && insp.is_dir) {
+      setCms("");
+      if (insp.detected_type === "node") setRuntime("node");
+      else if (insp.detected_type === "php") setRuntime("php");
+      else if (insp.detected_type === "static") setRuntime("static");
+    }
+  };
+
+  const handleBrowseFolder = async () => {
+    setError("");
+    setBrowsingFolder(true);
+    try {
+      const res = await api.post<{
+        cancelled: boolean;
+        path?: string;
+        inspection?: NonNullable<typeof folderInspection>;
+      }>("/desktop/pick-folder", {
+        initial_dir: customRootPath.trim() || defaultSitesDir || undefined,
+      });
+      if (!res.cancelled && res.path) {
+        setCustomRootPath(res.path);
+        if (res.inspection) {
+          applyFolderInspection(res.inspection);
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed opening folder picker");
+    } finally {
+      setBrowsingFolder(false);
+    }
+  };
+
+  const fileToBase64 = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        const commaIdx = result.indexOf(",");
+        resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+      };
+      reader.onerror = () => reject(new Error("Failed reading selected database file"));
+      reader.readAsDataURL(file);
+    });
+
   // The transfer recipient is picked, not typed. A free-text email could only
   // ever fail late — `transfer` answers 404 "No account with that email" — and
   // an operator does not carry their clients' addresses in their head.
@@ -195,10 +285,17 @@ export default function Sites() {
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+
+    const isExistingWpDir = isDesktopApp() && !!folderInspection?.is_wordpress;
+    if (isExistingWpDir && !skipWpDbUpload && !wpDbFile) {
+      setError("Existing WordPress directory detected — please upload a database dump (.sql, .sql.gz, .zip, or .sqlite) or check 'Skip database upload for now'.");
+      return;
+    }
+
     setSubmitting(true);
     try {
-      const effectiveRuntime = cms ? "php" : runtime;
-      const effectivePreset = cms || phpPreset;
+      const effectiveRuntime = isExistingWpDir ? "php" : (cms ? "php" : runtime);
+      const effectivePreset = isExistingWpDir ? "wordpress" : (cms || phpPreset);
       const effectiveDomainToCreate = isDesktopApp() ? formatDesktopDomain(domain, domainSuffix) : domain;
       const body: Record<string, unknown> = {
         domain: effectiveDomainToCreate,
@@ -215,8 +312,11 @@ export default function Sites() {
       }
       if (isDesktopApp() && customRootPath.trim()) {
         body.document_root = customRootPath.trim();
+        if (folderInspection && !folderInspection.is_empty) {
+          body.connect_existing = true;
+        }
       }
-      if (cms) {
+      if (cms && !isExistingWpDir) {
         body.cms = cms;
         if (cms === "wordpress" && isDesktopApp()) body.db_engine = wpDbEngine;
         if (siteTitle) body.site_title = siteTitle;
@@ -233,9 +333,33 @@ export default function Sites() {
       }
 
       const created = await api.post<Site>("/sites", body);
+
+      if (isExistingWpDir && wpDbFile && !skipWpDbUpload) {
+        showGlobalNotification("info", `Importing WordPress database for ${created.domain}...`);
+        const contentBase64 = await fileToBase64(wpDbFile);
+        const targetUrl =
+          sslPort && created.ssl_enabled
+            ? buildSiteExternalUrl(created.domain, sslPort, true)
+            : buildSiteExternalUrl(created.domain, conflictInfo?.active_port, false);
+        const imp = await api.post<{ db_name: string; rewritten?: boolean; source_url?: string | null }>(
+          `/sites/${created.id}/wordpress/import-database`,
+          {
+            filename: wpDbFile.name,
+            content_base64: contentBase64,
+            source_url: wpSourceUrl.trim() || undefined,
+            target_url: targetUrl,
+          },
+        );
+        showGlobalNotification(
+          "success",
+          `Connected ${created.domain} (${imp.db_name}) and updated wp-config.php`,
+        );
+      } else {
+        setProvisioningSiteId(created.id);
+        showGlobalNotification("info", `Creating local site ${created.domain}...`);
+      }
+
       setShowForm(false);
-      setProvisioningSiteId(created.id);
-      showGlobalNotification("info", `Creating local site ${created.domain}...`);
       setDomain("");
       setDomainSuffix(".test");
       setRuntime("static");
@@ -247,6 +371,10 @@ export default function Sites() {
       setAdminPassword("");
       setWpDbEngine("sqlite");
       setCustomRootPath("");
+      setFolderInspection(null);
+      setWpDbFile(null);
+      setWpSourceUrl("");
+      setSkipWpDbUpload(false);
       setEnableBackup(false);
       setBackupFrequency("daily");
       setBackupRetention(7);
@@ -560,25 +688,145 @@ export default function Sites() {
           )}
 
           {isDesktopApp() && (
-            <div>
-              <label htmlFor="site-custom-root" className="block text-sm font-medium text-dark-100 mb-1">
-                Website Folder Path <span className="text-xs text-dark-400 font-normal">(optional custom location)</span>
-              </label>
-              <input
-                id="site-custom-root"
-                type="text"
-                value={customRootPath}
-                onChange={(e) => setCustomRootPath(e.target.value)}
-                placeholder={
-                  defaultSitesDir
-                    ? `${defaultSitesDir}\\${effectiveDomain || "mysite.test"}`
-                    : `C:\\Users\\...\\DockPanel\\sites\\${effectiveDomain || "mysite.test"}`
-                }
-                className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm font-mono"
-              />
-              <p className="text-xs text-dark-400 mt-1">
-                Leave empty to use your default websites directory.
-              </p>
+            <div className="space-y-3">
+              <div>
+                <label htmlFor="site-custom-root" className="block text-sm font-medium text-dark-100 mb-1">
+                  Website Folder Path <span className="text-xs text-dark-400 font-normal">(empty or existing site directory)</span>
+                </label>
+                <div className="flex items-stretch gap-2">
+                  <input
+                    id="site-custom-root"
+                    type="text"
+                    value={customRootPath}
+                    onChange={(e) => setCustomRootPath(e.target.value)}
+                    placeholder={
+                      defaultSitesDir
+                        ? `${defaultSitesDir}\\${effectiveDomain || "mysite.test"}`
+                        : `C:\\Users\\...\\DockPanel\\sites\\${effectiveDomain || "mysite.test"}`
+                    }
+                    className="flex-1 px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleBrowseFolder}
+                    disabled={browsingFolder}
+                    className="px-4 py-2.5 bg-dark-700 hover:bg-dark-600 text-dark-100 border border-dark-500 rounded-lg text-sm font-medium transition-colors whitespace-nowrap disabled:opacity-50"
+                  >
+                    {browsingFolder ? "Opening..." : "Browse..."}
+                  </button>
+                  {customRootPath && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCustomRootPath("");
+                        setFolderInspection(null);
+                        setWpDbFile(null);
+                      }}
+                      className="px-3 py-2.5 bg-dark-800 hover:bg-dark-700 text-dark-300 border border-dark-600 rounded-lg text-xs"
+                      title="Reset to default folder"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-dark-400 mt-1">
+                  Browse for an empty folder or an existing website folder to connect it locally. Leave empty to use the default directory.
+                </p>
+
+                {folderInspection && customRootPath.trim() && (
+                  <div
+                    className={`mt-2 px-3 py-2 rounded-lg border text-xs flex items-center justify-between gap-2 ${
+                      folderInspection.is_wordpress
+                        ? "bg-accent-950/30 border-accent-700/50 text-accent-200"
+                        : folderInspection.is_empty
+                        ? "bg-dark-800 border-dark-600 text-dark-200"
+                        : folderInspection.detected_type === "invalid"
+                        ? "bg-red-950/40 border-red-800/50 text-red-300"
+                        : "bg-emerald-950/30 border-emerald-800/40 text-emerald-300"
+                    }`}
+                  >
+                    <span>
+                      {folderInspection.detected_type === "invalid"
+                        ? "Selected path is a file, not a folder."
+                        : !folderInspection.exists
+                        ? "New folder — will be created empty."
+                        : folderInspection.is_empty
+                        ? "Empty directory — ready for a new website."
+                        : folderInspection.is_wordpress
+                        ? `Existing WordPress directory detected${folderInspection.wp_version ? ` (v${folderInspection.wp_version})` : ""} — files will be connected without overwriting.`
+                        : `Existing ${folderInspection.detected_type.toUpperCase()} website detected (${folderInspection.file_count} items) — files will be connected without overwriting.`}
+                    </span>
+                    {folderInspection.wp_db_name && (
+                      <span className="font-mono text-[11px] text-dark-300 shrink-0">
+                        DB: {folderInspection.wp_db_name}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {folderInspection?.is_wordpress && (
+                <div className="p-4 rounded-lg bg-dark-850 border border-accent-700/50 space-y-3">
+                  <div>
+                    <h4 className="text-sm font-medium text-dark-50">
+                      Upload WordPress Database Dump
+                    </h4>
+                    <p className="text-xs text-dark-300 mt-0.5">
+                      Upload your <code className="text-dark-100">.sql</code>,{" "}
+                      <code className="text-dark-100">.sql.gz</code>, <code className="text-dark-100">.zip</code>, or{" "}
+                      <code className="text-dark-100">.sqlite</code> export. DockPanel will rewrite URLs for{" "}
+                      <span className="font-mono text-accent-300">{effectiveDomain || "this site"}</span>, import it into local MariaDB, and update{" "}
+                      <code className="text-dark-100">wp-config.php</code> credentials automatically.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <label htmlFor="wp-db-upload" className="block text-xs font-medium text-dark-200 mb-1">
+                        Database File
+                      </label>
+                      <input
+                        id="wp-db-upload"
+                        type="file"
+                        accept=".sql,.gz,.sql.gz,.zip,.sqlite,.db"
+                        disabled={skipWpDbUpload}
+                        onChange={(e) => setWpDbFile(e.target.files?.[0] || null)}
+                        className="w-full text-xs text-dark-200 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-accent-600 file:text-white hover:file:bg-accent-500 disabled:opacity-40"
+                      />
+                      {wpDbFile && (
+                        <p className="text-[11px] text-emerald-300 mt-1 font-mono">
+                          Selected: {wpDbFile.name} ({Math.max(1, Math.round(wpDbFile.size / 1024))} KB)
+                        </p>
+                      )}
+                    </div>
+
+                    <div>
+                      <label htmlFor="wp-source-url" className="block text-xs font-medium text-dark-200 mb-1">
+                        Source Site URL <span className="text-dark-400 font-normal">(auto-detected if blank)</span>
+                      </label>
+                      <input
+                        id="wp-source-url"
+                        type="url"
+                        disabled={skipWpDbUpload}
+                        value={wpSourceUrl}
+                        onChange={(e) => setWpSourceUrl(e.target.value)}
+                        placeholder="https://old-website.com"
+                        className="w-full px-3 py-1.5 bg-dark-900 border border-dark-600 rounded-lg text-xs text-dark-100 font-mono focus:outline-none focus:border-accent-500 disabled:opacity-40"
+                      />
+                    </div>
+                  </div>
+
+                  <label className="inline-flex items-center gap-2 text-xs text-dark-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={skipWpDbUpload}
+                      onChange={(e) => setSkipWpDbUpload(e.target.checked)}
+                      className="rounded border-dark-600 bg-dark-800 text-accent-500 focus:ring-0"
+                    />
+                    Skip database upload for now (connect existing WordPress files only)
+                  </label>
+                </div>
+              )}
             </div>
           )}
 
@@ -904,17 +1152,15 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                                 </svg>
                               </Link>
-                              {!isDesktopApp() && (
                               <Link
                                 to={`/mail?domain=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
-                                title={m?.has_mail ? "Mail configured" : "Mail"}
+                                title={isDesktopApp() ? "Local Mail Catcher" : (m?.has_mail ? "Mail configured" : "Mail")}
                               >
                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                                 </svg>
                               </Link>
-                              )}
                               <Link
                                 to={`/databases?search=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}
@@ -1100,17 +1346,15 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                                 </svg>
                               </Link>
-                              {!isDesktopApp() && (
                               <Link
                                 to={`/mail?domain=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
-                                title={m?.has_mail ? "Mail configured" : "Mail"}
+                                title={isDesktopApp() ? "Local Mail Catcher" : (m?.has_mail ? "Mail configured" : "Mail")}
                               >
                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                                 </svg>
                               </Link>
-                              )}
                               <Link
                                 to={`/databases?search=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}

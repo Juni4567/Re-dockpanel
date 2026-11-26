@@ -536,10 +536,123 @@ try {
     Ok(())
 }
 
+pub fn find_mysql_client_binary() -> Option<PathBuf> {
+    if let Some(daemon) = find_mariadbd_binary() {
+        if let Some(dir) = daemon.parent() {
+            for name in ["mariadb.exe", "mysql.exe"] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn import_mysql_dump(port: u16, db_name: &str, sql_file: &Path) -> Result<(), String> {
     let clean = sanitize_mysql_ident(db_name)?;
-    let sql = fs::read_to_string(sql_file).map_err(|e| e.to_string())?;
-    run_mysql_query(port, Some(&clean), &sql).map(|_| ())
+    if !sql_file.is_file() {
+        return Err(format!("SQL dump file not found: {}", sql_file.display()));
+    }
+
+    // Prefer native mariadb.exe / mysql.exe streaming stdin so multi-megabyte dumps
+    // never hit the Windows CreateProcess 32KB command-line limit.
+    if let Some(client_exe) = find_mysql_client_binary() {
+        let file = fs::File::open(sql_file)
+            .map_err(|e| format!("Failed opening SQL file '{}': {}", sql_file.display(), e))?;
+        let mut cmd = std::process::Command::new(&client_exe);
+        cmd.args([
+            "-h",
+            "127.0.0.1",
+            "-P",
+            &port.to_string(),
+            "-u",
+            "root",
+            "--default-character-set=utf8mb4",
+            &clean,
+        ])
+        .stdin(std::process::Stdio::from(file));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Failed executing {}: {}", client_exe.display(), e))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("MariaDB import exited with status {}", out.status)
+        });
+    }
+
+    // Fallback: execute SQL directly from disk inside PHP PDO_MySQL (never passing SQL via argv).
+    let php_exe = crate::state::find_php_binary(None)
+        .ok_or_else(|| "No MariaDB client or PHP PDO_MySQL binary available for SQL import".to_string())?;
+    let script = r#"<?php
+$port    = $argv[1];
+$db      = $argv[2];
+$sqlPath = $argv[3];
+try {
+    $pdo = new PDO("mysql:host=127.0.0.1;port={$port};dbname={$db};charset=utf8mb4", 'root', '', [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_TIMEOUT => 30,
+        PDO::MYSQL_ATTR_MULTI_STATEMENTS => true,
+    ]);
+    $sql = file_get_contents($sqlPath);
+    if ($sql === false) {
+        throw new RuntimeException('Failed reading SQL dump file');
+    }
+    $pdo->exec($sql);
+    echo "\n__DOCKPANEL_JSON__" . json_encode(['ok' => true]);
+} catch (Throwable $e) {
+    echo "\n__DOCKPANEL_JSON__" . json_encode(['ok' => false, 'error' => $e->getMessage()]);
+}
+"#;
+    let temp_script =
+        std::env::temp_dir().join(format!("dockpanel_mysqlimp_{}.php", uuid::Uuid::new_v4()));
+    fs::write(&temp_script, script).map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(&php_exe);
+    cmd.arg(&temp_script)
+        .arg(port.to_string())
+        .arg(&clean)
+        .arg(sql_file.to_string_lossy().to_string());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output();
+    let _ = fs::remove_file(&temp_script);
+    let output = out.map_err(|e| format!("Failed executing SQL import via PHP: {}", e))?;
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let parsed = crate::databases::parse_php_json_output(&raw_stdout).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.trim().is_empty() {
+            format!("Invalid MySQL import output: {}", raw_stdout.trim())
+        } else {
+            stderr.to_string()
+        }
+    })?;
+    if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(())
+    } else {
+        Err(parsed["error"]
+            .as_str()
+            .unwrap_or("MariaDB SQL import failed")
+            .to_string())
+    }
 }
 
 #[cfg(test)]

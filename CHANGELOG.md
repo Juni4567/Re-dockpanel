@@ -4,6 +4,23 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.251.0] - 2026-11-26
+
+### Release: DockPanel Desktop — Built-in Mail Catcher, Existing Folder Import, & Live Sync
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.251.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Built-in Local Mail Catcher (`mail_catcher.rs`, `DesktopMailCatcher.tsx`, `Mail.tsx`, `Dashboard.tsx`, `state.rs`):**
+  - Added an embedded local SMTP server (`127.0.0.1`) with persistent `mail_inbox.json` storage (up to 500 messages, 25 MB max per message, multipart/MIME & RFC 2047 header decoding).
+  - Automatically wired active PHP (`SMTP`, `smtp_port`, `sendmail_from`) and Node.js (`SMTP_HOST`, `SMTP_PORT`) site workers to route outbound mail to the local Mail Catcher.
+  - Added the Desktop Mail Catcher UI at `/mail` with HTML/Text/Headers/Raw message inspection, domain & search filtering, unread tracking, test email dispatch, and a Dashboard Local Mail summary widget.
+- **Connect Existing Site Folders & WordPress Database Import (`Sites.tsx`, `wordpress.rs`, `mariadb.rs`, `main.rs`):**
+  - Added native Windows folder picker (`/desktop/pick-folder`) and folder inspection (`/desktop/inspect-folder`) to detect existing static, PHP, Node.js, and WordPress projects (`wp-config.php`, table prefix, database name, `siteurl`).
+  - Added `/api/sites/{id}/wordpress/import-database` (up to 512 MB) supporting `.sql`, `.sql.gz`, `.zip`, and `.sqlite`/`.db` dumps with automatic MariaDB provisioning, domain/URL rewriting, and `wp-config.php` updates.
+  - Upgraded `import_mysql_dump()` to stream via native `mariadb.exe`/`mysql.exe` stdin (with a PHP `PDO_MySQL` file-read fallback) to avoid the Windows 32 KB `CreateProcess` command-line limit.
+- **Live Sync Push/Pull (`live_sync.rs`, `LiveSyncModal.tsx`, `main.rs`):**
+  - Added `/api/sites/{id}/sync/preflight`, `/api/sites/{id}/sync/push`, and `/api/sites/{id}/sync/pull` endpoints to sync files and databases with remote DockPanel servers, including domain pair rewriting, safety snapshot enforcement, and `wp-config.php` preservation.
+
 ## [2.250.0] - 2026-11-26
 
 ### Release: DockPanel Cloud & Desktop v2.250.0 — Unified Stable Release

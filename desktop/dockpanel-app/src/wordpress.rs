@@ -192,6 +192,467 @@ pub fn read_wp_mysql_db_name(site_dir: &Path) -> Option<String> {
     read_wp_config_string(&cfg, "DB_NAME")
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderInspection {
+    pub path: String,
+    pub exists: bool,
+    pub is_dir: bool,
+    pub is_empty: bool,
+    pub file_count: usize,
+    pub detected_type: String,
+    pub is_wordpress: bool,
+    pub has_wp_config: bool,
+    pub wp_version: Option<String>,
+    pub wp_table_prefix: Option<String>,
+    pub wp_db_name: Option<String>,
+    pub wp_siteurl: Option<String>,
+}
+
+pub fn parse_wp_table_prefix(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("$table_prefix") {
+            if let Some((_, rhs)) = trimmed.split_once('=') {
+                let rhs = rhs.trim();
+                let quote = rhs.chars().next()?;
+                if quote == '\'' || quote == '"' {
+                    if let Some(end) = rhs[1..].find(quote) {
+                        let val = rhs[1..1 + end].trim();
+                        if !val.is_empty() {
+                            return Some(val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn update_wp_table_prefix(content: &str, prefix: &str) -> String {
+    let clean: String = prefix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if clean.is_empty() {
+        return content.to_string();
+    }
+    let replacement_line = format!("$table_prefix = '{}';", clean);
+    let mut replaced = false;
+    let mut out_lines = Vec::new();
+    for line in content.lines() {
+        if line.trim().starts_with("$table_prefix") && line.contains('=') {
+            if !replaced {
+                out_lines.push(replacement_line.clone());
+                replaced = true;
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    if replaced {
+        return out_lines.join("\n") + if content.ends_with('\n') { "\n" } else { "" };
+    }
+    let mut result = out_lines.join("\n");
+    if let Some(pos) = result.find("require_once ABSPATH . 'wp-settings.php'") {
+        result.insert_str(pos, &format!("{}\n", replacement_line));
+    } else {
+        result.push('\n');
+        result.push_str(&replacement_line);
+        result.push('\n');
+    }
+    result
+}
+
+pub fn remove_wp_config_constant(content: &str, key: &str) -> String {
+    let needle_sq = format!("'{}'", key);
+    let needle_dq = format!("\"{}\"", key);
+    let out_lines: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("define")
+                && (trimmed.contains(&needle_sq) || trimmed.contains(&needle_dq)))
+        })
+        .collect();
+    out_lines.join("\n") + if content.ends_with('\n') { "\n" } else { "" }
+}
+
+/// Inspects a local directory to determine whether it is empty, contains an existing
+/// PHP/Node/Static site, or is an existing WordPress installation.
+pub fn inspect_site_folder(path: &Path) -> FolderInspection {
+    let path_str = path.to_string_lossy().to_string();
+    if !path.exists() {
+        return FolderInspection {
+            path: path_str,
+            exists: false,
+            is_dir: false,
+            is_empty: true,
+            file_count: 0,
+            detected_type: "new".to_string(),
+            is_wordpress: false,
+            has_wp_config: false,
+            wp_version: None,
+            wp_table_prefix: None,
+            wp_db_name: None,
+            wp_siteurl: None,
+        };
+    }
+
+    if !path.is_dir() {
+        return FolderInspection {
+            path: path_str,
+            exists: true,
+            is_dir: false,
+            is_empty: false,
+            file_count: 0,
+            detected_type: "invalid".to_string(),
+            is_wordpress: false,
+            has_wp_config: false,
+            wp_version: None,
+            wp_table_prefix: None,
+            wp_db_name: None,
+            wp_siteurl: None,
+        };
+    }
+
+    let mut file_count = 0usize;
+    let mut has_php = false;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            file_count += 1;
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.ends_with(".php") {
+                has_php = true;
+            }
+        }
+    }
+
+    let is_empty = file_count == 0;
+    let has_wp_config = path.join("wp-config.php").is_file();
+    let is_wordpress = has_wp_config
+        || path.join("wp-config-sample.php").is_file()
+        || path.join("wp-includes").join("version.php").is_file()
+        || path.join("wp-login.php").is_file()
+        || (path.join("wp-content").is_dir() && path.join("index.php").is_file());
+
+    let wp_version = if is_wordpress {
+        let v = read_wp_version(path);
+        if v.is_empty() { None } else { Some(v) }
+    } else {
+        None
+    };
+
+    let (wp_table_prefix, wp_db_name, wp_siteurl) = if has_wp_config {
+        if let Ok(cfg) = fs::read_to_string(path.join("wp-config.php")) {
+            let siteurl = read_wp_config_string(&cfg, "WP_SITEURL")
+                .or_else(|| read_wp_config_string(&cfg, "WP_HOME"));
+            (
+                parse_wp_table_prefix(&cfg),
+                read_wp_config_string(&cfg, "DB_NAME"),
+                siteurl,
+            )
+        } else {
+            (None, None, None)
+        }
+    } else {
+        (None, None, None)
+    };
+
+    let detected_type = if is_empty {
+        "empty"
+    } else if is_wordpress {
+        "wordpress"
+    } else if path.join("package.json").is_file() {
+        "node"
+    } else if has_php || path.join("index.php").is_file() {
+        "php"
+    } else {
+        "static"
+    }
+    .to_string();
+
+    FolderInspection {
+        path: path_str,
+        exists: true,
+        is_dir: true,
+        is_empty,
+        file_count,
+        detected_type,
+        is_wordpress,
+        has_wp_config,
+        wp_version,
+        wp_table_prefix,
+        wp_db_name,
+        wp_siteurl,
+    }
+}
+
+/// Scans an SQL dump for WordPress table prefix (`<prefix>options`) and `siteurl` / `home` URLs.
+pub fn detect_wp_sql_metadata(sql: &str) -> (Option<String>, Option<String>) {
+    let mut table_prefix: Option<String> = None;
+    let mut source_url: Option<String> = None;
+
+    for line in sql.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+
+        if table_prefix.is_none() && lower.contains("create table") && lower.contains("options") {
+            if let Some(opt_idx) = lower.find("options") {
+                let before = &trimmed[..opt_idx];
+                let candidate: String = before
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                if !candidate.is_empty() && candidate.ends_with('_') {
+                    table_prefix = Some(candidate);
+                }
+            }
+        }
+
+        if source_url.is_none() && (trimmed.contains("'siteurl'") || trimmed.contains("'home'")) {
+            let key = if trimmed.contains("'siteurl'") {
+                "'siteurl'"
+            } else {
+                "'home'"
+            };
+            if let Some(pos) = trimmed.find(key) {
+                let after = &trimmed[pos + key.len()..];
+                if let Some(q1) = after.find('\'') {
+                    let rest = &after[q1 + 1..];
+                    if let Some(q2) = rest.find('\'') {
+                        let url_candidate = rest[..q2].trim();
+                        if url_candidate.starts_with("http://")
+                            || url_candidate.starts_with("https://")
+                        {
+                            source_url = Some(url_candidate.trim_end_matches('/').to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if table_prefix.is_some() && source_url.is_some() {
+            break;
+        }
+    }
+
+    (table_prefix, source_url)
+}
+
+fn unpack_uploaded_db_bytes(filename: &str, raw_bytes: &[u8]) -> Result<(bool, Vec<u8>), String> {
+    let lower = filename.trim().to_ascii_lowercase();
+    if lower.ends_with(".sqlite") || lower.ends_with(".db") || raw_bytes.starts_with(b"SQLite format 3\0") {
+        return Ok((true, raw_bytes.to_vec()));
+    }
+
+    // ZIP archive containing a .sql (or .sqlite) file
+    if raw_bytes.starts_with(&[0x50, 0x4B, 0x03, 0x04]) || lower.ends_with(".zip") {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(raw_bytes))
+            .map_err(|e| format!("Invalid ZIP archive: {e}"))?;
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
+            if f.is_dir() {
+                continue;
+            }
+            let name = f.name().to_ascii_lowercase();
+            if name.ends_with(".sql") {
+                let mut out = Vec::new();
+                std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+                return Ok((false, out));
+            }
+            if name.ends_with(".sqlite") || name.ends_with(".db") {
+                let mut out = Vec::new();
+                std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+                return Ok((true, out));
+            }
+        }
+        return Err("ZIP archive does not contain a .sql or .sqlite database file".to_string());
+    }
+
+    // Gzipped .sql.gz
+    if raw_bytes.starts_with(&[0x1f, 0x8b]) || lower.ends_with(".gz") {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(raw_bytes);
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|e| format!("Failed decompressing gzip database dump: {e}"))?;
+        return Ok((false, out));
+    }
+
+    Ok((false, raw_bytes.to_vec()))
+}
+
+fn ensure_wp_config_base(site_dir: &Path) -> Result<String, String> {
+    let cfg_path = site_dir.join("wp-config.php");
+    if cfg_path.is_file() {
+        return fs::read_to_string(&cfg_path)
+            .map_err(|e| format!("Failed reading wp-config.php: {e}"));
+    }
+    let sample_path = site_dir.join("wp-config-sample.php");
+    if sample_path.is_file() {
+        return fs::read_to_string(&sample_path)
+            .map_err(|e| format!("Failed reading wp-config-sample.php: {e}"));
+    }
+    let salt = uuid::Uuid::new_v4().to_string();
+    Ok(format!(
+        r#"<?php
+define( 'DB_NAME', 'wordpress' );
+define( 'DB_USER', 'root' );
+define( 'DB_PASSWORD', '' );
+define( 'DB_HOST', '127.0.0.1' );
+define( 'DB_CHARSET', 'utf8mb4' );
+define( 'DB_COLLATE', '' );
+
+define( 'AUTH_KEY',         '{salt}-auth' );
+define( 'SECURE_AUTH_KEY',  '{salt}-sec' );
+define( 'LOGGED_IN_KEY',    '{salt}-log' );
+define( 'NONCE_KEY',        '{salt}-non' );
+define( 'AUTH_SALT',        '{salt}-asalt' );
+define( 'SECURE_AUTH_SALT', '{salt}-ssalt' );
+define( 'LOGGED_IN_SALT',   '{salt}-lsalt' );
+define( 'NONCE_SALT',       '{salt}-nsalt' );
+
+$table_prefix = 'wp_';
+define( 'WP_DEBUG', false );
+
+if ( ! defined( 'ABSPATH' ) ) {{
+    define( 'ABSPATH', __DIR__ . '/' );
+}}
+require_once ABSPATH . 'wp-settings.php';
+"#
+    ))
+}
+
+/// Imports an uploaded database dump (`.sql`, `.sql.gz`, `.zip`, or `.sqlite`) for an existing
+/// WordPress directory, rewrites site URLs to match `target_url`, imports into MariaDB (or SQLite),
+/// and updates `wp-config.php` credentials and table prefix.
+pub fn import_existing_wp_database(
+    site_dir: &Path,
+    domain: &str,
+    target_url: &str,
+    mariadb_port: Option<u16>,
+    filename: &str,
+    raw_bytes: &[u8],
+    source_url_override: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    if raw_bytes.is_empty() {
+        return Err("Uploaded database file is empty".to_string());
+    }
+    let (is_sqlite, data_bytes) = unpack_uploaded_db_bytes(filename, raw_bytes)?;
+    let esc_php = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
+    let clean_target_url = target_url.trim().trim_end_matches('/');
+
+    if is_sqlite {
+        let db_dir = site_dir.join("wp-content").join("database");
+        fs::create_dir_all(&db_dir).map_err(|e| format!("Failed creating SQLite dir: {e}"))?;
+        let sqlite_target = db_dir.join(".ht.sqlite");
+        fs::write(&sqlite_target, &data_bytes)
+            .map_err(|e| format!("Failed writing SQLite database: {e}"))?;
+
+        let mut cfg = ensure_wp_config_base(site_dir)?;
+        let clean_db_name = format!("{}_wp", domain.replace('.', "_").replace('-', "_"));
+        cfg = upsert_wp_config_constant(&cfg, "DB_ENGINE", "'sqlite'");
+        cfg = upsert_wp_config_constant(&cfg, "DB_DIR", "__DIR__ . '/wp-content/database'");
+        cfg = upsert_wp_config_constant(&cfg, "DB_FILE", "'.ht.sqlite'");
+        cfg = upsert_wp_config_constant(&cfg, "DB_NAME", &format!("'{}'", esc_php(&clean_db_name)));
+        cfg = upsert_wp_config_constant(&cfg, "DB_USER", "'root'");
+        cfg = upsert_wp_config_constant(&cfg, "DB_PASSWORD", "''");
+        cfg = upsert_wp_config_constant(&cfg, "DB_HOST", "'127.0.0.1'");
+        cfg = upsert_wp_config_constant(&cfg, "WP_HOME", &format!("'{}'", esc_php(clean_target_url)));
+        cfg = upsert_wp_config_constant(&cfg, "WP_SITEURL", &format!("'{}'", esc_php(clean_target_url)));
+        fs::write(site_dir.join("wp-config.php"), cfg)
+            .map_err(|e| format!("Failed updating wp-config.php: {e}"))?;
+
+        return Ok(json!({
+            "ok": true,
+            "db_engine": "sqlite",
+            "db_name": clean_db_name,
+            "target_url": clean_target_url,
+            "source_url": serde_json::Value::Null,
+            "rewritten": false,
+            "wp_config_updated": true,
+        }));
+    }
+
+    let port = mariadb_port.ok_or_else(|| {
+        "MariaDB is not running. Start or install MariaDB to import SQL database dumps."
+            .to_string()
+    })?;
+
+    let raw_sql = String::from_utf8_lossy(&data_bytes).to_string();
+    let (detected_prefix, detected_source_url) = detect_wp_sql_metadata(&raw_sql);
+    let effective_source_url = source_url_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .or(detected_source_url);
+
+    let (final_sql, rewritten) = if let Some(ref src) = effective_source_url {
+        if !src.eq_ignore_ascii_case(clean_target_url) {
+            (
+                crate::live_sync::rewrite_domains(&raw_sql, src, clean_target_url),
+                true,
+            )
+        } else {
+            (raw_sql, false)
+        }
+    } else {
+        (raw_sql, false)
+    };
+
+    let clean_db_name = format!("{}_wp", domain.replace('.', "_").replace('-', "_"));
+    crate::mariadb::create_database(port, &clean_db_name)?;
+
+    let tmp_sql = std::env::temp_dir().join(format!("dockpanel_wp_imp_{}.sql", uuid::Uuid::new_v4()));
+    fs::write(&tmp_sql, final_sql.as_bytes())
+        .map_err(|e| format!("Failed staging SQL dump: {e}"))?;
+    let import_res = crate::mariadb::import_mysql_dump(port, &clean_db_name, &tmp_sql);
+    let _ = fs::remove_file(&tmp_sql);
+    import_res?;
+
+    // Remove stale SQLite drop-in if the folder previously used SQLite
+    let stale_db_php = site_dir.join("wp-content").join("db.php");
+    if stale_db_php.is_file() {
+        let _ = fs::remove_file(&stale_db_php);
+    }
+
+    // Update wp-config.php with new local MariaDB credentials, table prefix, and site URL
+    let mut cfg = ensure_wp_config_base(site_dir)?;
+    cfg = remove_wp_config_constant(&cfg, "DB_ENGINE");
+    cfg = remove_wp_config_constant(&cfg, "DB_DIR");
+    cfg = remove_wp_config_constant(&cfg, "DB_FILE");
+    cfg = upsert_wp_config_constant(&cfg, "DB_NAME", &format!("'{}'", esc_php(&clean_db_name)));
+    cfg = upsert_wp_config_constant(&cfg, "DB_USER", "'root'");
+    cfg = upsert_wp_config_constant(&cfg, "DB_PASSWORD", "''");
+    cfg = upsert_wp_config_constant(&cfg, "DB_HOST", &format!("'127.0.0.1:{}'", port));
+    cfg = upsert_wp_config_constant(&cfg, "WP_HOME", &format!("'{}'", esc_php(clean_target_url)));
+    cfg = upsert_wp_config_constant(&cfg, "WP_SITEURL", &format!("'{}'", esc_php(clean_target_url)));
+    if let Some(ref pfx) = detected_prefix {
+        cfg = update_wp_table_prefix(&cfg, pfx);
+    }
+
+    fs::write(site_dir.join("wp-config.php"), cfg)
+        .map_err(|e| format!("Failed updating wp-config.php: {e}"))?;
+
+    Ok(json!({
+        "ok": true,
+        "db_engine": "mariadb",
+        "db_name": clean_db_name,
+        "db_host": format!("127.0.0.1:{}", port),
+        "table_prefix": detected_prefix,
+        "source_url": effective_source_url,
+        "target_url": clean_target_url,
+        "rewritten": rewritten,
+        "wp_config_updated": true,
+    }))
+}
+
 fn wp_meta_path(site_dir: &Path) -> PathBuf {
     site_dir.join(".dockpanel-wp.json")
 }
@@ -1839,5 +2300,61 @@ mod tests {
         assert!(is_valid_zip_archive(&good_zip, 10));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_inspect_folder_and_wp_sql_metadata_and_sqlite_import() {
+        let tmp = std::env::temp_dir().join(format!("dockpanel_wp_inspect_{}", uuid::Uuid::new_v4()));
+        let empty_dir = tmp.join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+        let insp_empty = inspect_site_folder(&empty_dir);
+        assert!(insp_empty.is_empty);
+        assert_eq!(insp_empty.detected_type, "empty");
+        assert!(!insp_empty.is_wordpress);
+
+        let wp_dir = tmp.join("existing_wp");
+        fs::create_dir_all(wp_dir.join("wp-includes")).unwrap();
+        fs::write(wp_dir.join("wp-includes").join("version.php"), "<?php $wp_version = '6.7.1';").unwrap();
+        fs::write(
+            wp_dir.join("wp-config.php"),
+            "<?php\ndefine( 'DB_NAME', 'prod_db' );\n$table_prefix = 'wp_old_';\n",
+        )
+        .unwrap();
+
+        let insp_wp = inspect_site_folder(&wp_dir);
+        assert!(insp_wp.is_wordpress);
+        assert!(insp_wp.has_wp_config);
+        assert_eq!(insp_wp.detected_type, "wordpress");
+        assert_eq!(insp_wp.wp_version.as_deref(), Some("6.7.1"));
+        assert_eq!(insp_wp.wp_db_name.as_deref(), Some("prod_db"));
+        assert_eq!(insp_wp.wp_table_prefix.as_deref(), Some("wp_old_"));
+
+        let sample_sql = concat!(
+            "CREATE TABLE `wp_live_options` (`option_id` bigint(20));\n",
+            "INSERT INTO `wp_live_options` VALUES (1, 'siteurl', 'https://prod.example.com', 'yes');\n"
+        );
+        let (pfx, src_url) = detect_wp_sql_metadata(sample_sql);
+        assert_eq!(pfx.as_deref(), Some("wp_live_"));
+        assert_eq!(src_url.as_deref(), Some("https://prod.example.com"));
+
+        // Verify SQLite import updates wp-config.php URL & credentials
+        let res = import_existing_wp_database(
+            &wp_dir,
+            "mywp.test",
+            "https://mywp.test",
+            None,
+            "site.sqlite",
+            b"SQLite format 3\0dummy",
+            None,
+        )
+        .unwrap();
+        assert_eq!(res["db_engine"], "sqlite");
+        let updated_cfg = fs::read_to_string(wp_dir.join("wp-config.php")).unwrap();
+        assert!(updated_cfg.contains("define( 'DB_ENGINE', 'sqlite' )"));
+        assert!(updated_cfg.contains("define( 'WP_HOME', 'https://mywp.test' )"));
+        assert!(updated_cfg.contains("define( 'WP_SITEURL', 'https://mywp.test' )"));
+        assert!(wp_dir.join("wp-content").join("database").join(".ht.sqlite").is_file());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

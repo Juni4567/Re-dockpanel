@@ -5,6 +5,8 @@ mod databases;
 mod downloads;
 mod files;
 mod hosts_manager;
+pub mod live_sync;
+pub mod mail_catcher;
 pub mod mariadb;
 pub mod router;
 pub mod ssl;
@@ -142,6 +144,10 @@ async fn create_site_handler(
         .and_then(|p| u16::try_from(p).ok());
     let cms = payload.get("cms").and_then(|v| v.as_str());
     let preset = payload.get("php_preset").and_then(|v| v.as_str());
+    let connect_existing = payload
+        .get("connect_existing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let custom_root = payload
         .get("document_root")
         .or_else(|| payload.get("root_path"))
@@ -169,8 +175,12 @@ async fn create_site_handler(
             if let Some(p) = cms.or(preset).filter(|s| !s.is_empty() && *s != "generic") {
                 state.update_site_preset(&site.id, p);
             }
-            let wants_wp = site.runtime == "php" && (cms == Some("wordpress") || preset == Some("wordpress"));
             let site_dir = state.site_dir(&site);
+            let existing_wp = connect_existing && wordpress::inspect_site_folder(&site_dir).is_wordpress;
+            let wants_wp = !connect_existing
+                && !existing_wp
+                && site.runtime == "php"
+                && (cms == Some("wordpress") || preset == Some("wordpress"));
             let prov_key = format!("site:{}", site.id);
 
             let wp_req = wordpress::InstallWpRequest {
@@ -1644,7 +1654,7 @@ async fn metrics_overview_handler(State(state): State<Arc<AppState>>) -> Json<se
                 "traffic_bytes_this_month": 0,
                 "server_location": site.document_root,
                 "has_database": has_db,
-                "has_mail": false,
+                "has_mail": state.mail_catcher.is_running(),
             }),
         );
     }
@@ -2750,6 +2760,286 @@ async fn desktop_clear_cache_handler(State(state): State<Arc<AppState>>) -> Json
         "info",
     );
     Json(serde_json::json!({ "ok": true, "cleared_bytes": cleared_bytes }))
+}
+
+async fn desktop_pick_folder_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Option<serde_json::Value>>,
+) -> Response {
+    let initial_dir = payload
+        .as_ref()
+        .and_then(|p| p.get("initial_dir"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| state.get_default_sites_dir().to_string_lossy().to_string());
+
+    let pick_res: Result<Option<String>, String> = tokio::task::spawn_blocking(move || {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let escaped = initial_dir.replace('\'', "''");
+            let ps = format!(
+                r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = 'None'
+$owner.StartPosition = 'Manual'
+$owner.Location = New-Object System.Drawing.Point(-32000, -32000)
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Show()
+$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+$dlg.Description = 'Select website folder (empty or existing website)'
+$dlg.UseDescriptionForTitle = $true
+$dlg.ShowNewFolderButton = $true
+$init = '{escaped}'
+if ($init -and (Test-Path -LiteralPath $init)) {{
+    $dlg.SelectedPath = $init
+}}
+$res = $dlg.ShowDialog($owner)
+$owner.Close()
+$owner.Dispose()
+if ($res -eq [System.Windows.Forms.DialogResult]::OK) {{
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $dlg.SelectedPath
+}}
+"#
+            );
+            let out = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", &ps])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("Failed opening Windows folder dialog: {}", e))?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(if err.is_empty() {
+                    "Folder picker failed".to_string()
+                } else {
+                    err
+                });
+            }
+            let selected = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if selected.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(selected))
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = initial_dir;
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+
+    match pick_res {
+        Ok(Some(path)) => {
+            let inspection = wordpress::inspect_site_folder(std::path::Path::new(&path));
+            Json(serde_json::json!({
+                "cancelled": false,
+                "path": path,
+                "inspection": inspection,
+            }))
+            .into_response()
+        }
+        Ok(None) => Json(serde_json::json!({ "cancelled": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn desktop_inspect_folder_handler(
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let raw = payload
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if raw.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "path is required" })),
+        )
+            .into_response();
+    }
+    let inspection = wordpress::inspect_site_folder(std::path::Path::new(raw));
+    Json(inspection).into_response()
+}
+
+async fn wordpress_import_database_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+    let Some(site) = state.get_site(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Site not found" })),
+        )
+            .into_response();
+    };
+
+    let filename = payload
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("database.sql")
+        .trim()
+        .to_string();
+    let b64_raw = payload
+        .get("content_base64")
+        .or_else(|| payload.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if b64_raw.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Database file content is required" })),
+        )
+            .into_response();
+    }
+
+    let cleaned_b64: String = b64_raw.chars().filter(|c| !c.is_whitespace()).collect();
+    let raw_bytes = match B64.decode(&cleaned_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("Invalid base64 database payload: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let lower_fn = filename.to_ascii_lowercase();
+    let looks_sqlite = lower_fn.ends_with(".sqlite")
+        || lower_fn.ends_with(".db")
+        || raw_bytes.starts_with(b"SQLite format 3\0");
+
+    // Auto-install and start MariaDB when importing a MySQL/SQL dump
+    if !looks_sqlite && state.get_mariadb_port().is_none() {
+        if mariadb::find_mariadbd_binary().is_none() {
+            if let Err(e) = mariadb::install_mariadb_with_progress(|_, _, _, _| {}).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("MariaDB auto-install failed: {}", e) })),
+                )
+                    .into_response();
+            }
+        }
+        let start_res = tokio::task::spawn_blocking({
+            let st = state.clone();
+            move || st.start_mariadb()
+        })
+        .await;
+        match start_res {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Failed starting MariaDB: {}", e) })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let active_port = state.get_router_config().active_port;
+    let ssl_port = state.get_ssl_port();
+    let default_target_url = if site.ssl_enabled {
+        match ssl_port {
+            Some(443) => format!("https://{}", site.domain),
+            Some(p) => format!("https://{}:{}", site.domain, p),
+            None if active_port == 80 => format!("http://{}", site.domain),
+            None => format!("http://{}:{}", site.domain, active_port),
+        }
+    } else if active_port == 80 {
+        format!("http://{}", site.domain)
+    } else {
+        format!("http://{}:{}", site.domain, active_port)
+    };
+
+    let target_url = payload
+        .get("target_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or(default_target_url);
+
+    let source_url_override = payload
+        .get("source_url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let site_dir = state.site_dir(&site);
+    let domain = site.domain.clone();
+    let mdb_port = state.get_mariadb_port();
+
+    let res = tokio::task::spawn_blocking(move || {
+        wordpress::import_existing_wp_database(
+            &site_dir,
+            &domain,
+            &target_url,
+            mdb_port,
+            &filename,
+            &raw_bytes,
+            source_url_override.as_deref(),
+        )
+    })
+    .await;
+
+    match res {
+        Ok(Ok(val)) => {
+            state.update_site_preset(&site.id, "wordpress");
+            let _ = state.start_site(&site.id);
+            state.record_event(
+                "wp_import_db",
+                "site",
+                &site.domain,
+                "WordPress Database Imported",
+                &format!(
+                    "Connected {} to {} and updated wp-config.php",
+                    site.domain,
+                    val.get("db_name").and_then(|v| v.as_str()).unwrap_or("database")
+                ),
+                "success",
+            );
+            Json(val).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn wordpress_reset_admin_password_handler(
@@ -4242,7 +4532,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "mariadb_running": mdb_port.is_some(),
         "mariadb_port": mdb_port,
         "default_sites_dir": state.get_default_sites_dir().to_string_lossy().to_string(),
-        "version": "2.250.0"
+        "version": "2.251.0"
     }))
 }
 
@@ -4518,6 +4808,155 @@ async fn services_install_status_handler(State(state): State<Arc<AppState>>) -> 
     }))
 }
 
+async fn desktop_mail_status_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.mail_catcher.status())
+}
+
+async fn desktop_mail_list_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let search = q.get("q").map(|s| s.as_str());
+    let domain = q.get("domain").map(|s| s.as_str());
+    let messages = state.mail_catcher.list_summaries(search, domain);
+    Json(serde_json::json!({
+        "messages": messages,
+        "status": state.mail_catcher.status(),
+    }))
+}
+
+async fn desktop_mail_get_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.mail_catcher.get_message(&id) {
+        Some(msg) => {
+            state.mail_catcher.mark_read(&id, true);
+            let mut updated = msg;
+            updated.read = true;
+            Json(updated).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Message not found" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn desktop_mail_mark_read_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<Option<serde_json::Value>>,
+) -> Response {
+    let read = payload
+        .as_ref()
+        .and_then(|p| p.get("read"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if state.mail_catcher.mark_read(&id, read) {
+        Json(serde_json::json!({ "ok": true, "read": read })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Message not found" })),
+        )
+            .into_response()
+    }
+}
+
+async fn desktop_mail_read_all_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    state.mail_catcher.mark_all_read();
+    Json(serde_json::json!({ "ok": true }))
+}
+
+async fn desktop_mail_delete_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if state.mail_catcher.delete_message(&id) {
+        Json(serde_json::json!({ "ok": true })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Message not found" })),
+        )
+            .into_response()
+    }
+}
+
+async fn desktop_mail_clear_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cleared = state.mail_catcher.clear_messages();
+    Json(serde_json::json!({ "ok": true, "cleared": cleared }))
+}
+
+async fn desktop_mail_test_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Option<serde_json::Value>>,
+) -> Response {
+    let Some(port) = state.mail_catcher.smtp_port() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Local SMTP catcher is not running" })),
+        )
+            .into_response();
+    };
+    let site_domain = payload
+        .as_ref()
+        .and_then(|p| p.get("site_domain"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| state.list_sites().into_iter().next().map(|s| s.domain));
+    let domain_label = site_domain.as_deref().unwrap_or("dockpanel.desktop");
+    let from = payload
+        .as_ref()
+        .and_then(|p| p.get("from"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("wordpress@{}", domain_label));
+    let to = payload
+        .as_ref()
+        .and_then(|p| p.get("to"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("developer@localhost");
+    let subject = payload
+        .as_ref()
+        .and_then(|p| p.get("subject"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("Test email from {}", domain_label));
+    let text = payload
+        .as_ref()
+        .and_then(|p| p.get("text"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            format!(
+                "This test email was captured locally by DockPanel Desktop on 127.0.0.1:{}.\nSite: {}",
+                port, domain_label
+            )
+        });
+    let html = format!(
+        "<div style=\"font-family:sans-serif;padding:16px;\"><h2>DockPanel Local Mail Catcher</h2><p>Captured locally on <code>127.0.0.1:{}</code>.</p><p><strong>Site:</strong> {}</p></div>",
+        port,
+        domain_label
+    );
+    match mail_catcher::send_test_email_smtp(port, &from, to, &subject, &text, Some(&html)).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "smtp_port": port })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(windows)]
 mod win_metrics {
     #[repr(C)]
@@ -4756,7 +5195,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "cpu_cores": 8,
                     "ram_mb": 16384,
                     "disk_gb": 512,
-                    "agent_version": "2.250.0",
+                    "agent_version": "2.251.0",
                     "cpu_usage": 5.0,
                     "mem_used_mb": 2048,
                     "uptime_secs": 3600,
@@ -4943,38 +5382,58 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         )
         .route("/desktop/open-folder", post(desktop_open_folder_handler))
         .route("/desktop/open-vscode", post(desktop_open_vscode_handler))
+        .route("/desktop/pick-folder", post(desktop_pick_folder_handler))
+        .route("/desktop/inspect-folder", post(desktop_inspect_folder_handler))
         .route("/desktop/clear-cache", post(desktop_clear_cache_handler))
+        .route(
+            "/sites/{id}/wordpress/import-database",
+            post(wordpress_import_database_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route("/desktop/mail/status", get(desktop_mail_status_handler))
+        .route(
+            "/desktop/mail/messages",
+            get(desktop_mail_list_handler).delete(desktop_mail_clear_handler),
+        )
+        .route("/desktop/mail/messages/read-all", post(desktop_mail_read_all_handler))
+        .route(
+            "/desktop/mail/messages/{id}",
+            get(desktop_mail_get_handler).delete(desktop_mail_delete_handler),
+        )
+        .route("/desktop/mail/messages/{id}/read", post(desktop_mail_mark_read_handler))
+        .route("/desktop/mail/test", post(desktop_mail_test_handler))
         .route("/system/ports/conflict", get(port_conflict_handler))
         .route("/system/ports/resolve", post(port_resolve_handler))
         .route("/sites/metrics-overview", get(metrics_overview_handler))
         .route(
             "/sites/{id}/sync/preflight",
-            post(|| async {
-                Json(serde_json::json!({
-                    "success": true,
-                    "message": "Remote server connection verified",
-                    "remote_site_id": "remote-site-123"
-                }))
+            post(|State(s): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<live_sync::PreflightCheckRequest>| async move {
+                let local_domain = s.get_site(&id).map(|site| site.domain);
+                Json(live_sync::check_preflight(&req, local_domain.as_deref()).await)
             }),
         )
         .route(
             "/sites/{id}/sync/push",
-            post(|| async {
-                Json(serde_json::json!({
-                    "success": true,
-                    "message": "Sync completed successfully",
-                    "steps": ["Connected", "Synchronized", "Complete"]
-                }))
+            post(|State(s): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<live_sync::SyncRequest>| async move {
+                match live_sync::execute_push(s, &id, &req).await {
+                    Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
+                    Err((code, msg)) => {
+                        let st = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+                        (st, Json(serde_json::json!({ "error": msg }))).into_response()
+                    }
+                }
             }),
         )
         .route(
             "/sites/{id}/sync/pull",
-            post(|| async {
-                Json(serde_json::json!({
-                    "success": true,
-                    "message": "Sync completed successfully",
-                    "steps": ["Connected", "Synchronized", "Complete"]
-                }))
+            post(|State(s): State<Arc<AppState>>, Path(id): Path<String>, Json(req): Json<live_sync::SyncRequest>| async move {
+                match live_sync::execute_pull(s, &id, &req).await {
+                    Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
+                    Err((code, msg)) => {
+                        let st = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+                        (st, Json(serde_json::json!({ "error": msg }))).into_response()
+                    }
+                }
             }),
         )
         .route(
@@ -5135,7 +5594,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "status": "running",
                     "mode": "desktop",
                     "os": "windows",
-                    "version": "2.250.0"
+                    "version": "2.251.0"
                 }))
             }),
         )
@@ -5211,7 +5670,15 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/mail/queue",
-            get(|| async { Json(serde_json::json!({"count": 0, "queue": []})) }),
+            get({
+                let s = state.clone();
+                move || async move {
+                    let queue = s.mail_catcher.list_summaries(None, None);
+                    let count = queue.len();
+                    let preview: Vec<_> = queue.into_iter().take(10).collect();
+                    Json(serde_json::json!({"count": count, "queue": preview}))
+                }
+            }),
         )
         .route(
             "/on-call/whoami",
@@ -5316,6 +5783,43 @@ fn start_embedded_server(state: Arc<AppState>) -> u16 {
                 .layer(CorsLayer::permissive());
 
             let _ = port_tx.send(port);
+
+            // Start local SMTP Mail Catcher (127.0.0.1:1025 or fallback free port) before
+            // spawning PHP/Node site workers so every worker receives the bound SMTP port.
+            {
+                let domains_state = state.clone();
+                let event_state = state.clone();
+                match mail_catcher::start_smtp_server(
+                    state.mail_catcher.clone(),
+                    1025,
+                    move || {
+                        domains_state
+                            .list_sites()
+                            .into_iter()
+                            .map(|s| s.domain)
+                            .collect()
+                    },
+                    move |email| {
+                        event_state.record_event(
+                            "mail_captured",
+                            "mail",
+                            email.site_domain.as_deref().unwrap_or("localhost"),
+                            &format!("Email captured: {}", email.subject),
+                            &format!("From {} to {}", email.from, email.to.join(", ")),
+                            "info",
+                        );
+                    },
+                )
+                .await
+                {
+                    Ok(smtp_port) => {
+                        println!("DockPanel Local Mail Catcher listening on 127.0.0.1:{}", smtp_port);
+                    }
+                    Err(e) => {
+                        eprintln!("Local Mail Catcher failed to start: {}", e);
+                    }
+                }
+            }
 
             // Reconcile and start PHP workers for all active sites in the background
             // so GUI window creation is not delayed. Clean up any orphaned PHP processes
@@ -6418,6 +6922,92 @@ mod tests {
         assert_eq!(c.get(format!("http://127.0.0.1:{}/stacks", port)).send().await.unwrap().status(), StatusCode::OK);
         assert_eq!(c.get(format!("http://127.0.0.1:{}/databases", port)).send().await.unwrap().status(), StatusCode::OK);
         assert_eq!(c.get(format!("http://127.0.0.1:{}/databases/sizes", port)).send().await.unwrap().status(), StatusCode::OK);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_inspect_folder_and_connect_existing_wordpress_db_import() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_wp_connect_{}", uuid::Uuid::new_v4()));
+        let existing_wp = temp_dir.join("my_existing_wp");
+        std::fs::create_dir_all(existing_wp.join("wp-includes")).unwrap();
+        std::fs::write(
+            existing_wp.join("wp-includes").join("version.php"),
+            "<?php $wp_version = '6.6.2';",
+        )
+        .unwrap();
+        std::fs::write(
+            existing_wp.join("wp-config.php"),
+            "<?php\ndefine( 'DB_NAME', 'old_prod' );\n$table_prefix = 'wp_prod_';\n",
+        )
+        .unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites")));
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let c = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{}", port);
+
+        // 1. Inspect existing WP folder
+        let insp_res: serde_json::Value = c
+            .post(format!("{}/desktop/inspect-folder", base))
+            .json(&serde_json::json!({ "path": existing_wp.to_string_lossy() }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(insp_res["is_wordpress"], true);
+        assert_eq!(insp_res["wp_version"], "6.6.2");
+        assert_eq!(insp_res["wp_table_prefix"], "wp_prod_");
+
+        // 2. Connect existing WP folder without overwriting wp-config.php
+        let create_res: serde_json::Value = c
+            .post(format!("{}/sites", base))
+            .json(&serde_json::json!({
+                "domain": "connected-wp.test",
+                "runtime": "php",
+                "php_preset": "wordpress",
+                "document_root": existing_wp.to_string_lossy(),
+                "connect_existing": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let site_id = create_res["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            std::fs::read_to_string(existing_wp.join("wp-config.php")).unwrap(),
+            "<?php\ndefine( 'DB_NAME', 'old_prod' );\n$table_prefix = 'wp_prod_';\n"
+        );
+
+        // 3. Import uploaded database and verify wp-config.php credentials/URL update
+        let imp_res = c
+            .post(format!("{}/sites/{}/wordpress/import-database", base, site_id))
+            .json(&serde_json::json!({
+                "filename": "backup.sqlite",
+                "content_base64": B64.encode(b"SQLite format 3\0testdb"),
+                "target_url": "https://connected-wp.test"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(imp_res.status(), StatusCode::OK);
+        let updated_cfg = std::fs::read_to_string(existing_wp.join("wp-config.php")).unwrap();
+        assert!(updated_cfg.contains("define( 'WP_HOME', 'https://connected-wp.test' )"));
+        assert!(updated_cfg.contains("define( 'WP_SITEURL', 'https://connected-wp.test' )"));
+        assert!(updated_cfg.contains("$table_prefix = 'wp_prod_';"));
 
         server.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);

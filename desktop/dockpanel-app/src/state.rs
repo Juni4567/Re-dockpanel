@@ -191,6 +191,7 @@ pub struct AppState {
     pub ssl_router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub ssl_port: Arc<Mutex<Option<u16>>>,
     pub cert_resolver: Arc<crate::ssl::DynamicCertResolver>,
+    pub mail_catcher: Arc<crate::mail_catcher::MailCatcherStore>,
     pub mariadb_process: Arc<Mutex<Option<(std::process::Child, u16)>>>,
     pub php_installs: Arc<Mutex<HashMap<String, PhpInstallJob>>>,
     pub notifications: Arc<Mutex<Vec<LocalNotification>>>,
@@ -536,6 +537,7 @@ impl AppState {
         let (notif_tx, _) = tokio::sync::broadcast::channel(64);
         let cert_resolver = Arc::new(crate::ssl::DynamicCertResolver::new());
         cert_resolver.load_existing_certs(&config_dir.join("certs"));
+        let mail_catcher = crate::mail_catcher::MailCatcherStore::new(&config_dir);
         Self {
             data: Arc::new(Mutex::new(data)),
             router_config: Arc::new(Mutex::new(router_config)),
@@ -545,6 +547,7 @@ impl AppState {
             ssl_router_handle: Arc::new(tokio::sync::Mutex::new(None)),
             ssl_port: Arc::new(Mutex::new(None)),
             cert_resolver,
+            mail_catcher,
             mariadb_process: Arc::new(Mutex::new(None)),
             php_installs: Arc::new(Mutex::new(HashMap::new())),
             notifications: Arc::new(Mutex::new(Vec::new())),
@@ -1312,6 +1315,21 @@ server.listen(port, '127.0.0.1', () => {{
         cmd.args([
             "-d",
             &error_log_arg,
+        ]);
+        if let Some(smtp_port) = self.mail_catcher.smtp_port() {
+            let from_addr = format!("wordpress@{}", clean);
+            cmd.args([
+                "-d",
+                "SMTP=127.0.0.1",
+                "-d",
+                &format!("smtp_port={}", smtp_port),
+                "-d",
+                &format!("sendmail_from={}", from_addr),
+                "-d",
+                "sendmail_path=",
+            ]);
+        }
+        cmd.args([
             "-S",
             &format!("127.0.0.1:{}", worker_port),
             "-t",
@@ -1433,6 +1451,10 @@ server.listen(port, '127.0.0.1', () => {{
             .env("PORT", worker_port.to_string())
             .env("HOST", "127.0.0.1")
             .env("SITE_DOMAIN", &clean);
+        if let Some(smtp_port) = self.mail_catcher.smtp_port() {
+            cmd.env("SMTP_HOST", "127.0.0.1")
+                .env("SMTP_PORT", smtp_port.to_string());
+        }
 
         if let Some(out) = stdout_file {
             cmd.stdout(std::process::Stdio::from(out));

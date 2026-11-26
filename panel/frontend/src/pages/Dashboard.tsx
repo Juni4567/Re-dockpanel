@@ -470,7 +470,7 @@ export default function Dashboard() {
     // Feature #9: Mail queue count
     // Admin-gated in the backend; asking as anybody else is a refusal
     // every 5s that this page then swallows (mail queue).
-    if (isAdmin && !desktop) {
+    if (isAdmin) {
       api
         .get<MailQueueResponse>("/mail/queue")
         .then((d) => {
@@ -1310,14 +1310,16 @@ export default function Dashboard() {
                 </span>
               </div>
             )}
-            {/* Feature #9: Mail queue widget. */}
-            {isAdmin && !desktop && (
-              <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
-                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Mail Queue</span>
-                <span className={`text-sm font-medium ${(mailQueue ?? 0) > 0 ? "text-warn-400" : "text-dark-50"}`}>
-                  {mailQueue ?? 0} <span className="text-[10px] text-dark-400">messages</span>
+            {/* Feature #9: Mail queue / Desktop Local Mail Catcher widget. */}
+            {isAdmin && (
+              <Link to="/mail" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive hover:bg-dark-750 transition-colors">
+                <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">
+                  {desktop ? "Local Mail" : "Mail Queue"}
                 </span>
-              </div>
+                <span className={`text-sm font-medium ${(mailQueue ?? 0) > 0 ? "text-warn-400" : "text-dark-50"}`}>
+                  {mailQueue ?? 0} <span className="text-[10px] text-dark-400">{desktop ? "captured" : "messages"}</span>
+                </span>
+              </Link>
             )}
           </div>}
 

@@ -1,6 +1,6 @@
 [package]
 name = "dockpanel-app"
-version = "2.250.0"
+version = "2.251.0"
 edition = "2021"
 description = "DockPanel Desktop - Native Pure Rust Windows Application"
 
@@ -26,6 +26,7 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 
