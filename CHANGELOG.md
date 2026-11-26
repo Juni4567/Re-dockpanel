@@ -4,6 +4,26 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.252.0] - 2026-11-27
+
+### Release: DockPanel Desktop — Real-Time Import Progress, HTTPS Proxy Fix, & Live PHP Logs
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.252.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Real-Time Existing Website & Database Import Progress (`Sites.tsx`, `ProvisionLog.tsx`, `main.rs`, `wordpress.rs`, `mariadb.rs`, `live_sync.rs`, `state.rs`):**
+  - Replaced the blocking existing-WordPress database import request with non-blocking client upload progress (`api.upload`) transitioning seamlessly into a live SSE stream (`/api/sites/{id}/wordpress/import-log/{job_id}`).
+  - Added `import_existing_wp_database_with_progress()`, `rewrite_domains_with_progress()`, `import_mysql_dump_with_progress()`, and `AppState::append_install_progress()` to stream timestamped logs and live progress percentages for `site_connect`, `upload`, `unpack`, `mariadb`, `metadata`, `rewrite`, `db_create`, `db_import`, `wp_config`, `ssl_start`, and `complete`.
+  - Added folder-scanning indicator (`inspectingFolder`), `$table_prefix` badge, auto-expanded Terminal Output (`defaultShowLogs`), and dismissible log viewer in `ProvisionLog.tsx`.
+- **Real-Time Per-Site PHP & Access/Redirect Logs (`state.rs`, `router.rs`, `main.rs`, `SiteDetail.tsx`):**
+  - Isolated per-site logs under `logs/<domain>.php_errors.log`, `logs/<domain>.php_worker.log`, and `logs/<domain>.access.log` (recording HTTP/HTTPS method, path, status, `Location` header on redirects, and duration in ms), plus `wp-content/debug.log` when present.
+  - Added `GET /api/sites/{id}/logs/stream` SSE live-tail endpoint, fixed `/sites/{id}/access-logs` and `/sites/{id}/php-errors` query filtering, and added **Live Tail On/Off** in `SiteDetail.tsx`.
+
+#### Fixed
+- **HTTPS `ERR_TOO_MANY_REDIRECTS` Loop on PHP Sites (`state.rs`):**
+  - Added `ensure_php_proxy_shim()` (`dockpanel_proxy_env.php` via `-d auto_prepend_file=...`) so built-in `php -S` workers behind DockPanel Desktop's TLS-terminating router populate `$_SERVER['HTTPS'] = 'on'`, `REQUEST_SCHEME = 'https'`, and `SERVER_PORT = '443'` from `X-Forwarded-Proto: https`.
+- **Plesk Maintenance Page Drop-In Replacement (`wordpress.rs`, `main.rs`):**
+  - Added `sanitize_plesk_maintenance_dropin()` to detect leftover Plesk/WP Toolkit `wp-content/maintenance.php` drop-ins and replace them with DockPanel Desktop's clean 503 maintenance template during existing-site connection, database import, core reinstallation, and maintenance toggles.
+
 ## [2.251.0] - 2026-11-26
 
 ### Release: DockPanel Desktop — Built-in Mail Catcher, Existing Folder Import, & Live Sync

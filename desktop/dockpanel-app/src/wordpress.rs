@@ -444,10 +444,17 @@ pub fn detect_wp_sql_metadata(sql: &str) -> (Option<String>, Option<String>) {
     (table_prefix, source_url)
 }
 
-fn unpack_uploaded_db_bytes(filename: &str, raw_bytes: &[u8]) -> Result<(bool, Vec<u8>), String> {
+fn unpack_uploaded_db_bytes(filename: &str, raw_bytes: &[u8]) -> Result<(bool, Vec<u8>, String), String> {
     let lower = filename.trim().to_ascii_lowercase();
     if lower.ends_with(".sqlite") || lower.ends_with(".db") || raw_bytes.starts_with(b"SQLite format 3\0") {
-        return Ok((true, raw_bytes.to_vec()));
+        return Ok((
+            true,
+            raw_bytes.to_vec(),
+            format!(
+                "Detected SQLite database ({})",
+                crate::downloads::format_mb(raw_bytes.len() as u64)
+            ),
+        ));
     }
 
     // ZIP archive containing a .sql (or .sqlite) file
@@ -459,16 +466,34 @@ fn unpack_uploaded_db_bytes(filename: &str, raw_bytes: &[u8]) -> Result<(bool, V
             if f.is_dir() {
                 continue;
             }
-            let name = f.name().to_ascii_lowercase();
+            let raw_name = f.name().to_string();
+            let name = raw_name.to_ascii_lowercase();
             if name.ends_with(".sql") {
                 let mut out = Vec::new();
                 std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
-                return Ok((false, out));
+                return Ok((
+                    false,
+                    out.clone(),
+                    format!(
+                        "Extracted '{}' from ZIP ({} -> {})",
+                        raw_name,
+                        crate::downloads::format_mb(raw_bytes.len() as u64),
+                        crate::downloads::format_mb(out.len() as u64)
+                    ),
+                ));
             }
             if name.ends_with(".sqlite") || name.ends_with(".db") {
                 let mut out = Vec::new();
                 std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
-                return Ok((true, out));
+                return Ok((
+                    true,
+                    out.clone(),
+                    format!(
+                        "Extracted SQLite '{}' from ZIP ({})",
+                        raw_name,
+                        crate::downloads::format_mb(out.len() as u64)
+                    ),
+                ));
             }
         }
         return Err("ZIP archive does not contain a .sql or .sqlite database file".to_string());
@@ -482,26 +507,44 @@ fn unpack_uploaded_db_bytes(filename: &str, raw_bytes: &[u8]) -> Result<(bool, V
         decoder
             .read_to_end(&mut out)
             .map_err(|e| format!("Failed decompressing gzip database dump: {e}"))?;
-        return Ok((false, out));
+        return Ok((
+            false,
+            out.clone(),
+            format!(
+                "Decompressed gzip SQL dump ({} -> {})",
+                crate::downloads::format_mb(raw_bytes.len() as u64),
+                crate::downloads::format_mb(out.len() as u64)
+            ),
+        ));
     }
 
-    Ok((false, raw_bytes.to_vec()))
+    Ok((
+        false,
+        raw_bytes.to_vec(),
+        format!(
+            "Loaded plain SQL dump ({})",
+            crate::downloads::format_mb(raw_bytes.len() as u64)
+        ),
+    ))
 }
 
-fn ensure_wp_config_base(site_dir: &Path) -> Result<String, String> {
+fn ensure_wp_config_base(site_dir: &Path) -> Result<(String, &'static str), String> {
     let cfg_path = site_dir.join("wp-config.php");
     if cfg_path.is_file() {
-        return fs::read_to_string(&cfg_path)
-            .map_err(|e| format!("Failed reading wp-config.php: {e}"));
+        let content = fs::read_to_string(&cfg_path)
+            .map_err(|e| format!("Failed reading wp-config.php: {e}"))?;
+        return Ok((content, "existing wp-config.php"));
     }
     let sample_path = site_dir.join("wp-config-sample.php");
     if sample_path.is_file() {
-        return fs::read_to_string(&sample_path)
-            .map_err(|e| format!("Failed reading wp-config-sample.php: {e}"));
+        let content = fs::read_to_string(&sample_path)
+            .map_err(|e| format!("Failed reading wp-config-sample.php: {e}"))?;
+        return Ok((content, "wp-config-sample.php"));
     }
     let salt = uuid::Uuid::new_v4().to_string();
-    Ok(format!(
-        r#"<?php
+    Ok((
+        format!(
+            r#"<?php
 define( 'DB_NAME', 'wordpress' );
 define( 'DB_USER', 'root' );
 define( 'DB_PASSWORD', '' );
@@ -526,6 +569,8 @@ if ( ! defined( 'ABSPATH' ) ) {{
 }}
 require_once ABSPATH . 'wp-settings.php';
 "#
+        ),
+        "generated default wp-config.php",
     ))
 }
 
@@ -541,21 +586,101 @@ pub fn import_existing_wp_database(
     raw_bytes: &[u8],
     source_url_override: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    import_existing_wp_database_with_progress(
+        site_dir,
+        domain,
+        target_url,
+        mariadb_port,
+        filename,
+        raw_bytes,
+        source_url_override,
+        |_, _, _, _, _| {},
+    )
+}
+
+/// Same as `import_existing_wp_database`, streaming `(step, label, status, progress, log_line)` updates.
+pub fn import_existing_wp_database_with_progress<F>(
+    site_dir: &Path,
+    domain: &str,
+    target_url: &str,
+    mariadb_port: Option<u16>,
+    filename: &str,
+    raw_bytes: &[u8],
+    source_url_override: Option<&str>,
+    mut on_progress: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnMut(&str, &str, &str, Option<u8>, Option<&str>),
+{
     if raw_bytes.is_empty() {
         return Err("Uploaded database file is empty".to_string());
     }
-    let (is_sqlite, data_bytes) = unpack_uploaded_db_bytes(filename, raw_bytes)?;
+
+    on_progress(
+        "unpack",
+        &format!("Inspecting & unpacking {}...", filename),
+        "in_progress",
+        Some(15),
+        Some(&format!(
+            "Received '{}' ({})",
+            filename,
+            crate::downloads::format_mb(raw_bytes.len() as u64)
+        )),
+    );
+    let (is_sqlite, data_bytes, unpack_summary) = match unpack_uploaded_db_bytes(filename, raw_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            on_progress("unpack", "Failed unpacking database archive", "error", None, Some(&e));
+            return Err(e);
+        }
+    };
+    on_progress(
+        "unpack",
+        &unpack_summary,
+        "done",
+        Some(100),
+        Some(&unpack_summary),
+    );
+
     let esc_php = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
     let clean_target_url = target_url.trim().trim_end_matches('/');
 
     if is_sqlite {
         let db_dir = site_dir.join("wp-content").join("database");
+        on_progress(
+            "db_import",
+            "Installing SQLite database into wp-content/database/.ht.sqlite...",
+            "in_progress",
+            Some(40),
+            Some(&format!("Target path: {}", db_dir.join(".ht.sqlite").display())),
+        );
         fs::create_dir_all(&db_dir).map_err(|e| format!("Failed creating SQLite dir: {e}"))?;
         let sqlite_target = db_dir.join(".ht.sqlite");
         fs::write(&sqlite_target, &data_bytes)
             .map_err(|e| format!("Failed writing SQLite database: {e}"))?;
+        on_progress(
+            "db_import",
+            &format!(
+                "Installed SQLite database ({})",
+                crate::downloads::format_mb(data_bytes.len() as u64)
+            ),
+            "done",
+            Some(100),
+            Some(&format!(
+                "Wrote {} bytes to {}",
+                data_bytes.len(),
+                sqlite_target.display()
+            )),
+        );
 
-        let mut cfg = ensure_wp_config_base(site_dir)?;
+        on_progress(
+            "wp_config",
+            "Updating wp-config.php for local SQLite & domain URL...",
+            "in_progress",
+            Some(50),
+            None,
+        );
+        let (mut cfg, cfg_src) = ensure_wp_config_base(site_dir)?;
         let clean_db_name = format!("{}_wp", domain.replace('.', "_").replace('-', "_"));
         cfg = upsert_wp_config_constant(&cfg, "DB_ENGINE", "'sqlite'");
         cfg = upsert_wp_config_constant(&cfg, "DB_DIR", "__DIR__ . '/wp-content/database'");
@@ -568,6 +693,16 @@ pub fn import_existing_wp_database(
         cfg = upsert_wp_config_constant(&cfg, "WP_SITEURL", &format!("'{}'", esc_php(clean_target_url)));
         fs::write(site_dir.join("wp-config.php"), cfg)
             .map_err(|e| format!("Failed updating wp-config.php: {e}"))?;
+        on_progress(
+            "wp_config",
+            &format!("Updated wp-config.php (WP_HOME/WP_SITEURL -> {})", clean_target_url),
+            "done",
+            Some(100),
+            Some(&format!(
+                "Source: {} | Set DB_ENGINE='sqlite', DB_NAME='{}', WP_HOME='{}', WP_SITEURL='{}'",
+                cfg_src, clean_db_name, clean_target_url, clean_target_url
+            )),
+        );
 
         return Ok(json!({
             "ok": true,
@@ -585,45 +720,234 @@ pub fn import_existing_wp_database(
             .to_string()
     })?;
 
+    on_progress(
+        "metadata",
+        "Scanning SQL dump for table prefix & source site URL...",
+        "in_progress",
+        Some(25),
+        None,
+    );
     let raw_sql = String::from_utf8_lossy(&data_bytes).to_string();
+    let line_count = raw_sql.lines().count();
     let (detected_prefix, detected_source_url) = detect_wp_sql_metadata(&raw_sql);
     let effective_source_url = source_url_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_end_matches('/').to_string())
-        .or(detected_source_url);
+        .or_else(|| detected_source_url.clone());
 
-    let (final_sql, rewritten) = if let Some(ref src) = effective_source_url {
+    let meta_msg = format!(
+        "Parsed {} lines ({}) | table_prefix={} | detected_url={} | effective_source_url={}",
+        line_count,
+        crate::downloads::format_mb(raw_sql.len() as u64),
+        detected_prefix.as_deref().unwrap_or("(default wp_)"),
+        detected_source_url.as_deref().unwrap_or("(none)"),
+        effective_source_url.as_deref().unwrap_or("(none)")
+    );
+    on_progress(
+        "metadata",
+        &format!(
+            "SQL analyzed ({} lines, prefix: {})",
+            line_count,
+            detected_prefix.as_deref().unwrap_or("wp_")
+        ),
+        "done",
+        Some(100),
+        Some(&meta_msg),
+    );
+
+    let (final_sql, rewritten, replacement_count) = if let Some(ref src) = effective_source_url {
         if !src.eq_ignore_ascii_case(clean_target_url) {
-            (
-                crate::live_sync::rewrite_domains(&raw_sql, src, clean_target_url),
-                true,
-            )
+            let t0 = std::time::Instant::now();
+            on_progress(
+                "rewrite",
+                &format!("Rewriting URLs: {} -> {}", src, clean_target_url),
+                "in_progress",
+                Some(5),
+                Some(&format!(
+                    "Starting serialization-safe URL rewrite: '{}' -> '{}'",
+                    src, clean_target_url
+                )),
+            );
+            let mut last_pct: u8 = 0;
+            let (out_sql, count) = crate::live_sync::rewrite_domains_with_progress(
+                &raw_sql,
+                src,
+                clean_target_url,
+                |done_bytes, total_bytes, reps| {
+                    let pct = if total_bytes > 0 {
+                        ((done_bytes as f64 / total_bytes as f64) * 100.0).round() as u8
+                    } else {
+                        100
+                    };
+                    if pct >= last_pct.saturating_add(10) && pct < 100 {
+                        last_pct = pct;
+                        on_progress(
+                            "rewrite",
+                            &format!("Rewriting URLs ({}% — {} replacements)...", pct, reps),
+                            "in_progress",
+                            Some(pct),
+                            None,
+                        );
+                    }
+                },
+            );
+            let ms = t0.elapsed().as_millis();
+            on_progress(
+                "rewrite",
+                &format!("Rewrote {} URL/domain references ({} -> {})", count, src, clean_target_url),
+                "done",
+                Some(100),
+                Some(&format!(
+                    "Replaced {} URL/serialized PHP occurrences in {} ms",
+                    count, ms
+                )),
+            );
+            (out_sql, true, count)
         } else {
-            (raw_sql, false)
+            on_progress(
+                "rewrite",
+                "Source URL already matches target URL — skipped rewrite",
+                "done",
+                Some(100),
+                Some(&format!("Source and target both '{}'", clean_target_url)),
+            );
+            (raw_sql, false, 0)
         }
     } else {
-        (raw_sql, false)
+        on_progress(
+            "rewrite",
+            "No source URL found in dump — skipped URL rewrite",
+            "done",
+            Some(100),
+            Some("Provide a Source Site URL if serialized links still point to an old domain."),
+        );
+        (raw_sql, false, 0)
     };
 
     let clean_db_name = format!("{}_wp", domain.replace('.', "_").replace('-', "_"));
-    crate::mariadb::create_database(port, &clean_db_name)?;
+    on_progress(
+        "db_create",
+        &format!("Creating local MariaDB database '{}'...", clean_db_name),
+        "in_progress",
+        Some(30),
+        Some(&format!("Target MariaDB instance: 127.0.0.1:{}", port)),
+    );
+    if let Err(e) = crate::mariadb::create_database(port, &clean_db_name) {
+        on_progress(
+            "db_create",
+            &format!("Failed creating database '{}'", clean_db_name),
+            "error",
+            None,
+            Some(&e),
+        );
+        return Err(e);
+    }
+    on_progress(
+        "db_create",
+        &format!("Database '{}' ready on 127.0.0.1:{}", clean_db_name, port),
+        "done",
+        Some(100),
+        Some(&format!(
+            "Created/verified database '{}' (utf8mb4_unicode_ci) on 127.0.0.1:{}",
+            clean_db_name, port
+        )),
+    );
 
     let tmp_sql = std::env::temp_dir().join(format!("dockpanel_wp_imp_{}.sql", uuid::Uuid::new_v4()));
     fs::write(&tmp_sql, final_sql.as_bytes())
         .map_err(|e| format!("Failed staging SQL dump: {e}"))?;
-    let import_res = crate::mariadb::import_mysql_dump(port, &clean_db_name, &tmp_sql);
+
+    let t_imp = std::time::Instant::now();
+    on_progress(
+        "db_import",
+        &format!(
+            "Importing {} into '{}'...",
+            crate::downloads::format_mb(final_sql.len() as u64),
+            clean_db_name
+        ),
+        "in_progress",
+        Some(5),
+        Some(&format!(
+            "Staged SQL dump at {} ({})",
+            tmp_sql.display(),
+            crate::downloads::format_mb(final_sql.len() as u64)
+        )),
+    );
+    let mut last_imp_msg = String::new();
+    let import_res = crate::mariadb::import_mysql_dump_with_progress(
+        port,
+        &clean_db_name,
+        &tmp_sql,
+        |written, total, detail| {
+            let pct = if total > 0 {
+                ((written as f64 / total as f64) * 100.0).round().clamp(5.0, 99.0) as u8
+            } else {
+                50
+            };
+            last_imp_msg = detail.to_string();
+            on_progress(
+                "db_import",
+                &format!("Importing SQL into '{}': {}...", clean_db_name, detail),
+                "in_progress",
+                Some(pct),
+                if written == 0 { Some(detail) } else { None },
+            );
+        },
+    );
     let _ = fs::remove_file(&tmp_sql);
-    import_res?;
+    if let Err(e) = import_res {
+        on_progress(
+            "db_import",
+            &format!("SQL import into '{}' failed", clean_db_name),
+            "error",
+            None,
+            Some(&e),
+        );
+        return Err(e);
+    }
+    let imp_secs = t_imp.elapsed().as_secs_f32();
+    on_progress(
+        "db_import",
+        &format!(
+            "Imported SQL dump into '{}' ({:.2}s)",
+            clean_db_name, imp_secs
+        ),
+        "done",
+        Some(100),
+        Some(&format!(
+            "{} (completed in {:.2}s)",
+            if last_imp_msg.is_empty() {
+                "SQL import completed".to_string()
+            } else {
+                last_imp_msg
+            },
+            imp_secs
+        )),
+    );
 
     // Remove stale SQLite drop-in if the folder previously used SQLite
+    on_progress(
+        "wp_config",
+        "Updating wp-config.php database credentials & URLs...",
+        "in_progress",
+        Some(40),
+        None,
+    );
+    let mut cfg_logs = Vec::new();
     let stale_db_php = site_dir.join("wp-content").join("db.php");
     if stale_db_php.is_file() {
-        let _ = fs::remove_file(&stale_db_php);
+        if fs::remove_file(&stale_db_php).is_ok() {
+            cfg_logs.push(format!("Removed stale SQLite drop-in: {}", stale_db_php.display()));
+        }
+    }
+    if sanitize_plesk_maintenance_dropin(site_dir, domain) {
+        cfg_logs.push("Replaced leftover Plesk wp-content/maintenance.php with DockPanel Desktop maintenance page".to_string());
     }
 
     // Update wp-config.php with new local MariaDB credentials, table prefix, and site URL
-    let mut cfg = ensure_wp_config_base(site_dir)?;
+    let (mut cfg, cfg_src) = ensure_wp_config_base(site_dir)?;
+    cfg_logs.push(format!("Base config source: {}", cfg_src));
     cfg = remove_wp_config_constant(&cfg, "DB_ENGINE");
     cfg = remove_wp_config_constant(&cfg, "DB_DIR");
     cfg = remove_wp_config_constant(&cfg, "DB_FILE");
@@ -635,10 +959,22 @@ pub fn import_existing_wp_database(
     cfg = upsert_wp_config_constant(&cfg, "WP_SITEURL", &format!("'{}'", esc_php(clean_target_url)));
     if let Some(ref pfx) = detected_prefix {
         cfg = update_wp_table_prefix(&cfg, pfx);
+        cfg_logs.push(format!("Set $table_prefix = '{}'", pfx));
     }
+    cfg_logs.push(format!(
+        "Set DB_NAME='{}', DB_HOST='127.0.0.1:{}', WP_HOME='{}', WP_SITEURL='{}'",
+        clean_db_name, port, clean_target_url, clean_target_url
+    ));
 
     fs::write(site_dir.join("wp-config.php"), cfg)
         .map_err(|e| format!("Failed updating wp-config.php: {e}"))?;
+    on_progress(
+        "wp_config",
+        &format!("Updated wp-config.php (DB: {}, URL: {})", clean_db_name, clean_target_url),
+        "done",
+        Some(100),
+        Some(&cfg_logs.join("\n")),
+    );
 
     Ok(json!({
         "ok": true,
@@ -649,6 +985,7 @@ pub fn import_existing_wp_database(
         "source_url": effective_source_url,
         "target_url": clean_target_url,
         "rewritten": rewritten,
+        "replacements": replacement_count,
         "wp_config_updated": true,
     }))
 }
@@ -1363,6 +1700,11 @@ where
                 );
             },
         )?;
+        let maint_domain = site_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("localhost");
+        sanitize_plesk_maintenance_dropin(site_dir, maint_domain);
         on_progress("extract", "Core files extracted cleanly", "done", None);
         return Ok(json!({
             "ok": true,
@@ -1748,9 +2090,78 @@ echo json_encode([
     })
 }
 
+fn render_dockpanel_maintenance_php(domain: &str) -> String {
+    let clean_dom = domain
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<?php
+$protocol = $_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1';
+if ('HTTP/1.1' !== $protocol && 'HTTP/1.0' !== $protocol) {{
+    $protocol = 'HTTP/1.0';
+}}
+header("{{$protocol}} 503 Service Unavailable", true, 503);
+header('Content-Type: text/html; charset=utf-8');
+header('Retry-After: 600');
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{domain} — Scheduled Maintenance</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b1120; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 1.5rem; }}
+        .card {{ background: #111827; border: 1px solid #1e293b; border-radius: 1rem; padding: 2.25rem; max-width: 480px; width: 100%; text-align: center; box-shadow: 0 20px 45px rgba(0, 0, 0, 0.45); }}
+        h1 {{ font-size: 1.35rem; margin: 0 0 0.75rem; color: #f8fafc; }}
+        p {{ color: #94a3b8; font-size: 0.95rem; line-height: 1.6; margin: 0; }}
+        .badge {{ display: inline-block; margin-top: 1.25rem; padding: 0.3rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; background: rgba(245, 158, 11, 0.14); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.25); }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Scheduled Maintenance</h1>
+        <p><strong>{domain}</strong> is briefly unavailable while maintenance is in progress. Please check back shortly.</p>
+        <span class="badge">DockPanel Desktop</span>
+    </div>
+</body>
+</html>
+"#,
+        domain = clean_dom
+    )
+}
+
+/// Replaces leftover Plesk / WP Toolkit `wp-content/maintenance.php` drop-ins with
+/// DockPanel Desktop's own clean 503 maintenance template. Returns `true` if replaced.
+pub fn sanitize_plesk_maintenance_dropin(site_dir: &Path, domain: &str) -> bool {
+    let maint_php = site_dir.join("wp-content").join("maintenance.php");
+    if !maint_php.is_file() {
+        return false;
+    }
+    if let Ok(content) = fs::read_to_string(&maint_php) {
+        let lower = content.to_ascii_lowercase();
+        if lower.contains("plesk.com") || lower.contains("plesk-logo") || lower.contains("wp toolkit") {
+            let _ = fs::write(&maint_php, render_dockpanel_maintenance_php(domain));
+            return true;
+        }
+    }
+    false
+}
+
 pub fn set_maintenance(site_dir: &Path, enabled: bool) -> Result<serde_json::Value, String> {
     let maint = site_dir.join(".maintenance");
     if enabled {
+        let domain = site_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("localhost");
+        sanitize_plesk_maintenance_dropin(site_dir, domain);
+        let wp_content = site_dir.join("wp-content");
+        let maint_php = wp_content.join("maintenance.php");
+        if wp_content.is_dir() && !maint_php.is_file() {
+            let _ = fs::write(&maint_php, render_dockpanel_maintenance_php(domain));
+        }
         fs::write(&maint, "<?php $upgrading = time(); ?>\n").map_err(|e| e.to_string())?;
     } else if maint.exists() {
         fs::remove_file(&maint).map_err(|e| e.to_string())?;
@@ -2337,8 +2748,9 @@ mod tests {
         assert_eq!(pfx.as_deref(), Some("wp_live_"));
         assert_eq!(src_url.as_deref(), Some("https://prod.example.com"));
 
-        // Verify SQLite import updates wp-config.php URL & credentials
-        let res = import_existing_wp_database(
+        // Verify SQLite import updates wp-config.php URL & credentials and emits progress steps
+        let mut seen_steps: Vec<(String, String)> = Vec::new();
+        let res = import_existing_wp_database_with_progress(
             &wp_dir,
             "mywp.test",
             "https://mywp.test",
@@ -2346,14 +2758,28 @@ mod tests {
             "site.sqlite",
             b"SQLite format 3\0dummy",
             None,
+            |step, _lbl, status, _pct, _log| {
+                seen_steps.push((step.to_string(), status.to_string()));
+            },
         )
         .unwrap();
         assert_eq!(res["db_engine"], "sqlite");
+        assert!(seen_steps.iter().any(|(s, st)| s == "unpack" && st == "done"));
+        assert!(seen_steps.iter().any(|(s, st)| s == "db_import" && st == "done"));
+        assert!(seen_steps.iter().any(|(s, st)| s == "wp_config" && st == "done"));
         let updated_cfg = fs::read_to_string(wp_dir.join("wp-config.php")).unwrap();
         assert!(updated_cfg.contains("define( 'DB_ENGINE', 'sqlite' )"));
         assert!(updated_cfg.contains("define( 'WP_HOME', 'https://mywp.test' )"));
         assert!(updated_cfg.contains("define( 'WP_SITEURL', 'https://mywp.test' )"));
         assert!(wp_dir.join("wp-content").join("database").join(".ht.sqlite").is_file());
+
+        // Verify Plesk maintenance drop-in is replaced with DockPanel template
+        let maint_php = wp_dir.join("wp-content").join("maintenance.php");
+        fs::write(&maint_php, "<html>Powered by WP Toolkit <a href=\"https://www.plesk.com/\">Plesk</a></html>").unwrap();
+        assert!(sanitize_plesk_maintenance_dropin(&wp_dir, "mywp.test"));
+        let replaced = fs::read_to_string(&maint_php).unwrap();
+        assert!(replaced.contains("DockPanel Desktop"));
+        assert!(!replaced.to_lowercase().contains("plesk"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

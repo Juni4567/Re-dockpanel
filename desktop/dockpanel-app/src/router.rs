@@ -443,6 +443,15 @@ async fn proxy_to_worker(
 }
 
 pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppState>) -> Response {
+    let req_started = std::time::Instant::now();
+    let method_str = req.method().as_str().to_string();
+    let is_https = req.extensions().get::<IsHttps>().map(|h| h.0).unwrap_or(false);
+    let path_and_query_for_log = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
     // 1. Extract Host header. Strip port if present.
     let host_header = match req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()) {
         Some(h) if !h.trim().is_empty() => h.trim(),
@@ -466,6 +475,31 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
         }
     };
 
+    let resp = route_matched_site_request(req, &state, &site).await;
+    let elapsed_ms = req_started.elapsed().as_millis();
+    let status_code = resp.status().as_u16();
+    let scheme = if is_https { "HTTPS" } else { "HTTP" };
+    let location_note = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|loc| format!(" (Location: {})", loc))
+        .unwrap_or_default();
+    state.append_site_access_log(
+        &site.domain,
+        &format!(
+            "{} {} {} -> {}{} [{}ms]",
+            scheme, method_str, path_and_query_for_log, status_code, location_note, elapsed_ms
+        ),
+    );
+    resp
+}
+
+async fn route_matched_site_request(
+    req: axum::extract::Request,
+    state: &Arc<AppState>,
+    site: &crate::state::LocalSite,
+) -> Response {
     // 4. If site status is "stopped"
     if site.status.eq_ignore_ascii_case("stopped") {
         return render_stopped_page(&site.domain);

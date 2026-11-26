@@ -205,6 +205,22 @@ pub struct AppState {
 }
 
 /// Finds an available loopback TCP port.
+fn open_log_file_append(path: &Path, max_bytes: u64) -> Option<fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > max_bytes {
+            let _ = fs::write(path, "");
+        }
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 pub fn find_available_loopback_port() -> Option<u16> {
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
@@ -779,6 +795,50 @@ impl AppState {
         self.push_php_install_step(install_id, obj, done);
     }
 
+    /// Updates a progress step in-place while preserving and appending timestamped log lines.
+    pub fn append_install_progress(
+        &self,
+        install_id: &str,
+        step: &str,
+        label: &str,
+        status: &str,
+        progress: Option<u8>,
+        log_line: Option<&str>,
+        done: bool,
+    ) {
+        let mut merged_msg = String::new();
+        if let Ok(jobs) = self.php_installs.lock() {
+            if let Some(job) = jobs.get(install_id) {
+                if let Some(existing) = job.steps.iter().find(|s| {
+                    s.get("step").and_then(|v| v.as_str()) == Some(step)
+                }) {
+                    if let Some(prev) = existing.get("message").and_then(|v| v.as_str()) {
+                        merged_msg = prev.to_string();
+                    }
+                }
+            }
+        }
+        if let Some(line) = log_line.map(str::trim).filter(|s| !s.is_empty()) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            let stamped = format!("[{}] {}", ts, line);
+            if !merged_msg.lines().last().map(|l| l.ends_with(line)).unwrap_or(false) {
+                if !merged_msg.is_empty() {
+                    merged_msg.push('\n');
+                }
+                merged_msg.push_str(&stamped);
+            }
+        }
+        self.push_install_progress(
+            install_id,
+            step,
+            label,
+            status,
+            progress,
+            if merged_msg.is_empty() { None } else { Some(merged_msg.as_str()) },
+            done,
+        );
+    }
+
     pub fn certs_dir(&self) -> PathBuf {
         self.config_dir.join("certs")
     }
@@ -1309,13 +1369,24 @@ server.listen(port, '127.0.0.1', () => {{
         #[cfg(windows)]
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        let php_error_log = self.config_dir.join("php_errors.log");
+        let logs_dir = self.config_dir.join("logs");
+        let _ = fs::create_dir_all(&logs_dir);
+
+        let php_error_log = self.php_error_log_path(&clean);
         let error_log_arg = format!("error_log={}", php_error_log.to_string_lossy());
         let mut cmd = std::process::Command::new(&php_exe);
         cmd.args([
             "-d",
+            "log_errors=On",
+            "-d",
             &error_log_arg,
         ]);
+        if let Some(shim_path) = self.ensure_php_proxy_shim() {
+            cmd.args([
+                "-d",
+                &format!("auto_prepend_file={}", shim_path.to_string_lossy()),
+            ]);
+        }
         if let Some(smtp_port) = self.mail_catcher.smtp_port() {
             let from_addr = format!("wordpress@{}", clean);
             cmd.args([
@@ -1329,14 +1400,25 @@ server.listen(port, '127.0.0.1', () => {{
                 "sendmail_path=",
             ]);
         }
+        let worker_log_path = self.php_worker_log_path(&clean);
+        let (stdout_cfg, stderr_cfg) = match open_log_file_append(&worker_log_path, 2 * 1024 * 1024) {
+            Some(f) => {
+                let err_f = f.try_clone().ok();
+                (
+                    std::process::Stdio::from(f),
+                    err_f.map(std::process::Stdio::from).unwrap_or_else(std::process::Stdio::null),
+                )
+            }
+            None => (std::process::Stdio::null(), std::process::Stdio::null()),
+        };
         cmd.args([
             "-S",
             &format!("127.0.0.1:{}", worker_port),
             "-t",
             doc_root,
         ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(stdout_cfg)
+        .stderr(stderr_cfg);
 
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -1364,6 +1446,52 @@ server.listen(port, '127.0.0.1', () => {{
     pub fn app_log_path(&self, domain: &str) -> PathBuf {
         let clean = domain.trim().to_lowercase();
         self.config_dir.join("logs").join(format!("{}.app.log", clean))
+    }
+
+    pub fn php_error_log_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("logs").join(format!("{}.php_errors.log", clean))
+    }
+
+    pub fn php_worker_log_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("logs").join(format!("{}.php_worker.log", clean))
+    }
+
+    pub fn access_log_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("logs").join(format!("{}.access.log", clean))
+    }
+
+    pub fn append_site_access_log(&self, domain: &str, entry: &str) {
+        use std::io::Write;
+        let path = self.access_log_path(domain);
+        if let Some(mut f) = open_log_file_append(&path, 5 * 1024 * 1024) {
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(f, "[{}] {}", ts, entry);
+        }
+    }
+
+    /// Writes the shared PHP prepend shim so built-in `php -S` workers behind DockPanel's
+    /// TLS-terminating router populate `$_SERVER['HTTPS'] = 'on'` and `SERVER_PORT = 443`
+    /// whenever `X-Forwarded-Proto: https` is present (prevents WordPress HTTPS redirect loops).
+    pub fn ensure_php_proxy_shim(&self) -> Option<PathBuf> {
+        let _ = fs::create_dir_all(&self.config_dir);
+        let shim_path = self.config_dir.join("dockpanel_proxy_env.php");
+        const SHIM_CODE: &str = r#"<?php
+if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string)$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
+    $_SERVER['HTTPS'] = 'on';
+    $_SERVER['REQUEST_SCHEME'] = 'https';
+    $_SERVER['SERVER_PORT'] = '443';
+}
+"#;
+        let needs_write = fs::read_to_string(&shim_path)
+            .map(|c| c != SHIM_CODE)
+            .unwrap_or(true);
+        if needs_write && fs::write(&shim_path, SHIM_CODE).is_err() {
+            return None;
+        }
+        Some(shim_path)
     }
 
     pub fn spawn_site_worker(&self, site: &LocalSite) {
@@ -2047,6 +2175,35 @@ mod tests {
         assert!(site_dir.join("package.json").is_file());
         assert!(site_dir.join("server.js").is_file());
         assert!(!site_dir.join("index.html").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_php_proxy_shim_and_per_site_log_paths() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_shim_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir.clone(), sites_dir);
+
+        let shim = state.ensure_php_proxy_shim().expect("shim should be created");
+        assert!(shim.is_file());
+        let content = std::fs::read_to_string(&shim).unwrap();
+        assert!(content.contains("HTTP_X_FORWARDED_PROTO"));
+        assert!(content.contains("$_SERVER['HTTPS'] = 'on'"));
+        assert!(content.contains("$_SERVER['SERVER_PORT'] = '443'"));
+
+        assert_eq!(
+            state.php_error_log_path("Example.Local"),
+            config_dir.join("logs").join("example.local.php_errors.log")
+        );
+        assert_eq!(
+            state.access_log_path("Example.Local"),
+            config_dir.join("logs").join("example.local.access.log")
+        );
+        state.append_site_access_log("Example.Local", "HTTPS GET / -> 200 [3ms]");
+        let access_txt = std::fs::read_to_string(state.access_log_path("Example.Local")).unwrap();
+        assert!(access_txt.contains("HTTPS GET / -> 200 [3ms]"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

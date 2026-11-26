@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useParams, useNavigate, Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
@@ -185,7 +185,9 @@ export default function SiteDetail() {
   const [phpErrors, setPhpErrors] = useState("");
   const [logsLoading, setLogsLoading] = useState(false);
   const [showAccessLogs, setShowAccessLogs] = useState(false);
-  const [logType, setLogType] = useState<"access" | "error" | "php">("access");
+  const [logType, setLogType] = useState<"access" | "error" | "php">(isDesktopApp() ? "php" : "access");
+  const [liveLogs, setLiveLogs] = useState<boolean>(isDesktopApp());
+  const logPreRef = useRef<HTMLPreElement | null>(null);
 
   // Traffic Stats
   interface TrafficStats {
@@ -407,6 +409,51 @@ export default function SiteDetail() {
       setLogsLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!showAccessLogs || !liveLogs || !id) return;
+
+    if (isDesktopApp()) {
+      const es = new EventSource(`/api/sites/${id}/logs/stream?type=${logType}&lines=200`);
+      const applyLines = (text: string) => {
+        if (logType === "access") setAccessLogs(text);
+        else if (logType === "error") setErrorLogs(text);
+        else setPhpErrors(text);
+      };
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data) as { mode?: string; lines?: string[] };
+          const incoming = Array.isArray(payload.lines) ? payload.lines : [];
+          if (payload.mode === "append") {
+            const appendText = incoming.join("\n");
+            if (!appendText) return;
+            const updater = (prev: string) => (prev ? `${prev}\n${appendText}` : appendText);
+            if (logType === "access") setAccessLogs(updater);
+            else if (logType === "error") setErrorLogs(updater);
+            else setPhpErrors(updater);
+          } else {
+            applyLines(incoming.join("\n"));
+          }
+          setLogsLoading(false);
+        } catch {
+          // ignore malformed event
+        }
+      };
+      return () => es.close();
+    }
+
+    const timer = setInterval(() => {
+      if (logType === "php") void loadPhpErrors();
+      else void loadLogs(logType);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [showAccessLogs, liveLogs, logType, id]);
+
+  useEffect(() => {
+    if (showAccessLogs && liveLogs && logPreRef.current) {
+      logPreRef.current.scrollTop = logPreRef.current.scrollHeight;
+    }
+  }, [accessLogs, errorLogs, phpErrors, showAccessLogs, liveLogs]);
 
   const loadAppStatus = useCallback(async () => {
     try {
@@ -3175,12 +3222,27 @@ export default function SiteDetail() {
         </div>
       )}
 
-      {/* Access Logs */}
+      {/* Access & PHP Logs */}
       {site.status === "active" && (
         <div id="logs-section" className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
-          <button onClick={() => { setShowAccessLogs(!showAccessLogs); if (!showAccessLogs) loadLogs(logType === "php" ? "access" : logType as "access" | "error"); }}
+          <button onClick={() => {
+            const next = !showAccessLogs;
+            setShowAccessLogs(next);
+            if (next) {
+              if (logType === "php") void loadPhpErrors();
+              else void loadLogs(logType);
+            }
+          }}
             className="w-full px-5 py-4 flex items-center justify-between hover:bg-dark-700/30 transition-colors">
-            <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Access Logs</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Site &amp; PHP Logs</h2>
+              {showAccessLogs && liveLogs && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px] font-mono">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  LIVE
+                </span>
+              )}
+            </div>
             <svg className={`w-4 h-4 text-dark-300 transition-transform ${showAccessLogs ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" />
             </svg>
@@ -3198,11 +3260,25 @@ export default function SiteDetail() {
                       className={`px-2 py-1 rounded text-xs font-medium ${logType === "php" ? "bg-warn-500/15 text-warn-400" : "text-dark-300 hover:text-dark-100"}`}>PHP Errors</button>
                   )}
                 </div>
-                <button onClick={() => logType === "php" ? loadPhpErrors() : loadLogs(logType as "access" | "error")} className="text-xs text-rust-400 hover:text-rust-300">
-                  {logsLoading ? "Loading..." : "Refresh"}
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setLiveLogs((v) => !v)}
+                    className={`inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-mono border transition-colors ${
+                      liveLogs
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                        : "border-dark-600 bg-dark-800 text-dark-300 hover:text-dark-100"
+                    }`}
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${liveLogs ? "bg-emerald-400 animate-pulse" : "bg-dark-500"}`} />
+                    {liveLogs ? "Live Tail On" : "Live Tail Off"}
+                  </button>
+                  <button onClick={() => logType === "php" ? loadPhpErrors() : loadLogs(logType as "access" | "error")} className="text-xs text-rust-400 hover:text-rust-300">
+                    {logsLoading ? "Loading..." : "Refresh"}
+                  </button>
+                </div>
               </div>
-              <pre className="p-4 text-[11px] font-mono text-dark-200 bg-dark-950 max-h-80 overflow-y-auto overflow-x-auto whitespace-pre-wrap">
+              <pre ref={logPreRef} className="p-4 text-[11px] font-mono text-dark-200 bg-dark-950 max-h-80 overflow-y-auto overflow-x-auto whitespace-pre-wrap">
                 {logsLoading ? "Loading logs..." : (logType === "access" ? accessLogs : logType === "error" ? errorLogs : phpErrors) || "No logs available"}
               </pre>
             </div>

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { showGlobalNotification } from "../context/NotificationContext";
 
-interface ProvisionStep {
+export interface ProvisionStep {
   step: string;
   label: string;
   status: "pending" | "in_progress" | "done" | "error";
@@ -14,14 +14,26 @@ interface Props {
   sseUrl?: string;
   title?: string;
   autoClose?: boolean;
+  defaultShowLogs?: boolean;
+  externalSteps?: ProvisionStep[];
   onComplete?: () => void;
+  onDismiss?: () => void;
 }
 
-export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false, onComplete }: Props) {
+export default function ProvisionLog({
+  siteId,
+  sseUrl,
+  title,
+  autoClose = false,
+  defaultShowLogs = false,
+  externalSteps,
+  onComplete,
+  onDismiss,
+}: Props) {
   const [steps, setSteps] = useState<ProvisionStep[]>([]);
   const [done, setDone] = useState(false);
   const [severed, setSevered] = useState(false);
-  const [showLogs, setShowLogs] = useState(false);
+  const [showLogs, setShowLogs] = useState(defaultShowLogs);
   const [copied, setCopied] = useState(false);
   const receivedRef = useRef(0);
   const logContainerRef = useRef<HTMLPreElement | null>(null);
@@ -30,6 +42,12 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
   const defaultTitle = isDeploy ? "Deploying..." : "Provisioning...";
 
   const url = sseUrl || (siteId ? `/api/sites/${siteId}/provision-log` : "");
+
+  useEffect(() => {
+    if (defaultShowLogs) {
+      setShowLogs(true);
+    }
+  }, [defaultShowLogs, url]);
 
   useEffect(() => {
     if (!url) return;
@@ -100,20 +118,32 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
     return () => es.close();
   }, [url]);
 
+  const mergedSteps = (() => {
+    if (!externalSteps || externalSteps.length === 0) return steps;
+    const out = [...externalSteps];
+    for (const s of steps) {
+      const idx = out.findIndex((x) => x.step === s.step);
+      if (idx >= 0) out[idx] = s;
+      else out.push(s);
+    }
+    return out;
+  })();
+
   // Auto-scroll logs to bottom as they update
   useEffect(() => {
     if (showLogs && logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
-  }, [steps, showLogs]);
+  }, [mergedSteps, showLogs]);
 
-  const visibleSteps = steps.filter((s) => s.step !== "complete");
-  const completeStep = steps.find((s) => s.step === "complete");
+  const visibleSteps = mergedSteps.filter((s) => s.step !== "complete");
+  const completeStep = mergedSteps.find((s) => s.step === "complete");
 
-  const hasError = completeStep?.status === "error" || steps.some((s) => s.status === "error");
-  const isComplete = done && !hasError && !severed;
+  const hasError = completeStep?.status === "error" || mergedSteps.some((s) => s.status === "error");
+  const effectiveDone = done || Boolean(completeStep);
+  const isComplete = effectiveDone && !hasError && !severed;
 
-  const headline = !done
+  const headline = !effectiveDone
     ? (title || defaultTitle)
     : severed
     ? "Progress unavailable"
@@ -134,7 +164,7 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
   })();
 
   // Collect all step messages into a combined execution log
-  const allLogs = steps
+  const allLogs = mergedSteps
     .filter((s) => s.message && s.message.trim().length > 0)
     .map((s) => `[${s.step.toUpperCase()}] ${s.label}\n${s.message}`)
     .join("\n\n");
@@ -153,7 +183,7 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
       {/* Header */}
       <div className="flex items-center justify-between gap-3 mb-4">
         <div className="flex items-center gap-3">
-          {!done ? (
+          {!effectiveDone ? (
             <svg className="w-5 h-5 text-rust-400 animate-spin" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
@@ -175,7 +205,7 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
             <span className="text-sm font-semibold text-dark-50 font-mono tracking-wide">
               {headline}
             </span>
-            {!done && (
+            {!effectiveDone && (
               <span className="ml-2 text-xs text-dark-300 font-mono">
                 {visibleSteps.length > 0 ? `(Step ${visibleSteps.length}: ${visibleSteps[visibleSteps.length - 1].label})` : "Initializing..."}
               </span>
@@ -183,7 +213,7 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
           </div>
         </div>
 
-        {/* Right controls: Overall % + View Logs toggle */}
+        {/* Right controls: Overall % + View Logs toggle + Dismiss */}
         <div className="flex items-center gap-2">
           {!severed && (
             <span className="text-xs font-mono font-semibold text-dark-200 tabular-nums">
@@ -200,6 +230,16 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
               <span className="px-1.5 py-0.2 rounded bg-dark-800 text-[10px] text-dark-300 border border-dark-600">
                 {allLogs.split("\n").length} lines
               </span>
+            </button>
+          )}
+          {effectiveDone && onDismiss && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              className="px-2.5 py-1 text-xs font-mono font-medium rounded-md border border-dark-600 bg-dark-700/60 hover:bg-dark-700 text-dark-200 hover:text-dark-50 transition-colors"
+              aria-label="Dismiss progress log"
+            >
+              Dismiss
             </button>
           )}
         </div>
@@ -273,7 +313,7 @@ export default function ProvisionLog({ siteId, sseUrl, title, autoClose = false,
               )}
               {step.message && !showLogs && (
                 <p className="text-xs text-dark-300 mt-0.5 line-clamp-2 font-mono">
-                  {step.message.slice(0, 300)}...
+                  {step.message.length > 300 ? `${step.message.slice(0, 300)}...` : step.message}
                 </p>
               )}
             </div>

@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api";
 import { formatDate, formatSize } from "../utils/format";
 import { statusColors, runtimeLabels } from "../constants";
-import ProvisionLog from "../components/ProvisionLog";
+import ProvisionLog, { type ProvisionStep } from "../components/ProvisionLog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
 import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
@@ -59,7 +59,13 @@ export default function Sites() {
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState("");
-  const [provisioningSiteId, setProvisioningSiteId] = useState<string | null>(null);
+  const [provisionJob, setProvisionJob] = useState<{
+    siteId?: string;
+    sseUrl?: string;
+    title?: string;
+    defaultShowLogs?: boolean;
+    externalSteps?: ProvisionStep[];
+  } | null>(null);
   const [search, setSearch] = useState("");
   const [displayCount, setDisplayCount] = useState(25);
   const [viewMode, setViewMode] = useState<"table" | "grid">("table");
@@ -102,6 +108,7 @@ export default function Sites() {
   const [customRootPath, setCustomRootPath] = useState("");
   const [defaultSitesDir, setDefaultSitesDir] = useState("");
   const [browsingFolder, setBrowsingFolder] = useState(false);
+  const [inspectingFolder, setInspectingFolder] = useState(false);
   const [folderInspection, setFolderInspection] = useState<{
     path: string;
     exists: boolean;
@@ -206,19 +213,25 @@ export default function Sites() {
     if (!isDesktopApp()) return;
     const trimmed = customRootPath.trim();
     if (!trimmed) {
+      setInspectingFolder(false);
       setFolderInspection(null);
       setWpDbFile(null);
       setWpSourceUrl("");
       setSkipWpDbUpload(false);
       return;
     }
+    setInspectingFolder(true);
     const timer = setTimeout(() => {
       api
         .post<NonNullable<typeof folderInspection>>("/desktop/inspect-folder", { path: trimmed })
         .then((insp) => applyFolderInspection(insp))
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => setInspectingFolder(false));
     }, 300);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      setInspectingFolder(false);
+    };
   }, [customRootPath]);
 
   const applyFolderInspection = (insp: NonNullable<typeof folderInspection>) => {
@@ -262,12 +275,18 @@ export default function Sites() {
     }
   };
 
-  const fileToBase64 = (file: File): Promise<string> =>
+  const fileToBase64 = (file: File, onReadProgress?: (pct: number) => void): Promise<string> =>
     new Promise((resolve, reject) => {
       const reader = new FileReader();
+      reader.onprogress = (ev) => {
+        if (ev.lengthComputable && onReadProgress) {
+          onReadProgress(Math.round((ev.loaded / ev.total) * 100));
+        }
+      };
       reader.onload = () => {
         const result = typeof reader.result === "string" ? reader.result : "";
         const commaIdx = result.indexOf(",");
+        onReadProgress?.(100);
         resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
       };
       reader.onerror = () => reject(new Error("Failed reading selected database file"));
@@ -333,31 +352,14 @@ export default function Sites() {
       }
 
       const created = await api.post<Site>("/sites", body);
-
-      if (isExistingWpDir && wpDbFile && !skipWpDbUpload) {
-        showGlobalNotification("info", `Importing WordPress database for ${created.domain}...`);
-        const contentBase64 = await fileToBase64(wpDbFile);
-        const targetUrl =
-          sslPort && created.ssl_enabled
-            ? buildSiteExternalUrl(created.domain, sslPort, true)
-            : buildSiteExternalUrl(created.domain, conflictInfo?.active_port, false);
-        const imp = await api.post<{ db_name: string; rewritten?: boolean; source_url?: string | null }>(
-          `/sites/${created.id}/wordpress/import-database`,
-          {
-            filename: wpDbFile.name,
-            content_base64: contentBase64,
-            source_url: wpSourceUrl.trim() || undefined,
-            target_url: targetUrl,
-          },
-        );
-        showGlobalNotification(
-          "success",
-          `Connected ${created.domain} (${imp.db_name}) and updated wp-config.php`,
-        );
-      } else {
-        setProvisioningSiteId(created.id);
-        showGlobalNotification("info", `Creating local site ${created.domain}...`);
-      }
+      const isConnectExisting = !!body.connect_existing;
+      const selectedDbFile = isExistingWpDir && wpDbFile && !skipWpDbUpload ? wpDbFile : null;
+      const selectedFolderPath = customRootPath.trim();
+      const selectedSourceUrl = wpSourceUrl.trim();
+      const targetUrl =
+        sslPort && created.ssl_enabled
+          ? buildSiteExternalUrl(created.domain, sslPort, true)
+          : buildSiteExternalUrl(created.domain, conflictInfo?.active_port, false);
 
       setShowForm(false);
       setDomain("");
@@ -379,6 +381,190 @@ export default function Sites() {
       setBackupFrequency("daily");
       setBackupRetention(7);
       fetchSites();
+
+      if (selectedDbFile) {
+        const ts = () => new Date().toTimeString().slice(0, 8);
+        const fmtSize = (bytes: number) =>
+          bytes < 1024 * 1024
+            ? `${Math.max(1, Math.round(bytes / 1024))} KB`
+            : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        const fileSizeLabel = fmtSize(selectedDbFile.size);
+        const connectMsg = `[${ts()}] Folder: ${selectedFolderPath || created.domain}\n[${ts()}] Registered ${created.domain} -> ${targetUrl}`;
+        const initialUploadMsg = `[${ts()}] Reading ${selectedDbFile.name} (${fileSizeLabel})...`;
+
+        const updateUploadStep = (uploadStep: ProvisionStep, extraStep?: ProvisionStep) => {
+          setProvisionJob((prev) => {
+            const base = (prev?.externalSteps || [
+              {
+                step: "site_connect",
+                label: `Connected existing WordPress folder for ${created.domain}`,
+                status: "done",
+                progress: 100,
+                message: connectMsg,
+              },
+            ]).filter((s) => s.step !== "upload" && (!extraStep || s.step !== extraStep.step));
+            const nextSteps = [...base, uploadStep];
+            if (extraStep) nextSteps.push(extraStep);
+            return {
+              sseUrl: prev?.sseUrl,
+              title: `Connecting ${created.domain} & Importing Database...`,
+              defaultShowLogs: true,
+              externalSteps: nextSteps,
+            };
+          });
+        };
+
+        setProvisionJob({
+          title: `Connecting ${created.domain} & Importing Database...`,
+          defaultShowLogs: true,
+          externalSteps: [
+            {
+              step: "site_connect",
+              label: `Connected existing WordPress folder for ${created.domain}`,
+              status: "done",
+              progress: 100,
+              message: connectMsg,
+            },
+            {
+              step: "upload",
+              label: `Reading ${selectedDbFile.name} (${fileSizeLabel})...`,
+              status: "in_progress",
+              progress: 5,
+              message: initialUploadMsg,
+            },
+          ],
+        });
+        showGlobalNotification("info", `Uploading & importing database for ${created.domain}...`);
+
+        let uploadLog = initialUploadMsg;
+        let lastLoggedBucket = -1;
+        void (async () => {
+          try {
+            const contentBase64 = await fileToBase64(selectedDbFile, (readPct) => {
+              const overallPct = Math.max(5, Math.min(25, Math.round(readPct * 0.25)));
+              updateUploadStep({
+                step: "upload",
+                label: `Preparing ${selectedDbFile.name} (${readPct}%)...`,
+                status: "in_progress",
+                progress: overallPct,
+                message: uploadLog,
+              });
+            });
+
+            uploadLog += `\n[${ts()}] Uploading ${selectedDbFile.name} (${fileSizeLabel}) to local server...`;
+            updateUploadStep({
+              step: "upload",
+              label: `Uploading ${selectedDbFile.name} (0%)...`,
+              status: "in_progress",
+              progress: 25,
+              message: uploadLog,
+            });
+
+            const imp = await api.upload<{
+              ok?: boolean;
+              streaming?: boolean;
+              job_id?: string;
+              sse_url?: string;
+              db_name?: string;
+            }>(
+              `/sites/${created.id}/wordpress/import-database`,
+              {
+                filename: selectedDbFile.name,
+                content_base64: contentBase64,
+                source_url: selectedSourceUrl || undefined,
+                target_url: targetUrl,
+                stream: true,
+              },
+              (loaded, total) => {
+                const upPct = total > 0 ? Math.round((loaded / total) * 100) : 50;
+                const combinedPct = Math.min(98, 25 + Math.round(upPct * 0.73));
+                const bucket = Math.floor(upPct / 25);
+                if (bucket > lastLoggedBucket && upPct < 100) {
+                  lastLoggedBucket = bucket;
+                  uploadLog += `\n[${ts()}] Uploaded ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`;
+                }
+                updateUploadStep({
+                  step: "upload",
+                  label: `Uploading ${selectedDbFile.name}: ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`,
+                  status: "in_progress",
+                  progress: combinedPct,
+                  message: uploadLog,
+                });
+              },
+            );
+
+            uploadLog += `\n[${ts()}] Upload complete — starting server-side import pipeline...`;
+            if (imp.sse_url) {
+              setProvisionJob((prev) => ({
+                sseUrl: imp.sse_url,
+                title: `Connecting ${created.domain} & Importing Database...`,
+                defaultShowLogs: true,
+                externalSteps: [
+                  ...(prev?.externalSteps || []).filter((s) => s.step !== "upload"),
+                  {
+                    step: "upload",
+                    label: `Uploaded ${selectedDbFile.name} (${fileSizeLabel})`,
+                    status: "done",
+                    progress: 100,
+                    message: uploadLog,
+                  },
+                ],
+              }));
+            } else {
+              updateUploadStep(
+                {
+                  step: "upload",
+                  label: `Uploaded ${selectedDbFile.name} (${fileSizeLabel})`,
+                  status: "done",
+                  progress: 100,
+                  message: uploadLog,
+                },
+                {
+                  step: "complete",
+                  label: `Connected ${created.domain}${imp.db_name ? ` (${imp.db_name})` : ""}`,
+                  status: "done",
+                  progress: 100,
+                  message: `${uploadLog}\n[${ts()}] Database imported and wp-config.php updated.`,
+                },
+              );
+              fetchSites();
+            }
+          } catch (impErr) {
+            const errMsg = impErr instanceof Error ? impErr.message : "Database import failed";
+            uploadLog += `\n[${ts()}] ERROR: ${errMsg}`;
+            updateUploadStep(
+              {
+                step: "upload",
+                label: `Failed uploading/importing ${selectedDbFile.name}`,
+                status: "error",
+                message: uploadLog,
+              },
+              {
+                step: "complete",
+                label: `Database import failed for ${created.domain}`,
+                status: "error",
+                message: errMsg,
+              },
+            );
+            setError(errMsg);
+            showGlobalNotification("error", errMsg);
+          }
+        })();
+      } else {
+        setProvisionJob({
+          siteId: created.id,
+          title: isConnectExisting
+            ? `Connecting Existing Site (${created.domain})...`
+            : `Provisioning ${created.domain}...`,
+          defaultShowLogs: isConnectExisting,
+        });
+        showGlobalNotification(
+          "info",
+          isConnectExisting
+            ? `Connecting existing site ${created.domain}...`
+            : `Creating local site ${created.domain}...`,
+        );
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create site");
     } finally {
@@ -387,8 +573,6 @@ export default function Sites() {
   };
 
   const handleProvisionComplete = () => {
-    setProvisioningSiteId(null);
-    showGlobalNotification("success", "Site provisioning complete");
     fetchSites();
   };
 
@@ -501,9 +685,17 @@ export default function Sites() {
         </div>
       )}
 
-      {/* Provisioning log */}
-      {provisioningSiteId && (
-        <ProvisionLog siteId={provisioningSiteId} onComplete={handleProvisionComplete} />
+      {/* Provisioning & database import progress log */}
+      {provisionJob && (
+        <ProvisionLog
+          siteId={provisionJob.siteId}
+          sseUrl={provisionJob.sseUrl}
+          title={provisionJob.title}
+          defaultShowLogs={provisionJob.defaultShowLogs}
+          externalSteps={provisionJob.externalSteps}
+          onComplete={handleProvisionComplete}
+          onDismiss={() => setProvisionJob(null)}
+        />
       )}
 
       {/* Create form */}
@@ -733,7 +925,14 @@ export default function Sites() {
                   Browse for an empty folder or an existing website folder to connect it locally. Leave empty to use the default directory.
                 </p>
 
-                {folderInspection && customRootPath.trim() && (
+                {inspectingFolder && customRootPath.trim() && (
+                  <div className="mt-2 px-3 py-2 rounded-lg border border-dark-600 bg-dark-800/80 text-xs text-dark-300 flex items-center gap-2 font-mono">
+                    <span className="w-2 h-2 rounded-full bg-accent-400 animate-pulse" />
+                    Scanning folder contents &amp; WordPress configuration...
+                  </div>
+                )}
+
+                {!inspectingFolder && folderInspection && customRootPath.trim() && (
                   <div
                     className={`mt-2 px-3 py-2 rounded-lg border text-xs flex items-center justify-between gap-2 ${
                       folderInspection.is_wordpress
@@ -756,11 +955,14 @@ export default function Sites() {
                         ? `Existing WordPress directory detected${folderInspection.wp_version ? ` (v${folderInspection.wp_version})` : ""} — files will be connected without overwriting.`
                         : `Existing ${folderInspection.detected_type.toUpperCase()} website detected (${folderInspection.file_count} items) — files will be connected without overwriting.`}
                     </span>
-                    {folderInspection.wp_db_name && (
-                      <span className="font-mono text-[11px] text-dark-300 shrink-0">
-                        DB: {folderInspection.wp_db_name}
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2 font-mono text-[11px] text-dark-300 shrink-0">
+                      {folderInspection.wp_db_name && (
+                        <span>DB: {folderInspection.wp_db_name}</span>
+                      )}
+                      {folderInspection.wp_table_prefix && (
+                        <span>Prefix: {folderInspection.wp_table_prefix}</span>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

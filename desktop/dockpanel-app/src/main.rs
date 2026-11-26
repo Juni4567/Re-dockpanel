@@ -434,6 +434,105 @@ async fn create_site_handler(
                 return Json(fresh).into_response();
             }
 
+            if stream && connect_existing && !wants_wp {
+                let insp = wordpress::inspect_site_folder(&site_dir);
+                if insp.is_wordpress {
+                    let _ = wordpress::sanitize_plesk_maintenance_dropin(&site_dir, &site.domain);
+                }
+                state.append_install_progress(
+                    &prov_key,
+                    "folder",
+                    &format!("Connected existing {} folder", insp.detected_type.to_uppercase()),
+                    "done",
+                    Some(100),
+                    Some(&format!(
+                        "Path: {} ({} items, type: {}{})",
+                        site_dir.display(),
+                        insp.file_count,
+                        insp.detected_type,
+                        insp.wp_version
+                            .as_deref()
+                            .map(|v| format!(", WordPress v{}", v))
+                            .unwrap_or_default()
+                    )),
+                    false,
+                );
+                let ssl_ok = state.ensure_site_ssl(&site.domain).is_ok();
+                state.append_install_progress(
+                    &prov_key,
+                    "hosts",
+                    &format!("Registered {} in Windows hosts & local SSL", site.domain),
+                    "done",
+                    Some(100),
+                    Some(&format!(
+                        "Hosts entry 127.0.0.1 {} synced | Local SSL {}",
+                        site.domain,
+                        if ssl_ok { "ready" } else { "skipped" }
+                    )),
+                    false,
+                );
+                let started_site = state
+                    .start_site(&site.id)
+                    .unwrap_or_else(|_| state.get_site(&site.id).unwrap_or(site.clone()));
+                let active_port = state.get_router_config().active_port;
+                let ssl_port = state.get_ssl_port();
+                let url = if started_site.ssl_enabled {
+                    match ssl_port {
+                        Some(443) => format!("https://{}", started_site.domain),
+                        Some(p) => format!("https://{}:{}", started_site.domain, p),
+                        None if active_port == 80 => format!("http://{}", started_site.domain),
+                        None => format!("http://{}:{}", started_site.domain, active_port),
+                    }
+                } else if active_port == 80 {
+                    format!("http://{}", started_site.domain)
+                } else {
+                    format!("http://{}:{}", started_site.domain, active_port)
+                };
+                let runtime_desc = match started_site.runtime.as_str() {
+                    "node" => format!(
+                        "Node.js ({})",
+                        started_site.app_command.as_deref().unwrap_or("npm start")
+                    ),
+                    "static" => "Static HTTP".to_string(),
+                    "proxy" => format!("Proxy (:{})", started_site.proxy_port.unwrap_or(0)),
+                    _ => format!("PHP {}", started_site.php_version),
+                };
+                state.append_install_progress(
+                    &prov_key,
+                    "runtime",
+                    &format!("Started {} worker & router", runtime_desc),
+                    "done",
+                    Some(100),
+                    Some(&format!(
+                        "Runtime: {} | Worker port: {}",
+                        runtime_desc,
+                        state
+                            .get_site_worker_port(&started_site.domain)
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "router".into())
+                    )),
+                    false,
+                );
+                state.record_event(
+                    "create_site",
+                    "site",
+                    &started_site.domain,
+                    "Existing Site Connected",
+                    &format!("Connected existing site {} ({})", url, runtime_desc),
+                    "success",
+                );
+                state.append_install_progress(
+                    &prov_key,
+                    "complete",
+                    &format!("{} is live at {}", started_site.domain, url),
+                    "done",
+                    Some(100),
+                    Some(&format!("Connected existing website without overwriting files. Live URL: {}", url)),
+                    true,
+                );
+                return Json(started_site).into_response();
+            }
+
             let mut wp_failed = false;
             if wants_wp {
                 let mut sync_req = wp_req;
@@ -1506,7 +1605,7 @@ async fn php_install_log_handler(
 
     tokio::spawn(async move {
         let mut last_sent: Vec<String> = Vec::new();
-        for _ in 0..1200 {
+        for _ in 0..12000 {
             let (snapshot, done) = {
                 if let Ok(jobs) = state.php_installs.lock() {
                     if let Some(job) = jobs.get(&id) {
@@ -2550,25 +2649,74 @@ fn read_desktop_log_lines(
     filter: Option<&str>,
     site_domain: Option<&str>,
 ) -> Vec<String> {
-    let mut candidates: Vec<PathBuf> = match log_type {
-        "error" | "nginx_error" | "php_fpm" | "php_errors" => {
-            vec![
+    let mut candidates: Vec<PathBuf> = if let Some(dom) = site_domain {
+        let wp_debug_log = state
+            .get_site(dom)
+            .map(|s| state.site_dir(&s).join("wp-content").join("debug.log"))
+            .filter(|p| p.is_file());
+        match log_type {
+            "php" | "php_errors" => {
+                let mut v = vec![
+                    state.php_error_log_path(dom),
+                    state.php_worker_log_path(dom),
+                ];
+                if let Some(dbg) = wp_debug_log {
+                    v.push(dbg);
+                }
+                v.push(state.config_dir.join("php_errors.log"));
+                v
+            }
+            "error" | "nginx_error" | "php_fpm" => {
+                let mut v = vec![
+                    state.php_error_log_path(dom),
+                    state.php_worker_log_path(dom),
+                ];
+                if let Some(dbg) = wp_debug_log {
+                    v.push(dbg);
+                }
+                v.push(state.config_dir.join("php_errors.log"));
+                v
+            }
+            "access" | "nginx_access" => {
+                vec![
+                    state.access_log_path(dom),
+                    state.config_dir.join("desktop_activity.log"),
+                ]
+            }
+            _ => {
+                let mut v = vec![
+                    state.access_log_path(dom),
+                    state.php_error_log_path(dom),
+                    state.php_worker_log_path(dom),
+                ];
+                if let Some(dbg) = wp_debug_log {
+                    v.push(dbg);
+                }
+                v.push(state.config_dir.join("desktop_activity.log"));
+                v
+            }
+        }
+    } else {
+        match log_type {
+            "error" | "nginx_error" | "php_fpm" | "php_errors" | "php" => {
+                vec![
+                    state.config_dir.join("php_errors.log"),
+                    state.config_dir.join("webview_console.log"),
+                ]
+            }
+            "access" | "nginx_access" | "syslog" | "auth" | "service" => {
+                vec![state.config_dir.join("desktop_activity.log")]
+            }
+            _ => vec![
+                state.config_dir.join("desktop_activity.log"),
                 state.config_dir.join("php_errors.log"),
                 state.config_dir.join("webview_console.log"),
-            ]
+            ],
         }
-        "access" | "nginx_access" | "syslog" | "auth" | "service" => {
-            vec![state.config_dir.join("desktop_activity.log")]
-        }
-        _ => vec![
-            state.config_dir.join("desktop_activity.log"),
-            state.config_dir.join("php_errors.log"),
-            state.config_dir.join("webview_console.log"),
-        ],
     };
 
     // WebView IPC handler also writes directly into %APPDATA%\DockPanel\webview_console.log
-    if log_type == "error" || log_type == "nginx_error" || log_type == "php_fpm" {
+    if site_domain.is_none() && (log_type == "error" || log_type == "nginx_error" || log_type == "php_fpm") {
         if let Ok(app_data) = std::env::var("APPDATA") {
             let global_webview = PathBuf::from(app_data)
                 .join("DockPanel")
@@ -2584,6 +2732,23 @@ fn read_desktop_log_lines(
 
     let mut collected = Vec::new();
     for path in candidates {
+        // Only fall back to legacy global php_errors.log when per-site PHP logs have nothing yet
+        if site_domain.is_some()
+            && path.ends_with("php_errors.log")
+            && path.parent() == Some(state.config_dir.as_path())
+            && !collected.is_empty()
+        {
+            continue;
+        }
+        // Only fall back to desktop_activity.log for access logs if no per-site HTTP access lines exist yet
+        if site_domain.is_some()
+            && path.ends_with("desktop_activity.log")
+            && (log_type == "access" || log_type == "nginx_access")
+            && !collected.is_empty()
+        {
+            continue;
+        }
+
         if let Ok(content) = std::fs::read_to_string(&path) {
             for line in content.lines() {
                 let trimmed = line.trim();
@@ -2931,6 +3096,359 @@ async fn wordpress_import_database_handler(
         || lower_fn.ends_with(".db")
         || raw_bytes.starts_with(b"SQLite format 3\0");
 
+    let active_port = state.get_router_config().active_port;
+    let ssl_port = state.get_ssl_port();
+    let default_target_url = if site.ssl_enabled {
+        match ssl_port {
+            Some(443) => format!("https://{}", site.domain),
+            Some(p) => format!("https://{}:{}", site.domain, p),
+            None if active_port == 80 => format!("http://{}", site.domain),
+            None => format!("http://{}:{}", site.domain, active_port),
+        }
+    } else if active_port == 80 {
+        format!("http://{}", site.domain)
+    } else {
+        format!("http://{}:{}", site.domain, active_port)
+    };
+
+    let target_url = payload
+        .get("target_url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or(default_target_url);
+
+    let source_url_override = payload
+        .get("source_url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let site_dir = state.site_dir(&site);
+    let domain = site.domain.clone();
+
+    if stream {
+        let job_id = format!("wp-import-{}", uuid::Uuid::new_v4());
+        let sse_url = format!("/api/sites/{}/wordpress/import-log/{}", site.id, job_id);
+
+        state.append_install_progress(
+            &job_id,
+            "site_connect",
+            &format!("Connected existing WordPress folder for {}", site.domain),
+            "done",
+            Some(100),
+            Some(&format!(
+                "Folder: {} | Target URL: {}",
+                site_dir.display(),
+                target_url
+            )),
+            false,
+        );
+        state.append_install_progress(
+            &job_id,
+            "upload",
+            &format!(
+                "Uploaded {} ({})",
+                filename,
+                downloads::format_mb(raw_bytes.len() as u64)
+            ),
+            "done",
+            Some(100),
+            Some(&format!(
+                "Server received {} bytes for '{}'",
+                raw_bytes.len(),
+                filename
+            )),
+            false,
+        );
+        state.append_install_progress(
+            &job_id,
+            "unpack",
+            &format!("Preparing to process {}...", filename),
+            "in_progress",
+            Some(5),
+            None,
+            false,
+        );
+
+        let bg_state = state.clone();
+        let bg_site_id = site.id.clone();
+        let bg_domain = site.domain.clone();
+        let bg_php = site.php_version.clone();
+        let bg_job_id = job_id.clone();
+        let bg_filename = filename.clone();
+        let bg_target_url = target_url.clone();
+        let bg_source_override = source_url_override.clone();
+
+        tokio::spawn(async move {
+            if !looks_sqlite && bg_state.get_mariadb_port().is_none() {
+                bg_state.append_install_progress(
+                    &bg_job_id,
+                    "mariadb",
+                    "Checking local MariaDB server...",
+                    "in_progress",
+                    Some(5),
+                    Some("MariaDB is not running; preparing local database engine..."),
+                    false,
+                );
+                if mariadb::find_mariadbd_binary().is_none() {
+                    if let Err(e) = mariadb::install_mariadb_with_progress(|_, lbl, pct, msg| {
+                        bg_state.append_install_progress(
+                            &bg_job_id,
+                            "mariadb",
+                            lbl,
+                            "in_progress",
+                            pct,
+                            msg.as_deref().or(Some(lbl)),
+                            false,
+                        );
+                    })
+                    .await
+                    {
+                        bg_state.append_install_progress(
+                            &bg_job_id,
+                            "mariadb",
+                            "MariaDB auto-install failed",
+                            "error",
+                            None,
+                            Some(&e),
+                            false,
+                        );
+                        bg_state.append_install_progress(
+                            &bg_job_id,
+                            "complete",
+                            &format!("MariaDB auto-install failed: {}", e),
+                            "error",
+                            None,
+                            Some(&e),
+                            true,
+                        );
+                        return;
+                    }
+                }
+                bg_state.append_install_progress(
+                    &bg_job_id,
+                    "mariadb",
+                    "Starting local MariaDB server...",
+                    "in_progress",
+                    Some(90),
+                    Some("Launching mariadbd.exe on loopback port..."),
+                    false,
+                );
+                let start_res = tokio::task::spawn_blocking({
+                    let st = bg_state.clone();
+                    move || st.start_mariadb()
+                })
+                .await;
+                match start_res {
+                    Ok(Ok(port)) => {
+                        bg_state.append_install_progress(
+                            &bg_job_id,
+                            "mariadb",
+                            &format!("MariaDB ready on 127.0.0.1:{}", port),
+                            "done",
+                            Some(100),
+                            Some(&format!("MariaDB listening on 127.0.0.1:{}", port)),
+                            false,
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        bg_state.append_install_progress(
+                            &bg_job_id,
+                            "mariadb",
+                            "Failed starting MariaDB",
+                            "error",
+                            None,
+                            Some(&e),
+                            false,
+                        );
+                        bg_state.append_install_progress(
+                            &bg_job_id,
+                            "complete",
+                            &format!("Failed starting MariaDB: {}", e),
+                            "error",
+                            None,
+                            Some(&e),
+                            true,
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        bg_state.append_install_progress(
+                            &bg_job_id,
+                            "complete",
+                            &format!("MariaDB task error: {}", msg),
+                            "error",
+                            None,
+                            Some(&msg),
+                            true,
+                        );
+                        return;
+                    }
+                }
+            } else if !looks_sqlite {
+                if let Some(p) = bg_state.get_mariadb_port() {
+                    bg_state.append_install_progress(
+                        &bg_job_id,
+                        "mariadb",
+                        &format!("Using running MariaDB on 127.0.0.1:{}", p),
+                        "done",
+                        Some(100),
+                        Some(&format!("Detected active MariaDB on 127.0.0.1:{}", p)),
+                        false,
+                    );
+                }
+            }
+
+            let mdb_port = bg_state.get_mariadb_port();
+            let st_cb = bg_state.clone();
+            let jid_cb = bg_job_id.clone();
+            let dom_cb = bg_domain.clone();
+            let sd_cb = site_dir.clone();
+            let fn_cb = bg_filename.clone();
+            let tgt_cb = bg_target_url.clone();
+            let src_cb = bg_source_override.clone();
+
+            let res = tokio::task::spawn_blocking(move || {
+                wordpress::import_existing_wp_database_with_progress(
+                    &sd_cb,
+                    &dom_cb,
+                    &tgt_cb,
+                    mdb_port,
+                    &fn_cb,
+                    &raw_bytes,
+                    src_cb.as_deref(),
+                    |step, lbl, status, pct, log_line| {
+                        st_cb.append_install_progress(
+                            &jid_cb,
+                            step,
+                            lbl,
+                            status,
+                            pct,
+                            log_line,
+                            false,
+                        );
+                    },
+                )
+            })
+            .await;
+
+            match res {
+                Ok(Ok(val)) => {
+                    bg_state.append_install_progress(
+                        &bg_job_id,
+                        "ssl_start",
+                        &format!("Starting PHP {} worker & local HTTPS router...", bg_php),
+                        "in_progress",
+                        Some(50),
+                        Some(&format!("Provisioning SSL certificate & starting site '{}'...", bg_domain)),
+                        false,
+                    );
+                    bg_state.update_site_preset(&bg_site_id, "wordpress");
+                    let ssl_ok = bg_state.ensure_site_ssl(&bg_domain).is_ok();
+                    let start_ok = bg_state.start_site(&bg_site_id).is_ok();
+                    let db_name = val
+                        .get("db_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("database");
+                    let db_engine = val
+                        .get("db_engine")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("mariadb");
+                    let replacements = val
+                        .get("replacements")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+
+                    bg_state.append_install_progress(
+                        &bg_job_id,
+                        "ssl_start",
+                        &format!("Site live at {} (PHP {}, {})", bg_target_url, bg_php, db_engine),
+                        "done",
+                        Some(100),
+                        Some(&format!(
+                            "SSL={} | Worker started={} | Live URL={}",
+                            ssl_ok, start_ok, bg_target_url
+                        )),
+                        false,
+                    );
+                    bg_state.record_event(
+                        "wp_import_db",
+                        "site",
+                        &bg_domain,
+                        "WordPress Database Imported",
+                        &format!(
+                            "Connected {} to {} and updated wp-config.php",
+                            bg_domain, db_name
+                        ),
+                        "success",
+                    );
+                    bg_state.append_install_progress(
+                        &bg_job_id,
+                        "complete",
+                        &format!(
+                            "Connected {} ({}) — {} URL references updated",
+                            bg_domain, db_name, replacements
+                        ),
+                        "done",
+                        Some(100),
+                        Some(&format!(
+                            "Import complete | Engine: {} | Database: {} | URL replacements: {} | Live at {}",
+                            db_engine, db_name, replacements, bg_target_url
+                        )),
+                        true,
+                    );
+                }
+                Ok(Err(e)) => {
+                    bg_state.record_event(
+                        "wp_import_db_error",
+                        "site",
+                        &bg_domain,
+                        "WordPress Database Import Failed",
+                        &e,
+                        "critical",
+                    );
+                    bg_state.append_install_progress(
+                        &bg_job_id,
+                        "complete",
+                        &format!("Database import failed: {}", e),
+                        "error",
+                        None,
+                        Some(&e),
+                        true,
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    bg_state.append_install_progress(
+                        &bg_job_id,
+                        "complete",
+                        &format!("Database import worker error: {}", msg),
+                        "error",
+                        None,
+                        Some(&msg),
+                        true,
+                    );
+                }
+            }
+        });
+
+        return Json(serde_json::json!({
+            "ok": true,
+            "streaming": true,
+            "job_id": job_id,
+            "sse_url": sse_url,
+            "target_url": target_url,
+        }))
+        .into_response();
+    }
+
     // Auto-install and start MariaDB when importing a MySQL/SQL dump
     if !looks_sqlite && state.get_mariadb_port().is_none() {
         if mariadb::find_mariadbd_binary().is_none() {
@@ -2966,36 +3484,6 @@ async fn wordpress_import_database_handler(
         }
     }
 
-    let active_port = state.get_router_config().active_port;
-    let ssl_port = state.get_ssl_port();
-    let default_target_url = if site.ssl_enabled {
-        match ssl_port {
-            Some(443) => format!("https://{}", site.domain),
-            Some(p) => format!("https://{}:{}", site.domain, p),
-            None if active_port == 80 => format!("http://{}", site.domain),
-            None => format!("http://{}:{}", site.domain, active_port),
-        }
-    } else if active_port == 80 {
-        format!("http://{}", site.domain)
-    } else {
-        format!("http://{}:{}", site.domain, active_port)
-    };
-
-    let target_url = payload
-        .get("target_url")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or(default_target_url);
-
-    let source_url_override = payload
-        .get("source_url")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let site_dir = state.site_dir(&site);
-    let domain = site.domain.clone();
     let mdb_port = state.get_mariadb_port();
 
     let res = tokio::task::spawn_blocking(move || {
@@ -4141,12 +4629,86 @@ async fn site_log_text_handler(
     state: Arc<AppState>,
     id: String,
     log_type: &str,
+    limit: usize,
 ) -> Response {
     let Some(site) = state.get_site(&id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
     };
-    let lines = read_desktop_log_lines(&state, log_type, 200, None, Some(&site.domain));
+    let lines = read_desktop_log_lines(&state, log_type, limit.clamp(1, 5000), None, Some(&site.domain));
     Json(serde_json::json!({ "logs": lines.join("\n") })).into_response()
+}
+
+async fn site_logs_stream_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<LogQueryParams>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let lt = q.log_type.unwrap_or_else(|| "php".to_string());
+    let limit = q.lines.or(q.max).unwrap_or(200).clamp(1, 2000);
+    let pat = q.pattern.or(q.filter);
+    let domain = site.domain.clone();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
+    tokio::spawn(async move {
+        let initial = read_desktop_log_lines(&state, &lt, limit, pat.as_deref(), Some(&domain));
+        let snap_json = serde_json::json!({
+            "mode": "snapshot",
+            "type": lt,
+            "lines": initial,
+        })
+        .to_string();
+        if tx.send(Ok(SseEvent::default().data(snap_json))).await.is_err() {
+            return;
+        }
+        let mut prev_lines = initial;
+
+        for _ in 0..7200 {
+            tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+            let current = read_desktop_log_lines(&state, &lt, limit, pat.as_deref(), Some(&domain));
+            if current == prev_lines {
+                continue;
+            }
+            // Find overlap suffix of prev_lines matching prefix of current to emit only appended lines
+            let mut overlap = 0usize;
+            let max_check = prev_lines.len().min(current.len());
+            for k in (1..=max_check).rev() {
+                if prev_lines[prev_lines.len() - k..] == current[..k] {
+                    overlap = k;
+                    break;
+                }
+            }
+            let payload = if overlap > 0 && overlap < current.len() {
+                serde_json::json!({
+                    "mode": "append",
+                    "type": lt,
+                    "lines": &current[overlap..],
+                })
+            } else if current.len() > prev_lines.len() && prev_lines.is_empty() {
+                serde_json::json!({
+                    "mode": "append",
+                    "type": lt,
+                    "lines": &current,
+                })
+            } else {
+                serde_json::json!({
+                    "mode": "snapshot",
+                    "type": lt,
+                    "lines": &current,
+                })
+            };
+            prev_lines = current;
+            if tx.send(Ok(SseEvent::default().data(payload.to_string()))).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn logs_stats_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -4532,7 +5094,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "mariadb_running": mdb_port.is_some(),
         "mariadb_port": mdb_port,
         "default_sites_dir": state.get_default_sites_dir().to_string_lossy().to_string(),
-        "version": "2.251.0"
+        "version": "2.252.0"
     }))
 }
 
@@ -5195,7 +5757,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "cpu_cores": 8,
                     "ram_mb": 16384,
                     "disk_gb": 512,
-                    "agent_version": "2.251.0",
+                    "agent_version": "2.252.0",
                     "cpu_usage": 5.0,
                     "mem_used_mb": 2048,
                     "uptime_secs": 3600,
@@ -5234,18 +5796,22 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/sites/{id}/bandwidth-usage", get(|| async { Json(serde_json::json!({"used_bytes_this_month": 0, "year_month": "2026-11"})) }))
         .route(
             "/sites/{id}/access-logs",
-            get(|State(s): State<Arc<AppState>>, Path(id): Path<String>| async move {
-                site_log_text_handler(s, id, "access").await
+            get(|State(s): State<Arc<AppState>>, Path(id): Path<String>, Query(q): Query<LogQueryParams>| async move {
+                let lt = q.log_type.as_deref().unwrap_or("access");
+                let limit = q.lines.or(q.max).unwrap_or(200);
+                site_log_text_handler(s, id, lt, limit).await
             }),
         )
         .route(
             "/sites/{id}/php-errors",
-            get(|State(s): State<Arc<AppState>>, Path(id): Path<String>| async move {
-                site_log_text_handler(s, id, "error").await
+            get(|State(s): State<Arc<AppState>>, Path(id): Path<String>, Query(q): Query<LogQueryParams>| async move {
+                let limit = q.lines.or(q.max).unwrap_or(200);
+                site_log_text_handler(s, id, "php", limit).await
             }),
         )
         .route("/sites/{id}/logs", get(site_logs_read_handler))
         .route("/sites/{id}/logs/search", get(site_logs_read_handler))
+        .route("/sites/{id}/logs/stream", get(site_logs_stream_handler))
         .route("/sites/{id}/ssl", get(site_ssl_get_handler))
         .route("/sites/{id}/ssl/provision", post(site_ssl_provision_handler))
         .route("/sites/{id}/ssl/renew", post(site_ssl_provision_handler))
@@ -5389,6 +5955,12 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             "/sites/{id}/wordpress/import-database",
             post(wordpress_import_database_handler)
                 .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/sites/{id}/wordpress/import-log/{job_id}",
+            get(|State(s): State<Arc<AppState>>, Path((_id, job_id)): Path<(String, String)>| async move {
+                php_install_log_handler(State(s), Path(job_id)).await
+            }),
         )
         .route("/desktop/mail/status", get(desktop_mail_status_handler))
         .route(
@@ -5594,7 +6166,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "status": "running",
                     "mode": "desktop",
                     "os": "windows",
-                    "version": "2.251.0"
+                    "version": "2.252.0"
                 }))
             }),
         )
@@ -7008,6 +7580,154 @@ mod tests {
         assert!(updated_cfg.contains("define( 'WP_HOME', 'https://connected-wp.test' )"));
         assert!(updated_cfg.contains("define( 'WP_SITEURL', 'https://connected-wp.test' )"));
         assert!(updated_cfg.contains("$table_prefix = 'wp_prod_';"));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_connect_existing_and_import_database_sse() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_wp_stream_{}", uuid::Uuid::new_v4()));
+        let existing_wp = temp_dir.join("stream_wp");
+        std::fs::create_dir_all(existing_wp.join("wp-includes")).unwrap();
+        std::fs::write(
+            existing_wp.join("wp-includes").join("version.php"),
+            "<?php $wp_version = '6.7.0';",
+        )
+        .unwrap();
+        std::fs::write(
+            existing_wp.join("wp-config.php"),
+            "<?php\ndefine( 'DB_NAME', 'old_db' );\n$table_prefix = 'wp_old_';\n",
+        )
+        .unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites")));
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let c = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{}", port);
+
+        // 1. Connect existing folder with stream=true and verify provision-log emits folder/hosts/runtime/complete
+        let create_res: serde_json::Value = c
+            .post(format!("{}/sites", base))
+            .json(&serde_json::json!({
+                "domain": "stream-wp.test",
+                "runtime": "php",
+                "php_preset": "wordpress",
+                "document_root": existing_wp.to_string_lossy(),
+                "connect_existing": true,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let site_id = create_res["id"].as_str().unwrap().to_string();
+
+        let prov_sse = c
+            .get(format!("{}/sites/{}/provision-log", base, site_id))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(prov_sse.contains("\"step\":\"folder\""), "missing folder step: {}", prov_sse);
+        assert!(prov_sse.contains("\"step\":\"hosts\""), "missing hosts step: {}", prov_sse);
+        assert!(prov_sse.contains("\"step\":\"runtime\""), "missing runtime step: {}", prov_sse);
+        assert!(prov_sse.contains("\"step\":\"complete\""), "missing complete step: {}", prov_sse);
+
+        // 2. Import DB with stream=true and verify SSE import-log streams all steps & logs
+        let imp_start: serde_json::Value = c
+            .post(format!("{}/sites/{}/wordpress/import-database", base, site_id))
+            .json(&serde_json::json!({
+                "filename": "backup.sqlite",
+                "content_base64": B64.encode(b"SQLite format 3\0streamdb"),
+                "target_url": "https://stream-wp.test",
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(imp_start["streaming"], true);
+        let sse_path = imp_start["sse_url"].as_str().unwrap();
+        assert!(sse_path.starts_with("/api/sites/"));
+        let stripped = sse_path.strip_prefix("/api").unwrap();
+
+        let imp_sse = c
+            .get(format!("{}{}", base, stripped))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(imp_sse.contains("\"step\":\"site_connect\""), "missing site_connect: {}", imp_sse);
+        assert!(imp_sse.contains("\"step\":\"upload\""), "missing upload: {}", imp_sse);
+        assert!(imp_sse.contains("\"step\":\"unpack\""), "missing unpack: {}", imp_sse);
+        assert!(imp_sse.contains("\"step\":\"db_import\""), "missing db_import: {}", imp_sse);
+        assert!(imp_sse.contains("\"step\":\"wp_config\""), "missing wp_config: {}", imp_sse);
+        assert!(imp_sse.contains("\"step\":\"ssl_start\""), "missing ssl_start: {}", imp_sse);
+        assert!(imp_sse.contains("\"step\":\"complete\""), "missing complete: {}", imp_sse);
+
+        // 3. Verify per-site PHP errors, access logs, and real-time logs/stream SSE
+        std::fs::create_dir_all(state.config_dir.join("logs")).unwrap();
+        std::fs::write(
+            state.php_error_log_path("stream-wp.test"),
+            "[27-Nov-2026 01:45:00 UTC] PHP Warning: test warning in index.php\n",
+        )
+        .unwrap();
+        state.append_site_access_log("stream-wp.test", "HTTPS GET / -> 301 (Location: https://stream-wp.test/) [4ms]");
+
+        let php_logs_res: serde_json::Value = c
+            .get(format!("{}/sites/{}/php-errors", base, site_id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(php_logs_res["logs"].as_str().unwrap().contains("PHP Warning: test warning"));
+
+        let acc_logs_res: serde_json::Value = c
+            .get(format!("{}/sites/{}/access-logs?type=access", base, site_id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(acc_logs_res["logs"].as_str().unwrap().contains("301 (Location: https://stream-wp.test/)"));
+
+        // Stream initial snapshot and ensure connection closes cleanly when aborted/timed out
+        let mut stream_resp = c
+            .get(format!("{}/sites/{}/logs/stream?type=php", base, site_id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream_resp.status(), StatusCode::OK);
+        let first_chunk = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream_resp.chunk(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let sse_txt = String::from_utf8_lossy(&first_chunk);
+        assert!(sse_txt.contains("PHP Warning: test warning"), "SSE stream missed PHP log line: {}", sse_txt);
 
         server.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);

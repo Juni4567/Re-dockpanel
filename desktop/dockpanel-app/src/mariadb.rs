@@ -551,15 +551,47 @@ pub fn find_mysql_client_binary() -> Option<PathBuf> {
 }
 
 pub fn import_mysql_dump(port: u16, db_name: &str, sql_file: &Path) -> Result<(), String> {
+    import_mysql_dump_with_progress(port, db_name, sql_file, |_, _, _| {})
+}
+
+pub fn import_mysql_dump_with_progress<F>(
+    port: u16,
+    db_name: &str,
+    sql_file: &Path,
+    mut on_progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64, u64, &str),
+{
+    use std::io::{Read, Write};
+
     let clean = sanitize_mysql_ident(db_name)?;
     if !sql_file.is_file() {
         return Err(format!("SQL dump file not found: {}", sql_file.display()));
     }
 
+    let total_bytes = fs::metadata(sql_file).map(|m| m.len()).unwrap_or(0);
+
     // Prefer native mariadb.exe / mysql.exe streaming stdin so multi-megabyte dumps
-    // never hit the Windows CreateProcess 32KB command-line limit.
+    // never hit the Windows CreateProcess 32KB command-line limit and report byte progress.
     if let Some(client_exe) = find_mysql_client_binary() {
-        let file = fs::File::open(sql_file)
+        let client_name = client_exe
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mariadb.exe")
+            .to_string();
+        on_progress(
+            0,
+            total_bytes,
+            &format!(
+                "Streaming {} into '{}' via {}",
+                crate::downloads::format_mb(total_bytes),
+                clean,
+                client_name
+            ),
+        );
+
+        let mut file = fs::File::open(sql_file)
             .map_err(|e| format!("Failed opening SQL file '{}': {}", sql_file.display(), e))?;
         let mut cmd = std::process::Command::new(&client_exe);
         cmd.args([
@@ -572,17 +604,67 @@ pub fn import_mysql_dump(port: u16, db_name: &str, sql_file: &Path) -> Result<()
             "--default-character-set=utf8mb4",
             &clean,
         ])
-        .stdin(std::process::Stdio::from(file));
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let out = cmd
-            .output()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("Failed executing {}: {}", client_exe.display(), e))?;
+
+        let mut written: u64 = 0;
+        let mut last_report = std::time::Instant::now();
+        if let Some(mut stdin) = child.stdin.take() {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| format!("Failed reading SQL dump: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                if let Err(e) = stdin.write_all(&buf[..n]) {
+                    // If the client exited early (e.g. SQL error), break so wait_with_output surfaces stderr.
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        break;
+                    }
+                    return Err(format!("Failed streaming SQL to {}: {}", client_name, e));
+                }
+                written += n as u64;
+                if last_report.elapsed() >= std::time::Duration::from_millis(200) {
+                    last_report = std::time::Instant::now();
+                    on_progress(
+                        written,
+                        total_bytes,
+                        &format!(
+                            "Imported {} / {}",
+                            crate::downloads::format_mb(written),
+                            crate::downloads::format_mb(total_bytes)
+                        ),
+                    );
+                }
+            }
+            let _ = stdin.flush();
+        }
+
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("Failed waiting for {}: {}", client_exe.display(), e))?;
         if out.status.success() {
+            on_progress(
+                total_bytes,
+                total_bytes,
+                &format!(
+                    "SQL dump imported cleanly via {} ({})",
+                    client_name,
+                    crate::downloads::format_mb(total_bytes)
+                ),
+            );
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -599,6 +681,15 @@ pub fn import_mysql_dump(port: u16, db_name: &str, sql_file: &Path) -> Result<()
     // Fallback: execute SQL directly from disk inside PHP PDO_MySQL (never passing SQL via argv).
     let php_exe = crate::state::find_php_binary(None)
         .ok_or_else(|| "No MariaDB client or PHP PDO_MySQL binary available for SQL import".to_string())?;
+    on_progress(
+        0,
+        total_bytes,
+        &format!(
+            "Using PHP PDO_MySQL fallback to import {} into '{}'",
+            crate::downloads::format_mb(total_bytes),
+            clean
+        ),
+    );
     let script = r#"<?php
 $port    = $argv[1];
 $db      = $argv[2];
@@ -646,6 +737,14 @@ try {
         }
     })?;
     if parsed.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        on_progress(
+            total_bytes,
+            total_bytes,
+            &format!(
+                "SQL dump imported cleanly via PHP PDO_MySQL ({})",
+                crate::downloads::format_mb(total_bytes)
+            ),
+        );
         Ok(())
     } else {
         Err(parsed["error"]

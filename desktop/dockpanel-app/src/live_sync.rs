@@ -177,10 +177,21 @@ fn try_parse_serialized_string(s: &str) -> Option<(usize, &str, String, usize)> 
     None
 }
 
-/// Serialization-safe domain rewrite engine for SQL dumps (updates PHP `s:<len>:"..."` byte counts).
-pub fn rewrite_domains(sql: &str, source_domain: &str, target_domain: &str) -> String {
+/// Serialization-safe domain rewrite engine for SQL dumps (updates PHP `s:<len>:"..."` byte counts)
+/// while reporting `(processed_bytes, total_bytes, replacement_count)` progress.
+pub fn rewrite_domains_with_progress<F>(
+    sql: &str,
+    source_domain: &str,
+    target_domain: &str,
+    mut on_progress: F,
+) -> (String, usize)
+where
+    F: FnMut(usize, usize, usize),
+{
     if source_domain.is_empty() || source_domain == target_domain {
-        return sql.to_string();
+        let len = sql.len();
+        on_progress(len, len, 0);
+        return (sql.to_string(), 0);
     }
 
     let pairs = build_domain_pairs(source_domain, target_domain);
@@ -188,8 +199,16 @@ pub fn rewrite_domains(sql: &str, source_domain: &str, target_domain: &str) -> S
     let bytes = sql.as_bytes();
     let total_len = bytes.len();
     let mut i = 0;
+    let mut replacements = 0usize;
+    let mut last_reported_byte = 0usize;
+    let report_step = (total_len / 20).max(262_144);
 
     while i < total_len {
+        if i.saturating_sub(last_reported_byte) >= report_step {
+            last_reported_byte = i;
+            on_progress(i, total_len, replacements);
+        }
+
         if bytes[i] == b's' && i + 2 < total_len && bytes[i + 1] == b':' {
             if let Some((old_len, q_str, content, match_len)) =
                 try_parse_serialized_string(&sql[i..])
@@ -205,6 +224,7 @@ pub fn rewrite_domains(sql: &str, source_domain: &str, target_domain: &str) -> S
                         (old_len as isize + delta).max(0) as usize
                     };
                     result.push_str(&format!("s:{}:{}{}{}", new_len, q_str, new_content, q_str));
+                    replacements += 1;
                 } else {
                     result.push_str(&sql[i..i + match_len]);
                 }
@@ -218,6 +238,7 @@ pub fn rewrite_domains(sql: &str, source_domain: &str, target_domain: &str) -> S
             if sql[i..].starts_with(src) {
                 result.push_str(dst);
                 i += src.len();
+                replacements += 1;
                 replaced_plain = true;
                 break;
             }
@@ -230,7 +251,13 @@ pub fn rewrite_domains(sql: &str, source_domain: &str, target_domain: &str) -> S
         result.push(ch);
         i += ch.len_utf8();
     }
-    result
+    on_progress(total_len, total_len, replacements);
+    (result, replacements)
+}
+
+/// Serialization-safe domain rewrite engine for SQL dumps (updates PHP `s:<len>:"..."` byte counts).
+pub fn rewrite_domains(sql: &str, source_domain: &str, target_domain: &str) -> String {
+    rewrite_domains_with_progress(sql, source_domain, target_domain, |_, _, _| {}).0
 }
 
 fn preflight_error(msg: impl Into<String>) -> PreflightCheckResponse {
