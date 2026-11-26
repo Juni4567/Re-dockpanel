@@ -227,6 +227,7 @@ found, including what is still broken.
 </details>
 
 ### ☁️ Re-dockpanel Cloud (Linux Server)
+*Self-hosted Linux VPS &amp; multi-server control panel with Nginx, Docker apps, Let's Encrypt SSL, Git deploy, WordPress Toolkit, Mail, DNS, and WAF.*
 
 <details open>
 <summary><strong>Cloud Dashboard</strong> — Live server metrics, 24h graphs, site overview, and recent activity</summary>
