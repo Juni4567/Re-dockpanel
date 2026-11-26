@@ -304,12 +304,28 @@ fn dir_matches_version(dir_name: &str, version: &str) -> bool {
 }
 
 /// Finds a PHP binary matching the exact requested `major.minor` version (without falling back to other versions).
-/// Locate a locally installed Node.js binary on PATH or common Windows install locations.
+/// Locate a locally installed Node.js binary on PATH, nvm-windows, or common Windows install locations.
 pub fn find_node_binary() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let is_node_exe = |p: &Path| -> bool {
+            p.is_file() || (p.exists() && std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
+        };
+
+        // 1. Check current process PATH
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join("node.exe");
+                if is_node_exe(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        // 2. Fallback to `where.exe node`
         if let Ok(out) = std::process::Command::new("where.exe")
             .arg("node")
             .creation_flags(CREATE_NO_WINDOW)
@@ -318,26 +334,99 @@ pub fn find_node_binary() -> Option<PathBuf> {
             if out.status.success() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
                     let p = PathBuf::from(line.trim());
-                    if p.is_file() {
+                    if is_node_exe(&p) {
                         return Some(p);
                     }
                 }
             }
         }
+
+        // 3. Check standard install paths + nvm-windows (C:\nvm4w\nodejs, NVM_SYMLINK, NVM_HOME) + fnm/volta/scoop/choco
         let mut candidates = vec![
+            PathBuf::from(r"C:\nvm4w\nodejs\node.exe"),
             PathBuf::from(r"C:\Program Files\nodejs\node.exe"),
             PathBuf::from(r"C:\Program Files (x86)\nodejs\node.exe"),
+            PathBuf::from(r"C:\ProgramData\chocolatey\bin\node.exe"),
         ];
+        if let Ok(nvm_sym) = std::env::var("NVM_SYMLINK") {
+            candidates.push(PathBuf::from(nvm_sym).join("node.exe"));
+        }
         if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
             candidates.push(PathBuf::from(&local_app).join("Programs").join("nodejs").join("node.exe"));
             candidates.push(PathBuf::from(&local_app).join("fnm_multishells").join("node.exe"));
+            let nvm_dir = PathBuf::from(&local_app).join("nvm");
+            if let Ok(rd) = fs::read_dir(&nvm_dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path().join("node.exe");
+                    if is_node_exe(&p) {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+        if let Ok(app_data) = std::env::var("APPDATA") {
+            let nvm_dir = PathBuf::from(&app_data).join("nvm");
+            if let Ok(rd) = fs::read_dir(&nvm_dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path().join("node.exe");
+                    if is_node_exe(&p) {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+        if let Ok(nvm_home) = std::env::var("NVM_HOME") {
+            if let Ok(rd) = fs::read_dir(&nvm_home) {
+                for entry in rd.flatten() {
+                    let p = entry.path().join("node.exe");
+                    if is_node_exe(&p) {
+                        candidates.push(p);
+                    }
+                }
+            }
         }
         if let Ok(user_prof) = std::env::var("USERPROFILE") {
             candidates.push(PathBuf::from(&user_prof).join(".volta").join("bin").join("node.exe"));
+            candidates.push(PathBuf::from(&user_prof).join("scoop").join("shims").join("node.exe"));
         }
         for c in candidates {
-            if c.is_file() {
+            if is_node_exe(&c) {
                 return Some(c);
+            }
+        }
+
+        // 4. Query Windows Registry Machine & User Path in case app was launched with a stale PATH
+        for reg_key in [
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            r"HKCU\Environment",
+        ] {
+            if let Ok(out) = std::process::Command::new("reg")
+                .args(["query", reg_key, "/v", "Path"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for line in text.lines() {
+                        if let Some(idx) = line.find("REG_EXPAND_SZ").or_else(|| line.find("REG_SZ")) {
+                            let val = line[idx..]
+                                .splitn(2, char::is_whitespace)
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim();
+                            for dir in val.split(';') {
+                                let trimmed = dir.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                let candidate = PathBuf::from(trimmed).join("node.exe");
+                                if is_node_exe(&candidate) {
+                                    return Some(candidate);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         None
