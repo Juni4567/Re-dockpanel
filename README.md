@@ -1,17 +1,18 @@
 <p align="center">
-  <img src=".github/screenshots/dp-dashboard.png" alt="DockPanel Dashboard" width="800">
+  <img src=".github/screenshots/dp-dashboard.png" alt="DockPanel Cloud Dashboard" width="49%">
+  <img src=".github/screenshots/desktop-dashboard.png" alt="DockPanel Desktop Dashboard" width="49%">
 </p>
 
 <h1 align="center">Re-dockpanel</h1>
 
 <p align="center">
-  <strong>Enhanced, Feature-Packed Fork of DockPanel by <a href="https://github.com/Juni4567">Junaid (@Juni4567)</a></strong><br>
-  Originally created by <a href="https://github.com/ovexro/dockpanel">@ovexro/dockpanel</a>.<br>
-  Self-hosted. Docker-native. Written in Rust. Panel services run on <strong>~49MB of RAM</strong>. 840+ HTTP routes. 147 app templates. ~57MB binaries. Zero subscriptions.
+  <strong>Cloud Server Control Panel &amp; Native Desktop Local Development Suite</strong><br>
+  Enhanced, Feature-Packed Fork of DockPanel by <a href="https://github.com/Juni4567">Junaid (@Juni4567)</a> &bull; Originally by <a href="https://github.com/ovexro/dockpanel">@ovexro/dockpanel</a>.<br>
+  Self-hosted. Written in Rust + React. <strong>~49MB RAM</strong> on Linux servers. Native <strong>Windows Desktop</strong> app. Zero subscriptions.
 </p>
 
 <p align="center">
-  <sub>Not the WPF/WinForms <code>DockPanel</code> docking control — this is a self-hosted Linux server panel.</sub>
+  <sub>Two editions, one unified workflow: <strong>Re-dockpanel Cloud</strong> for production Linux VPS/dedicated servers, and <strong>DockPanel Desktop</strong> for local Windows development with bidirectional live sync.</sub>
 </p>
 
 <p align="center">
@@ -22,11 +23,27 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Juni4567/Re-dockpanel">Repository</a> &bull;
+  <a href="#-two-editions-cloud--desktop">Cloud &amp; Desktop</a> &bull;
+  <a href="#install">Install</a> &bull;
+  <a href="#screenshots">Screenshots</a> &bull;
   <a href="CHANGELOG.md">Changelog</a> &bull;
-  <a href="https://github.com/Juni4567/Re-dockpanel/releases">Releases</a> &bull;
-  <a href="https://github.com/ovexro/dockpanel">Original Upstream</a>
+  <a href="https://github.com/Juni4567/Re-dockpanel/releases">Releases</a>
 </p>
+
+---
+
+## 🌐 Two Editions: Cloud & Desktop
+
+| | ☁️ Re-dockpanel Cloud (Linux) | 🖥️ DockPanel Desktop (Windows) |
+|---|---|---|
+| **Target** | Production VPS, dedicated & homelab Linux servers | Local Windows workstation development |
+| **Architecture** | Rust/Axum (`api` + `agent` + `cli` + `mcp`) + PostgreSQL 16 + Nginx + Docker | Pure-Rust native app (`Tao` + `Wry` + `Axum`) + Windows Host Helper service |
+| **Runtimes** | Static, PHP (8.1–8.5), Node.js, Python, Reverse Proxy | Static, PHP (7.4–8.6), Node.js (`PATH` / `nvm-windows` / `fnm` / `Volta`) |
+| **Databases** | Dockerized MariaDB 11 & PostgreSQL 16 + SQL Studio | Portable MariaDB 11 + Zero-config SQLite + SQL Studio |
+| **SSL / Domains** | Automatic Let's Encrypt (Certbot) + SNI isolation | Zero-UAC `.test` / `.local` hosts + `mkcert` local Root CA HTTPS |
+| **WordPress** | 4-Tab Plesk-style WordPress Toolkit + auto-MariaDB | 1-click cached WordPress install (SQLite or MariaDB) + full Toolkit |
+| **Deployment** | Git Push-to-Deploy (zero-downtime), 147 Docker App templates, Multi-server | 1-click **Push / Pull Live Sync** with remote Cloud servers |
+| **Install** | One-line `curl \| sudo bash` | Standalone `DockPanel-Desktop-Setup.exe` ([Releases](https://github.com/Juni4567/Re-dockpanel/releases)) |
 
 ---
 
@@ -92,14 +109,15 @@ This fork (`Re-dockpanel`) includes key production improvements, bug fixes, and 
 - Integrated Certbot automation issues and renews Let's Encrypt SSL certificates.
 - Seamless dual-port SNI routing: port 80 automatic HTTP→HTTPS redirect, standard port 443 HTTPS access, and port 8443 direct IP fallback.
 
-### 11. 🖥️ DockPanel Desktop (Local WordPress & PHP Development Environment)
-- **Tauri v2 + WSL2 Micro-Distro**: Native Windows workstation app providing exact Linux parity (Nginx, PHP 8.1–8.4 FPM, MariaDB, PostgreSQL, Mailpit) running directly inside native ext4 storage.
-- **Zero-UAC Local Domains**: Seamless `.test` and `.local` domain resolution via background Windows Named Pipe Host Helper (`dockpanel-host-helper`) without annoying Windows UAC popups.
-- **Locally-Trusted Green-Padlock HTTPS**: Out-of-the-box local Root CA (`mkcert`) wildcard SSL certificates for all local sites in Chrome, Edge, and Firefox.
-- **High-Speed ext4 Filesystem Access**: Direct access to site roots via Windows UNC paths (`\\wsl.localhost\dockpanel-desktop\var\www\<domain>`) with 1-click **"Open in Explorer"** and **"Open in VS Code"** dashboard actions.
-- **Bidirectional Live Server Synchronization**: Push to or pull from remote VPS servers with serialized PHP database domain rewriting and automated pre-flight remote safety snapshots.
-- **Offline Inno Setup Installer**: Standalone Windows installer bundling the micro-distro container archive, binaries, and local CA tools.
-- *For complete architecture, guides, and build steps, see [**docs/desktop/README.md**](docs/desktop/README.md).*
+### 11. 🖥️ DockPanel Desktop (Native Windows Local Development Environment)
+- **Pure-Rust Native App (`Tao + Wry + Axum`)**: Lightweight Windows desktop workstation app with an embedded Axum HTTP/HTTPS router, zero Docker/WSL overhead required.
+- **PHP (7.4–8.6), Node.js & Static Runtimes**: Download/switch PHP versions on demand, run native Node.js apps (auto-detecting `PATH`, `nvm-windows`, `fnm`, `Volta`, Scoop, and Chocolatey with `$PORT` management), or serve static sites.
+- **Zero-UAC Local Domains**: Seamless `.test` and `.local` domain resolution via the background Windows Named Pipe Host Helper (`dockpanel-host-helper`) without Windows UAC popups.
+- **Locally-Trusted Green-Padlock HTTPS**: Bundled `mkcert` local Root CA + `tokio-rustls` SNI TLS termination on port `443` / `8443` for every local site.
+- **Portable MariaDB 11 & Zero-Config SQLite**: Run a bundled portable MariaDB server alongside SQLite databases, complete with the built-in SQL Studio, inline row editing, and `.sql` dump import/export.
+- **Cached 1-Click WordPress Toolkit**: Fast offline-cached WordPress core + SQLite/MariaDB provisioning with streaming progress, plugin/theme/debug/security controls, and checksum integrity verification.
+- **Custom Site Paths & Bidirectional Live Sync**: Choose custom local folder paths per site, open directly in Explorer or VS Code, and push/pull sites to remote Re-dockpanel Cloud servers.
+- **Standalone Inno Setup Installer**: Ships as `DockPanel-Desktop-Setup.exe` in [GitHub Releases](https://github.com/Juni4567/Re-dockpanel/releases). See [**docs/desktop/README.md**](docs/desktop/README.md) for details.
 
 ---
 
@@ -110,6 +128,8 @@ This fork (`Re-dockpanel`) includes key production improvements, bug fixes, and 
 ---
 
 ## Install
+
+### ☁️ Cloud Server (Linux)
 
 ```bash
 curl -sL https://raw.githubusercontent.com/Juni4567/Re-dockpanel/main/scripts/install.sh | sudo bash
@@ -124,6 +144,10 @@ Supports Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, AlmaLinux 9+, Fedora 39+. 
 On the RHEL family the optional-service installers (Redis, Node.js, PowerDNS, WAF, Cloudflare
 Tunnel) work from the panel as of v2.40.0; the mail server still refuses there, and UFW refuses
 on any firewalld box by design. See [getting started](docs/getting-started.md#requirements).
+
+### 🖥️ Desktop (Windows)
+
+Download **`DockPanel-Desktop-Setup.exe`** from the latest `desktop-v*` release on [GitHub Releases](https://github.com/Juni4567/Re-dockpanel/releases) and run the installer. It sets up the native desktop app, `DockPanelHostHelper` service for zero-UAC `.test`/`.local` domains, and `mkcert` local HTTPS automatically.
 
 ## Why DockPanel?
 
@@ -152,6 +176,46 @@ features whose setup half worked and whose payoff half had never once run.
 found, including what is still broken.
 
 ## Screenshots
+
+### 🖥️ DockPanel Desktop (Windows)
+
+<details open>
+<summary><strong>Desktop Dashboard</strong> — Native Windows workstation metrics, active sites, and quick actions</summary>
+
+![Desktop Dashboard](.github/screenshots/desktop-dashboard.png)
+</details>
+
+<details>
+<summary><strong>Desktop Sites</strong> — Local PHP, Node.js, and Static sites with HTTPS &amp; quick Explorer/VS Code actions</summary>
+
+![Desktop Sites](.github/screenshots/desktop-sites.png)
+</details>
+
+<details>
+<summary><strong>Create Local Site</strong> — Quick Install presets (WordPress, Laravel, etc.), <code>.test</code>/<code>.local</code> domains, Node.js &amp; PHP runtimes</summary>
+
+![Desktop Create Site](.github/screenshots/desktop-create-site.png)
+</details>
+
+<details>
+<summary><strong>Desktop WordPress Toolkit</strong> — Local multi-site WordPress management, updates, and vulnerability overview</summary>
+
+![Desktop WordPress Toolkit](.github/screenshots/desktop-wp-toolkit.png)
+</details>
+
+<details>
+<summary><strong>Desktop Databases</strong> — Portable MariaDB 11 &amp; local SQLite databases with built-in SQL Studio</summary>
+
+![Desktop Databases](.github/screenshots/desktop-databases.png)
+</details>
+
+<details>
+<summary><strong>Desktop Settings</strong> — Configurable default websites directory, branding, and PHP &amp; Services manager</summary>
+
+![Desktop Settings](.github/screenshots/desktop-settings.png)
+</details>
+
+### ☁️ Re-dockpanel Cloud (Linux Server)
 
 <details>
 <summary><strong>Dashboard</strong> — Live server metrics, 24h graphs, site overview, recent activity</summary>
