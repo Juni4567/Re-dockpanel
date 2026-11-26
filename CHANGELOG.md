@@ -6,8 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [2.250.0] - 2026-11-26
 
-### Release: DockPanel Desktop — Node.js Runtime, HTTPS Site Links, & WordPress/Live Parity
-*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.250.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+### Release: DockPanel Cloud & Desktop v2.250.0 — Unified Stable Release
+*Unified `2.250.0` stable release across both **Re-dockpanel Cloud** (`panel/backend`, `panel/agent`, `panel/cli`, `panel/frontend`) and **DockPanel Desktop** (`desktop/dockpanel-app`, `desktop/host-helper`, `desktop/installer`).*
 
 #### Added
 - **Native Node.js Site Runtime on Desktop (`Sites.tsx`, `state.rs`, `router.rs`, `main.rs`):**
@@ -16,6 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   - Added `create_site_with_options()` to scaffold starter `package.json` and `server.js` files for new `node` sites, and `spawn_node_worker()` to launch the site's `app_command` (default `npm start`) with auto-allocated `$PORT`, Windows Job Object cleanup, and per-site `.app.log` logging.
   - Updated `router.rs` to proxy all requests for `node` and `proxy` sites directly to their worker port rather than serving files statically.
   - Added `/api/sites/{id}/app/status`, `/api/sites/{id}/app/restart`, and `/api/sites/{id}/app/logs` endpoints and live Node.js service status reporting.
+- **Updated Cloud & Desktop Showcase (`README.md`, `.github/screenshots/`):**
+  - Added side-by-side Cloud and Desktop previews with edition titles, feature comparison table, and sanitized screenshots (`dp-dashboard.png`, `desktop-dashboard.png`, `desktop-sites.png`, `desktop-create-site.png`, `desktop-wp-toolkit.png`, `desktop-databases.png`, `desktop-settings.png`).
 
 #### Fixed
 - **Open Site in New Tab Uses HTTPS (`PortConflictModal.tsx`):**
