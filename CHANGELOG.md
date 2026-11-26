@@ -4,6 +4,28 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.250.0] - 2026-11-26
+
+### Release: DockPanel Desktop — Node.js Runtime, HTTPS Site Links, & WordPress/Live Parity
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.250.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Native Node.js Site Runtime on Desktop (`Sites.tsx`, `state.rs`, `router.rs`, `main.rs`):**
+  - Restored the `Node.js` runtime option in the Create Site form for DockPanel Desktop.
+  - Added `find_node_binary()` and `get_node_version()` supporting `PATH`, `where.exe`, `nvm-windows` (`C:\nvm4w\nodejs`, `NVM_SYMLINK`, `NVM_HOME`, `%LOCALAPPDATA%\nvm`, `%APPDATA%\nvm`), Scoop, Chocolatey, fnm, Volta, and Windows Registry `Path` lookup.
+  - Added `create_site_with_options()` to scaffold starter `package.json` and `server.js` files for new `node` sites, and `spawn_node_worker()` to launch the site's `app_command` (default `npm start`) with auto-allocated `$PORT`, Windows Job Object cleanup, and per-site `.app.log` logging.
+  - Updated `router.rs` to proxy all requests for `node` and `proxy` sites directly to their worker port rather than serving files statically.
+  - Added `/api/sites/{id}/app/status`, `/api/sites/{id}/app/restart`, and `/api/sites/{id}/app/logs` endpoints and live Node.js service status reporting.
+
+#### Fixed
+- **Open Site in New Tab Uses HTTPS (`PortConflictModal.tsx`):**
+  - Updated `buildSiteExternalUrl()` to use `https://` when SSL is enabled in desktop mode (defaulting to port `443` and appending `:<ssl_port>` when non-standard), fixing external site links opening `http://` when HTTPS is active.
+- **No Demo Site Re-Seeding on Startup (`main.rs`, `install.ps1`):**
+  - Removed the `if state.list_sites().is_empty()` auto-seed blocks in `--server-only` and `run_app()` and removed `mytestdomain.local` / `wordpress.test` seeding from `install.ps1`.
+- **WordPress Toolkit Live Server Parity & Auto-Database Provisioning (`panel/backend`, `panel/agent`, `WordPress.tsx`):**
+  - Ported desktop WP Toolkit parity fixes to `panel/backend` and `panel/agent` (`SetupRequest` defaults/aliases, `GET`/`POST` integrity route, `WP_CACHE` toggling, `wp-content/cache/` purge, `db_id` injection in `db-info`, and auto-resolved admin user in `setup_admin`).
+  - Added `ensure_site_mariadb()` in `panel/backend/src/routes/databases.rs` and stripped empty/default `db_host: "localhost"` in `WordPress.tsx` so one-click WP Toolkit installs on live servers automatically provision a MariaDB container and pass `127.0.0.1:<port>` (plus a 25s MySQL readiness wait in `panel/agent`) instead of failing with MySQL error 2002.
+
 ## [2.249.0] - 2026-11-25
 
 ### Release: DockPanel Desktop Production Release & Full Local Toolkit

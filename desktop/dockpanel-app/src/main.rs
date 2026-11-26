@@ -4242,7 +4242,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "mariadb_running": mdb_port.is_some(),
         "mariadb_port": mdb_port,
         "default_sites_dir": state.get_default_sites_dir().to_string_lossy().to_string(),
-        "version": "2.249.0"
+        "version": "2.250.0"
     }))
 }
 
@@ -4756,7 +4756,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "cpu_cores": 8,
                     "ram_mb": 16384,
                     "disk_gb": 512,
-                    "agent_version": "2.249.0",
+                    "agent_version": "2.250.0",
                     "cpu_usage": 5.0,
                     "mem_used_mb": 2048,
                     "uptime_secs": 3600,
@@ -5135,7 +5135,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "status": "running",
                     "mode": "desktop",
                     "os": "windows",
-                    "version": "2.249.0"
+                    "version": "2.250.0"
                 }))
             }),
         )
