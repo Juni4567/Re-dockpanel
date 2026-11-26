@@ -498,12 +498,12 @@ export default function Sites() {
                 >
                   <option value="static">Static (HTML/CSS/JS)</option>
                   <option value="php">PHP</option>
-                  {!isDesktopApp() && <option value="node">Node.js</option>}
+                  <option value="node">Node.js</option>
                   {!isDesktopApp() && <option value="python">Python</option>}
                   {!isDesktopApp() && <option value="proxy">Reverse Proxy</option>}
                 </select>
                 <p className="text-xs text-dark-400 mt-1.5">
-                  {runtime === "node" ? "Node.js app with managed process (systemd + nginx reverse proxy)" :
+                  {runtime === "node" ? (isDesktopApp() ? "Node.js app with managed local process (auto-assigned $PORT)" : "Node.js app with managed process (systemd + nginx reverse proxy)") :
                    runtime === "python" ? "Python app with managed process (systemd + nginx reverse proxy)" :
                    runtime === "proxy" ? "Reverse proxy to a port (Docker container or external service)" :
                    runtime === "php" ? "PHP with PHP-FPM — WordPress, Laravel, Drupal, etc." :

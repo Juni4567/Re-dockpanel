@@ -130,7 +130,16 @@ async fn create_site_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let domain = payload.get("domain").and_then(|v| v.as_str()).unwrap_or("site.test");
+    let runtime = payload
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .unwrap_or("php");
     let php = payload.get("php_version").and_then(|v| v.as_str());
+    let app_command = payload.get("app_command").and_then(|v| v.as_str());
+    let proxy_port = payload
+        .get("proxy_port")
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok());
     let cms = payload.get("cms").and_then(|v| v.as_str());
     let preset = payload.get("php_preset").and_then(|v| v.as_str());
     let custom_root = payload
@@ -144,12 +153,23 @@ async fn create_site_handler(
         .unwrap_or("sqlite")
         .to_string();
 
-    match state.create_site_with_root(domain, php, custom_root) {
+    #[cfg(not(test))]
+    if runtime == "node" && state::find_node_binary().is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Node.js was not found on PATH or standard install folders. Install Node.js (https://nodejs.org) and try again."
+            })),
+        )
+            .into_response();
+    }
+
+    match state.create_site_with_options(domain, Some(runtime), php, custom_root, app_command, proxy_port) {
         Ok(site) => {
             if let Some(p) = cms.or(preset).filter(|s| !s.is_empty() && *s != "generic") {
                 state.update_site_preset(&site.id, p);
             }
-            let wants_wp = cms == Some("wordpress") || preset == Some("wordpress");
+            let wants_wp = site.runtime == "php" && (cms == Some("wordpress") || preset == Some("wordpress"));
             let site_dir = state.site_dir(&site);
             let prov_key = format!("site:{}", site.id);
 
@@ -424,12 +444,18 @@ async fn create_site_handler(
                 }
             }
             if !wp_failed {
+                let runtime_desc = match site.runtime.as_str() {
+                    "node" => format!("Node.js ({})", site.app_command.as_deref().unwrap_or("npm start")),
+                    "static" => "Static".to_string(),
+                    "proxy" => format!("Proxy (:{} )", site.proxy_port.unwrap_or(0)),
+                    _ => format!("PHP {}", site.php_version),
+                };
                 state.record_event(
                     "create_site",
                     "site",
                     domain,
                     "Site Created",
-                    &format!("Created local site http://{} (PHP {})", domain, site.php_version),
+                    &format!("Created local site http://{} ({})", domain, runtime_desc),
                     "success",
                 );
             }
@@ -1105,6 +1131,70 @@ async fn switch_site_php_handler(
         )
             .into_response(),
     }
+}
+
+async fn site_app_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let port = state.get_site_worker_port(&site.domain);
+    let alive = {
+        let mut procs = state.worker_processes.lock().unwrap();
+        if let Some(child) = procs.get_mut(&site.domain.to_lowercase()) {
+            matches!(child.try_wait(), Ok(None))
+        } else {
+            false
+        }
+    };
+    let active = if site.runtime == "proxy" {
+        port.is_some()
+    } else {
+        alive && port.is_some()
+    };
+    Json(serde_json::json!({
+        "active": active,
+        "status": if active { "running" } else { "stopped" },
+        "port": port,
+        "runtime": site.runtime,
+        "app_command": site.app_command,
+    }))
+    .into_response()
+}
+
+async fn site_app_restart_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let _ = state.stop_site(&site.id);
+    match state.start_site(&site.id) {
+        Ok(updated) => Json(serde_json::json!({
+            "ok": true,
+            "status": "running",
+            "port": state.get_site_worker_port(&updated.domain),
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn site_app_logs_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let log_path = state.app_log_path(&site.domain);
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().rev().take(200).collect();
+    let tail: String = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+    Json(serde_json::json!({ "logs": tail })).into_response()
 }
 
 async fn switch_site_runtime_handler(
@@ -4387,6 +4477,13 @@ async fn services_install_status_handler(State(state): State<Arc<AppState>>) -> 
     let mdb_installed = mariadb::find_mariadbd_binary().is_some();
     let mdb_port = state.get_mariadb_port();
 
+    let node_ver = state::get_node_version();
+    let node_running = state.list_sites().iter().any(|s| {
+        s.runtime == "node"
+            && s.status == "active"
+            && state.get_site_worker_port(&s.domain).is_some()
+    });
+
     Json(serde_json::json!({
         "php": {
             "installed": installed_php.is_some(),
@@ -4404,7 +4501,11 @@ async fn services_install_status_handler(State(state): State<Arc<AppState>>) -> 
             "installed": helper_installed,
             "running": helper_installed,
         },
-        "nodejs": { "installed": false, "running": false },
+        "nodejs": {
+            "installed": node_ver.is_some(),
+            "running": node_running,
+            "version": node_ver.unwrap_or_default(),
+        },
         "composer": { "installed": false, "running": false },
         "redis": { "installed": false, "running": false },
         "certbot": { "installed": false },
@@ -4675,6 +4776,9 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/sites/{id}/stop", post(stop_site_handler))
         .route("/sites/{id}/php", put(switch_site_php_handler))
         .route("/sites/{id}/runtime", put(switch_site_runtime_handler))
+        .route("/sites/{id}/app/status", get(site_app_status_handler))
+        .route("/sites/{id}/app/restart", post(site_app_restart_handler))
+        .route("/sites/{id}/app/logs", get(site_app_logs_handler))
         .route("/sites/{id}/provision-log", get(site_provision_log_handler))
         .route("/sites/{id}/health", get(site_health_handler))
         .route("/sites/{id}/health-summary", get(site_health_summary_handler))

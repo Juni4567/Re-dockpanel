@@ -514,6 +514,22 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
 
     let worker_port = state.get_site_worker_port(&site.domain);
 
+    // Proxying runtimes (Node.js / Reverse Proxy) forward all requests to their local process/target
+    if site.runtime == "node" || site.runtime == "proxy" {
+        if let Some(port) = worker_port {
+            return proxy_to_worker(port, &path_and_query_str, req).await;
+        } else {
+            return render_error_page(
+                StatusCode::BAD_GATEWAY,
+                "Application Worker Not Running",
+                &format!(
+                    "Application process is not running for site '{}'. Start the site in DockPanel.",
+                    site.domain
+                ),
+            );
+        }
+    }
+
     // If path points to an existing file in site.document_root
     if target_path.is_file() {
         let is_php = target_path
@@ -1150,6 +1166,40 @@ Active Connections
             .unwrap();
         let ok_resp = handle_router_request(ok_req, state.clone()).await;
         assert_eq!(ok_resp.status(), axum::http::StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_node_site_proxies_all_paths_including_existing_files() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_node_router_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir.clone()));
+
+        let site = state
+            .create_site_with_options("node-proxy.test", Some("node"), None, None, Some("node server.js"), None)
+            .unwrap();
+
+        // Spawn a tiny mock HTTP server acting as the Node.js worker
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_port = listener.local_addr().unwrap().port();
+        let mock_app = axum::Router::new().fallback(|| async { "hello-from-node-worker" });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+        state.set_site_worker_port(&site.domain, worker_port);
+
+        // Even requesting /server.js (an existing file on disk) must proxy to the Node worker
+        let req = axum::http::Request::builder()
+            .header("host", "node-proxy.test")
+            .uri("/server.js")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = handle_router_request(req, state.clone()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "hello-from-node-worker");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

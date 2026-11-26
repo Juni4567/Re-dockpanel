@@ -46,6 +46,10 @@ pub struct LocalSite {
     pub php_memory_mb: i32,
     #[serde(default = "default_php_workers")]
     pub php_max_workers: i32,
+    #[serde(default)]
+    pub app_command: Option<String>,
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -300,6 +304,78 @@ fn dir_matches_version(dir_name: &str, version: &str) -> bool {
 }
 
 /// Finds a PHP binary matching the exact requested `major.minor` version (without falling back to other versions).
+/// Locate a locally installed Node.js binary on PATH or common Windows install locations.
+pub fn find_node_binary() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        if let Ok(out) = std::process::Command::new("where.exe")
+            .arg("node")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let p = PathBuf::from(line.trim());
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Program Files\nodejs\node.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\nodejs\node.exe"),
+        ];
+        if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(&local_app).join("Programs").join("nodejs").join("node.exe"));
+            candidates.push(PathBuf::from(&local_app).join("fnm_multishells").join("node.exe"));
+        }
+        if let Ok(user_prof) = std::env::var("USERPROFILE") {
+            candidates.push(PathBuf::from(&user_prof).join(".volta").join("bin").join("node.exe"));
+        }
+        for c in candidates {
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(out) = std::process::Command::new("which").arg("node").output() {
+            if out.status.success() {
+                let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Returns the installed Node.js version string (e.g. "v22.14.0") if available.
+pub fn get_node_version() -> Option<String> {
+    let node = find_node_binary()?;
+    let mut cmd = std::process::Command::new(node);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd.output().ok()?;
+    if out.status.success() {
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
 pub fn find_php_binary_exact(version: &str) -> Option<PathBuf> {
     let dirs = collect_versioned_php_dirs();
     if let Some((_, exe)) = dirs.iter().find(|(name, _)| dir_matches_version(name, version)) {
@@ -528,8 +604,17 @@ impl AppState {
             }
         };
         self.save_data();
-        if site.status == "active" && site.runtime == "php" {
-            self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+        // Stop any existing worker first so switching to static or between runtimes is clean
+        {
+            let mut procs = self.worker_processes.lock().unwrap();
+            if let Some(mut child) = procs.remove(&site.domain.to_lowercase()) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        self.remove_site_worker_port(&site.domain);
+        if site.status == "active" {
+            self.spawn_site_worker(&site);
         }
         Ok(site)
     }
@@ -853,9 +938,39 @@ impl AppState {
         php_version: Option<&str>,
         custom_root: Option<&str>,
     ) -> Result<LocalSite, String> {
+        self.create_site_with_options(domain, Some("php"), php_version, custom_root, None, None)
+    }
+
+    pub fn create_site_with_options(
+        &self,
+        domain: &str,
+        runtime: Option<&str>,
+        php_version: Option<&str>,
+        custom_root: Option<&str>,
+        app_command: Option<&str>,
+        proxy_port: Option<u16>,
+    ) -> Result<LocalSite, String> {
         let validated = crate::hosts_manager::validate_domain(domain)?;
         let clean_domain = validated.to_lowercase();
         let id = uuid::Uuid::new_v4().to_string();
+
+        let runtime_str = match runtime.map(str::trim).filter(|s| !s.is_empty()) {
+            Some("static") => "static".to_string(),
+            Some("node") => "node".to_string(),
+            Some("proxy") => "proxy".to_string(),
+            _ => "php".to_string(),
+        };
+
+        let effective_app_cmd = if runtime_str == "node" {
+            let cmd = app_command
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("npm start")
+                .to_string();
+            Some(cmd)
+        } else {
+            None
+        };
 
         let base_dir = self.get_default_sites_dir();
         let site_dir = if let Some(raw_root) = custom_root.map(str::trim).filter(|s| !s.is_empty()) {
@@ -878,12 +993,64 @@ impl AppState {
         fs::create_dir_all(&site_dir)
             .map_err(|e| format!("Failed creating site directory '{}': {}", site_dir.display(), e))?;
 
-        // Write starter index.html only if folder doesn't already have index.html or index.php
-        let index_file = site_dir.join("index.html");
-        let index_php = site_dir.join("index.php");
-        if !index_file.exists() && !index_php.exists() {
-            let html = format!(
-                r#"<!DOCTYPE html>
+        if runtime_str == "node" {
+            let pkg_json = site_dir.join("package.json");
+            let server_js = site_dir.join("server.js");
+            let index_js = site_dir.join("index.js");
+            let app_js = site_dir.join("app.js");
+            if !pkg_json.exists() && !server_js.exists() && !index_js.exists() && !app_js.exists() {
+                let pkg_name: String = clean_domain
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+                    .collect();
+                let pkg_content = format!(
+                    "{{\n  \"name\": \"{pkg_name}\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"scripts\": {{\n    \"start\": \"node server.js\"\n  }}\n}}\n"
+                );
+                let _ = fs::write(&pkg_json, pkg_content);
+                let server_content = format!(
+                    r#"const http = require('http');
+
+const port = Number(process.env.PORT) || 3000;
+const server = http.createServer((req, res) => {{
+  res.writeHead(200, {{ 'Content-Type': 'text/html; charset=utf-8' }});
+  res.end(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{domain} - DockPanel Desktop</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+    .card {{ background: #1e293b; padding: 2.5rem; border-radius: 1rem; border: 1px solid #334155; text-align: center; max-width: 520px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+    h1 {{ color: #38bdf8; margin-top: 0; }}
+    p {{ color: #94a3b8; font-size: 1.05rem; line-height: 1.6; }}
+    .badge {{ background: #059669; color: white; padding: 0.35rem 0.75rem; border-radius: 9999px; font-size: 0.875rem; font-weight: 600; display: inline-block; margin-top: 1rem; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>{domain}</h1>
+    <p>Your local Node.js app is running natively via <strong>DockPanel Desktop</strong> (Node ${{process.version}} on port ${{port}}).</p>
+    <span class="badge">Node.js Runtime Active</span>
+  </div>
+</body>
+</html>`);
+}});
+
+server.listen(port, '127.0.0.1', () => {{
+  console.log(`Server listening on http://127.0.0.1:${{port}}`);
+}});
+"#,
+                    domain = clean_domain
+                );
+                let _ = fs::write(&server_js, server_content);
+            }
+        } else {
+            // Write starter index.html only if folder doesn't already have index.html or index.php
+            let index_file = site_dir.join("index.html");
+            let index_php = site_dir.join("index.php");
+            if !index_file.exists() && !index_php.exists() {
+                let html = format!(
+                    r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -904,15 +1071,16 @@ impl AppState {
     </div>
 </body>
 </html>"#,
-                domain = clean_domain
-            );
-            let _ = fs::write(index_file, html);
+                    domain = clean_domain
+                );
+                let _ = fs::write(index_file, html);
+            }
         }
 
         let site = LocalSite {
             id,
             domain: clean_domain.clone(),
-            runtime: "php".to_string(),
+            runtime: runtime_str,
             php_version: php_version.unwrap_or("8.3").to_string(),
             document_root: site_dir.to_string_lossy().to_string(),
             status: "active".to_string(),
@@ -923,6 +1091,8 @@ impl AppState {
             max_upload_mb: 64,
             php_memory_mb: 256,
             php_max_workers: 4,
+            app_command: effective_app_cmd,
+            proxy_port,
         };
 
         {
@@ -1084,6 +1254,138 @@ impl AppState {
         }
     }
 
+    pub fn app_log_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("logs").join(format!("{}.app.log", clean))
+    }
+
+    pub fn spawn_site_worker(&self, site: &LocalSite) {
+        match site.runtime.as_str() {
+            "node" => {
+                self.spawn_node_worker(&site.domain, &site.document_root, site.app_command.as_deref());
+            }
+            "static" => {}
+            "proxy" => {
+                if let Some(p) = site.proxy_port {
+                    self.set_site_worker_port(&site.domain, p);
+                }
+            }
+            _ => {
+                self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+            }
+        }
+    }
+
+    pub fn spawn_node_worker(
+        &self,
+        domain: &str,
+        doc_root: &str,
+        app_command: Option<&str>,
+    ) -> Option<u16> {
+        let clean = domain.trim().to_lowercase();
+
+        // Check if existing worker is still alive
+        {
+            let mut procs = self.worker_processes.lock().unwrap();
+            if let Some(child) = procs.get_mut(&clean) {
+                if let Ok(None) = child.try_wait() {
+                    if let Some(port) = self.get_site_worker_port(&clean) {
+                        return Some(port);
+                    }
+                } else {
+                    procs.remove(&clean);
+                }
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let worker_port = listener.local_addr().ok()?.port();
+        drop(listener);
+
+        let command_line = app_command
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("npm start");
+
+        let log_path = self.app_log_path(&clean);
+        if let Some(parent) = log_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let stdout_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok();
+        let stderr_file = stdout_file.as_ref().and_then(|f| f.try_clone().ok());
+
+        #[cfg(windows)]
+        let mut cmd = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let mut c = std::process::Command::new("cmd.exe");
+            c.args(["/C", command_line]);
+            c.creation_flags(CREATE_NO_WINDOW);
+            if let Some(node_exe) = find_node_binary() {
+                if let Some(node_dir) = node_exe.parent() {
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    c.env("PATH", format!("{};{}", node_dir.to_string_lossy(), current_path));
+                }
+            }
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", command_line]);
+            c
+        };
+
+        cmd.current_dir(doc_root)
+            .env("PORT", worker_port.to_string())
+            .env("HOST", "127.0.0.1")
+            .env("SITE_DOMAIN", &clean);
+
+        if let Some(out) = stdout_file {
+            cmd.stdout(std::process::Stdio::from(out));
+        } else {
+            cmd.stdout(std::process::Stdio::null());
+        }
+        if let Some(err) = stderr_file {
+            cmd.stderr(std::process::Stdio::from(err));
+        } else {
+            cmd.stderr(std::process::Stdio::null());
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                #[cfg(windows)]
+                assign_child_to_job(&self.worker_job, &child);
+
+                {
+                    let mut procs = self.worker_processes.lock().unwrap();
+                    if let Some(mut old_child) = procs.insert(clean.clone(), child) {
+                        let _ = old_child.kill();
+                        let _ = old_child.wait();
+                    }
+                }
+                self.set_site_worker_port(&clean, worker_port);
+
+                // Briefly wait up to 1.5s for Node.js to bind its port so immediate requests succeed
+                for _ in 0..30 {
+                    if std::net::TcpStream::connect(("127.0.0.1", worker_port)).is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Some(worker_port)
+            }
+            Err(e) => {
+                eprintln!("Failed to spawn Node.js worker for {}: {}", clean, e);
+                None
+            }
+        }
+    }
+
     pub fn start_site(&self, id_or_domain: &str) -> Result<LocalSite, String> {
         let clean = id_or_domain.trim().to_lowercase();
         let site = {
@@ -1099,8 +1401,8 @@ impl AppState {
             None => return Err(format!("Site '{}' not found", id_or_domain)),
         };
 
-        // If site uses PHP, spawn or ensure worker is running
-        self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+        // Spawn runtime worker if applicable (PHP, Node.js, or Proxy)
+        self.spawn_site_worker(&site);
 
         // Update status to active
         {
@@ -1167,7 +1469,7 @@ impl AppState {
         };
 
         for site in active_sites {
-            self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+            self.spawn_site_worker(&site);
             let _ = crate::hosts_manager::sync_domain_to_hosts(&site.domain);
             #[cfg(not(test))]
             {
@@ -1613,6 +1915,27 @@ mod tests {
         std::fs::write(custom_root.join("extra.txt"), "cleanup-me").unwrap();
         assert!(state.delete_site(&site.id));
         assert!(!custom_root.exists(), "Deleting a site must remove its document root folder from disk");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_create_node_site_scaffolds_starter_app() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_node_site_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir, sites_dir.clone());
+
+        let site = state
+            .create_site_with_options("mynode.test", Some("node"), None, None, Some("node server.js"), None)
+            .unwrap();
+        assert_eq!(site.runtime, "node");
+        assert_eq!(site.app_command.as_deref(), Some("node server.js"));
+
+        let site_dir = sites_dir.join("mynode.test");
+        assert!(site_dir.join("package.json").is_file());
+        assert!(site_dir.join("server.js").is_file());
+        assert!(!site_dir.join("index.html").exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
