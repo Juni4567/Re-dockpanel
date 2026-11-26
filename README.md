@@ -1,7 +1,17 @@
-<p align="center">
-  <img src=".github/screenshots/dp-dashboard.png" alt="DockPanel Cloud Dashboard" width="49%">
-  <img src=".github/screenshots/desktop-dashboard.png" alt="DockPanel Desktop Dashboard" width="49%">
-</p>
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <h3>☁️ Re-dockpanel Cloud (Linux Server)</h3>
+      <img src=".github/screenshots/dp-dashboard.png" alt="Re-dockpanel Cloud Dashboard" width="100%">
+      <p><sub>Self-hosted Linux VPS &amp; multi-server control panel (~49MB RAM). Dockerized apps, Let's Encrypt SSL, Git push-to-deploy, WordPress Toolkit, Mail, DNS &amp; WAF.</sub></p>
+    </td>
+    <td width="50%" align="center" valign="top">
+      <h3>🖥️ DockPanel Desktop (Windows)</h3>
+      <img src=".github/screenshots/desktop-dashboard.png" alt="DockPanel Desktop Dashboard" width="100%">
+      <p><sub>Pure-Rust native Windows local dev suite. Zero-UAC <code>.test</code>/<code>.local</code> domains, <code>mkcert</code> HTTPS, PHP 7.4–8.6, Node.js, Portable MariaDB/SQLite &amp; Live Server Sync.</sub></p>
+    </td>
+  </tr>
+</table>
 
 <h1 align="center">Re-dockpanel</h1>
 
@@ -178,6 +188,7 @@ found, including what is still broken.
 ## Screenshots
 
 ### 🖥️ DockPanel Desktop (Windows)
+*Native Windows workstation environment for local PHP, Node.js, Static, and WordPress development with zero-UAC `.test`/`.local` domains and `mkcert` HTTPS.*
 
 <details open>
 <summary><strong>Desktop Dashboard</strong> — Native Windows workstation metrics, active sites, and quick actions</summary>
@@ -217,8 +228,8 @@ found, including what is still broken.
 
 ### ☁️ Re-dockpanel Cloud (Linux Server)
 
-<details>
-<summary><strong>Dashboard</strong> — Live server metrics, 24h graphs, site overview, recent activity</summary>
+<details open>
+<summary><strong>Cloud Dashboard</strong> — Live server metrics, 24h graphs, site overview, and recent activity</summary>
 
 ![Dashboard](.github/screenshots/dp-dashboard.png)
 </details>
