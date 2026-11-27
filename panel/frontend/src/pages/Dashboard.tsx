@@ -6,7 +6,7 @@ import { useAuth } from "../context/AuthContext";
 import { isNavVisible, navFlagsFor } from "../data/navItems";
 import { formatSize, formatRate, formatUptime, timeAgo } from "../utils/format";
 import ConfirmDialog from "../components/ConfirmDialog";
-import { showGlobalNotification } from "../context/NotificationContext";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
 import { isDesktopApp } from "../utils/desktop";
 
 interface SiteDetail {
@@ -489,11 +489,10 @@ export default function Dashboard() {
   // nobody is looking at costs nothing, and the banner is only wrong to a
   // person who is looking at it.
   useEffect(() => {
-    if (desktop) return;
     const loadUpdateInfo = () => {
       // Admin-gated in the backend; asking as anybody else is a refusal this
       // page then swallows (update status).
-      if (isAdmin) {
+      if (desktop || isAdmin) {
         api
           .get<UpdateInfo>("/telemetry/update-status")
           .then(setUpdateInfo)
@@ -519,17 +518,15 @@ export default function Dashboard() {
       // page that forwarded it, and what it forwarded was an authorization
       // refusal aimed at the operator rather than the reader.
       .catch(() => setError("Failed to load system info"));
-    if (!desktop) {
-      api
-        .get<Process[]>("/system/processes")
-        .then(setProcesses)
-        .catch(() => {});
-      api
-        .get<NetworkIface[]>("/system/network")
-        .then(setNetwork)
-        .catch(() => {});
-    }
-  }, [isAdmin, desktop]);
+    api
+      .get<Process[]>("/system/processes")
+      .then(setProcesses)
+      .catch(() => {});
+    api
+      .get<NetworkIface[]>("/system/network")
+      .then(setNetwork)
+      .catch(() => {});
+  }, [isAdmin]);
 
   // WebSocket connection for live metrics — PANEL HOST ONLY, deliberately.
   //
@@ -894,18 +891,76 @@ export default function Dashboard() {
       {/* Health banner moved to page header */}
 
       {/* Update available banner */}
-      {!desktop && updateInfo?.update_available && updateInfo.update_available_version && (
-        <div className="rounded-lg border border-rust-500/30 bg-rust-500/10 px-4 py-3 mb-6 flex items-center justify-between">
+      {updateInfo?.update_available && updateInfo.update_available_version && (
+        <div className="rounded-lg border border-rust-500/30 bg-rust-500/10 px-4 py-3 mb-6 flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-3">
             <svg className="w-5 h-5 text-rust-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
             <span className="text-sm text-rust-300">
-              <strong>DockPanel v{updateInfo.update_available_version}</strong> is available
+              <strong>DockPanel {desktop ? "Desktop " : ""}v{updateInfo.update_available_version}</strong> is available
               <span className="text-dark-400 ml-1">(current: v{updateInfo.current_version})</span>
             </span>
           </div>
-          <Link to="/telemetry?tab=updates" className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium transition-colors whitespace-nowrap">
-            View Update
-          </Link>
+          {desktop ? (
+            <div className="flex items-center gap-2">
+              {updateInfo.update_release_url && (
+                <a
+                  href={updateInfo.update_release_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded-lg text-xs font-medium transition-colors whitespace-nowrap"
+                >
+                  Release Notes
+                </a>
+              )}
+              <button
+                type="button"
+                onClick={async () => {
+                  const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+                  const targetVersion = updateInfo.update_available_version || "latest";
+                  try {
+                    showGlobalNotification(
+                      "info",
+                      `Downloading verified DockPanel Desktop v${targetVersion} installer...`,
+                      "Updating",
+                      `Target Version: v${targetVersion}\nCurrent:        v${updateInfo.current_version || "unknown"}`,
+                      { category: "update", target: `v${targetVersion}` }
+                    );
+                    await api.post("/desktop/update/install", {});
+                    const durationMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt));
+                    showGlobalNotification(
+                      "success",
+                      "Installer launched — follow the Setup Wizard to finish updating.",
+                      "Update Ready",
+                      `Version:  v${targetVersion}\nVerified: SHA-256 checksum passed\nElapsed:  ${durationMs}ms`,
+                      {
+                        category: "update",
+                        target: `v${targetVersion}`,
+                        endpoint: "/desktop/update/install",
+                        method: "POST",
+                        statusCode: 200,
+                        durationMs,
+                      }
+                    );
+                  } catch (e) {
+                    const info = buildAlertDetails(e, {
+                      context: `Download & verify DockPanel Desktop v${targetVersion}`,
+                      fallback: "Update failed",
+                      category: "update",
+                      target: `v${targetVersion}`,
+                    });
+                    showGlobalNotification("error", info.message, "Update Failed", info.details, info.meta);
+                  }
+                }}
+                className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium transition-colors whitespace-nowrap"
+              >
+                Install Update
+              </button>
+            </div>
+          ) : (
+            <Link to="/telemetry?tab=updates" className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium transition-colors whitespace-nowrap">
+              View Update
+            </Link>
+          )}
         </div>
       )}
 

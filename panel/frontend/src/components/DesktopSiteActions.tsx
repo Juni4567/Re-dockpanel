@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { api } from "../api";
-import { showGlobalNotification } from "../context/NotificationContext";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
 import {
   isDesktopApp,
   openDesktopFolder,
@@ -120,11 +120,13 @@ export async function toggleDesktopSiteStatus(
  */
 function SiteLifecycleToggle({
   siteId,
+  domain,
   status,
   onStatusChange,
   onError,
 }: {
   siteId: string;
+  domain: string;
   status?: string;
   onStatusChange?: (newStatus: string) => void;
   onError?: (message: string) => void;
@@ -137,21 +139,40 @@ function SiteLifecycleToggle({
     e.stopPropagation();
     if (loading) return;
 
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     setLoading(true);
     try {
       const nextStatus = await toggleDesktopSiteStatus(siteId, status);
+      const durationMs = Math.max(
+        1,
+        Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt)
+      );
       showGlobalNotification(
         "success",
-        nextStatus === "active" ? "Site PHP worker started" : "Site PHP worker stopped",
+        nextStatus === "active"
+          ? `Site runtime started for ${domain}`
+          : `Site runtime stopped for ${domain}`,
+        nextStatus === "active" ? "Site Started" : "Site Stopped",
+        `Domain:    ${domain}\nAction:    ${nextStatus === "active" ? "Start" : "Stop"} runtime\nState:     ${nextStatus}\nElapsed:   ${durationMs}ms`,
+        {
+          category: "site",
+          target: domain,
+          endpoint: `/sites/${siteId}/${isRunning ? "stop" : "start"}`,
+          method: "POST",
+          statusCode: 200,
+          durationMs,
+        }
       );
       onStatusChange?.(nextStatus);
     } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : `Failed to ${isRunning ? "stop" : "start"} site`;
-      showGlobalNotification("error", message);
-      onError?.(message);
+      const info = buildAlertDetails(err, {
+        context: `${isRunning ? "Stop" : "Start"} site ${domain}`,
+        fallback: `Failed to ${isRunning ? "stop" : "start"} site`,
+        category: "site",
+        target: domain,
+      });
+      showGlobalNotification("error", info.message, "Site Runtime Error", info.details, info.meta);
+      onError?.(info.message);
     } finally {
       setLoading(false);
     }
@@ -226,11 +247,20 @@ export default function DesktopSiteActions({
     e.stopPropagation();
     const ok = await openDesktopFolder(domain);
     if (ok) {
-      showGlobalNotification("success", `Opened folder for ${domain}`);
+      showGlobalNotification(
+        "success",
+        `Opened folder for ${domain}`,
+        "Explorer Launched",
+        `Path: %USERPROFILE%\\DockPanel\\sites\\${domain}`,
+        { category: "desktop", target: domain, autoDismissMs: 5000 }
+      );
       onOpenExplorer?.();
     } else {
       const msg = `Failed to open folder for ${domain}`;
-      showGlobalNotification("error", msg);
+      showGlobalNotification("error", msg, "Explorer Launch Failed", `Target path: %USERPROFILE%\\DockPanel\\sites\\${domain}`, {
+        category: "desktop",
+        target: domain,
+      });
       onError?.(msg);
     }
   };
@@ -240,11 +270,20 @@ export default function DesktopSiteActions({
     e.stopPropagation();
     const ok = await openDesktopVSCode(domain);
     if (ok) {
-      showGlobalNotification("success", `Opening ${domain} in VS Code`);
+      showGlobalNotification(
+        "success",
+        `Opening ${domain} in VS Code`,
+        "Editor Launched",
+        `Workspace: %USERPROFILE%\\DockPanel\\sites\\${domain}`,
+        { category: "desktop", target: domain, autoDismissMs: 5000 }
+      );
       onOpenVSCode?.();
     } else {
       const msg = `Could not launch VS Code for ${domain}. Ensure 'code' CLI is in PATH.`;
-      showGlobalNotification("error", msg);
+      showGlobalNotification("error", msg, "VS Code Launch Failed", `Command: code "%USERPROFILE%\\DockPanel\\sites\\${domain}"`, {
+        category: "desktop",
+        target: domain,
+      });
       onError?.(msg);
     }
   };
@@ -254,6 +293,7 @@ export default function DesktopSiteActions({
       {siteId && (
         <SiteLifecycleToggle
           siteId={siteId}
+          domain={domain}
           status={status}
           onStatusChange={onStatusChange}
           onError={onError}

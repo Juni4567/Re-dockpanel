@@ -12,7 +12,7 @@ import DesktopSiteActions from "../components/DesktopSiteActions";
 import { buildSiteExternalUrl } from "../components/PortConflictModal";
 import { isDesktopApp } from "../utils/desktop";
 import { useAuth } from "../context/AuthContext";
-import { showGlobalNotification } from "../context/NotificationContext";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
 
 interface Site {
   id: string;
@@ -477,15 +477,35 @@ export default function SiteDetail() {
   }, [id]);
 
   const handleAppAction = async (action: "start" | "stop" | "restart") => {
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     setAppActionLoading(action);
     try {
       const updated = await api.post<AppStatus>(`/sites/${id}/app/action`, { action });
+      const durationMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt));
       setAppStatus(updated);
-      showGlobalNotification("success", `App ${action}ed successfully`, "App Process");
+      showGlobalNotification(
+        "success",
+        `App ${action}ed successfully for ${site?.domain || id}`,
+        "App Process",
+        `Site:    ${site?.domain || id}\nAction:  ${action}\nElapsed: ${durationMs}ms`,
+        {
+          category: "site",
+          target: site?.domain,
+          endpoint: `/sites/${id}/app/action`,
+          method: "POST",
+          statusCode: 200,
+          durationMs,
+        }
+      );
       if (showAppLogs) loadAppLogs();
     } catch (e) {
-      const err = e instanceof Error ? e.message : `Failed to ${action} app`;
-      showGlobalNotification("error", err, "App Process");
+      const info = buildAlertDetails(e, {
+        context: `App ${action} for ${site?.domain || id}`,
+        fallback: `Failed to ${action} app`,
+        category: "site",
+        target: site?.domain,
+      });
+      showGlobalNotification("error", info.message, "App Process Failed", info.details, info.meta);
     } finally {
       setAppActionLoading(null);
     }
@@ -695,10 +715,15 @@ export default function SiteDetail() {
       setSslMessageIsError(false);
       showGlobalNotification("success", successText, "SSL Certificate Renewed");
     } catch (err) {
-      const errorText = err instanceof Error ? err.message : "SSL renewal failed";
-      setSslMessage(errorText);
+      const info = buildAlertDetails(err, {
+        context: `Renew SSL certificate for ${site.domain}`,
+        fallback: "SSL renewal failed",
+        category: "ssl",
+        target: site.domain,
+      });
+      setSslMessage(info.message);
       setSslMessageIsError(true);
-      showGlobalNotification("error", errorText, "SSL Renewal Failed");
+      showGlobalNotification("error", info.message, "SSL Renewal Failed", info.details, info.meta);
     } finally {
       setRenewingSsl(false);
     }
@@ -878,8 +903,18 @@ export default function SiteDetail() {
                   const nextEnabled = !site?.enabled;
                   await api.put(`/sites/${id}/toggle`, { enabled: nextEnabled });
                   setSite(s => s ? { ...s, enabled: nextEnabled } : s);
-                  showGlobalNotification("success", `Site ${nextEnabled ? "enabled" : "disabled"}`);
-                } catch (e) { setError(e instanceof Error ? e.message : "Toggle failed"); }
+                  showGlobalNotification(
+                    "success",
+                    `${site?.domain || "Site"} ${nextEnabled ? "enabled" : "disabled"}`,
+                    nextEnabled ? "Site Enabled" : "Site Disabled",
+                    `Domain: ${site?.domain || id}\nStatus: ${nextEnabled ? "Active" : "Disabled"}`,
+                    { category: "site", target: site?.domain, endpoint: `/sites/${id}/toggle`, method: "PUT", statusCode: 200 }
+                  );
+                } catch (e) {
+                  const info = buildAlertDetails(e, { context: `Toggle site ${site?.domain || id}`, fallback: "Toggle failed", category: "site", target: site?.domain });
+                  setError(info.message);
+                  showGlobalNotification("error", info.message, "Site Toggle Failed", info.details, info.meta);
+                }
                 finally { setToggling(false); }
               }} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
                 site?.enabled !== false
@@ -1281,15 +1316,37 @@ export default function SiteDetail() {
                       onChange={async (newVersion, ready) => {
                         setPhpChoice(newVersion);
                         if (!ready || newVersion === site.php_version) return;
+                        const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
                         setSwitchingPhp(true);
                         setPhpMessage("");
                         try {
                           const updated = await api.put<Site>(`/sites/${id}/php`, { version: newVersion });
+                          const durationMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt));
                           setSite(updated);
                           setPhpMessage(`Switched to PHP ${newVersion}`);
-                          showGlobalNotification("success", `Switched to PHP ${newVersion}`);
+                          showGlobalNotification(
+                            "success",
+                            `Switched ${site.domain} to PHP ${newVersion}`,
+                            "PHP Version Updated",
+                            `Site:     ${site.domain}\nRuntime:  PHP ${newVersion} (previous: PHP ${site.php_version})\nElapsed:  ${durationMs}ms`,
+                            {
+                              category: "php",
+                              target: site.domain,
+                              endpoint: `/sites/${id}/php`,
+                              method: "PUT",
+                              statusCode: 200,
+                              durationMs,
+                            }
+                          );
                         } catch (err) {
-                          setPhpMessage(err instanceof Error ? err.message : "Switch failed");
+                          const info = buildAlertDetails(err, {
+                            context: `Switch ${site.domain} to PHP ${newVersion}`,
+                            fallback: "Switch failed",
+                            category: "php",
+                            target: site.domain,
+                          });
+                          setPhpMessage(info.message);
+                          showGlobalNotification("error", info.message, "PHP Switch Failed", info.details, info.meta);
                           // Put the control back on what the site is actually
                           // running. Leaving it on the version that just failed
                           // states the switch happened, and — because the guard
@@ -1341,13 +1398,34 @@ export default function SiteDetail() {
                 type="button"
                 disabled={provisioningLocalSsl}
                 onClick={async () => {
+                  const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
                   setProvisioningLocalSsl(true);
                   try {
                     const res = await api.post<{ ssl_port?: number | null; message?: string }>(`/sites/${id}/ssl/provision`, {});
+                    const durationMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt));
                     if (typeof res?.ssl_port === "number") setSslPort(res.ssl_port);
-                    showGlobalNotification("success", res?.message || `Local SSL enabled for ${site.domain}`);
+                    showGlobalNotification(
+                      "success",
+                      res?.message || `Local SSL enabled for ${site.domain}`,
+                      "Local SSL Issued",
+                      `Domain:   ${site.domain}\nHTTPS:    ${res?.ssl_port ? `Port ${res.ssl_port}` : "Active"}\nElapsed:  ${durationMs}ms`,
+                      {
+                        category: "ssl",
+                        target: site.domain,
+                        endpoint: `/sites/${id}/ssl/provision`,
+                        method: "POST",
+                        statusCode: 200,
+                        durationMs,
+                      }
+                    );
                   } catch (err) {
-                    showGlobalNotification("error", err instanceof Error ? err.message : "Failed to enable local SSL");
+                    const info = buildAlertDetails(err, {
+                      context: `Provision Local SSL for ${site.domain}`,
+                      fallback: "Failed to enable local SSL",
+                      category: "ssl",
+                      target: site.domain,
+                    });
+                    showGlobalNotification("error", info.message, "Local SSL Failed", info.details, info.meta);
                   } finally {
                     setProvisioningLocalSsl(false);
                   }
@@ -1933,13 +2011,14 @@ export default function SiteDetail() {
       )}
 
       {/* Resource Limits */}
-      {!desktop && site.status === "active" && (
+      {site.status === "active" && (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
           <div className="px-5 py-4 border-b border-dark-600">
             <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Resource Limits</h2>
           </div>
           <div className="p-5 space-y-4">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              {!desktop && (
               <div>
                 <label className="block text-xs font-medium text-dark-200 mb-1">Rate Limit (req/s per IP)</label>
                 <input
@@ -1952,6 +2031,7 @@ export default function SiteDetail() {
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                 />
               </div>
+              )}
               <div>
                 <label className="block text-xs font-medium text-dark-200 mb-1">Max Upload (MB)</label>
                 <input
@@ -1963,6 +2043,7 @@ export default function SiteDetail() {
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                 />
               </div>
+              {!desktop && (
               <div>
                 <label className="block text-xs font-medium text-dark-200 mb-1">Bandwidth Quota (MB/mo)</label>
                 <input
@@ -1974,6 +2055,7 @@ export default function SiteDetail() {
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                 />
               </div>
+              )}
               {site.runtime === "php" && (
                 <>
                   <div>
@@ -1994,7 +2076,7 @@ export default function SiteDetail() {
                       value={phpWorkers}
                       onChange={(e) => setPhpWorkers(e.target.value)}
                       min="1"
-                      max="100"
+                      max={desktop ? 8 : 100}
                       className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                     />
                   </div>
@@ -2002,6 +2084,7 @@ export default function SiteDetail() {
               )}
             </div>
             {/* Custom Nginx Directives */}
+            {!desktop && (
             <div>
               <label className="block text-xs font-medium text-dark-200 mb-1">
                 Custom Nginx Directives <span className="text-dark-300 font-normal">(injected into server block)</span>
@@ -2018,8 +2101,9 @@ export default function SiteDetail() {
                 Config is validated before applying. Invalid directives will be rejected.
               </p>
             </div>
+            )}
 
-            {bandwidthUsage && (
+            {!desktop && bandwidthUsage && (
               <div>
                 <div className="flex items-center justify-between text-xs text-dark-300 mb-1">
                   <span>
@@ -2052,9 +2136,10 @@ export default function SiteDetail() {
 
             <div className="flex items-center justify-between">
               <p className="text-xs text-dark-300">
-                {rateLimit ? `${rateLimit} req/s per IP` : "No rate limit"} · {maxUpload} MB uploads
+                {!desktop ? `${rateLimit ? `${rateLimit} req/s per IP` : "No rate limit"} · ` : ""}
+                {maxUpload} MB uploads
                 {site.runtime === "php" ? ` · ${phpMemory} MB memory · ${phpWorkers} workers` : ""}
-                {bandwidthQuota ? ` · ${bandwidthQuota} MB/mo bandwidth` : " · Unlimited bandwidth"}
+                {!desktop ? (bandwidthQuota ? ` · ${bandwidthQuota} MB/mo bandwidth` : " · Unlimited bandwidth") : ""}
               </p>
               <div className="flex items-center gap-3">
                 {limitsMessage && (
@@ -2072,7 +2157,7 @@ export default function SiteDetail() {
                         rate_limit: rateLimit ? parseInt(rateLimit) : null,
                         max_upload_mb: parseInt(maxUpload) || 64,
                         php_memory_mb: parseInt(phpMemory) || 256,
-                        php_max_workers: parseInt(phpWorkers) || 5,
+                        php_max_workers: parseInt(phpWorkers) || (desktop ? 4 : 5),
                         custom_nginx: customNginx || null,
                         bandwidth_quota_mb: bandwidthQuota ? parseInt(bandwidthQuota) : null,
                       });
@@ -3380,12 +3465,41 @@ export default function SiteDetail() {
               <div className="mb-4">
                 <h4 className="text-xs text-dark-300 uppercase font-mono mb-2">Installed ({phpExts.installed.length})</h4>
                 <div className="flex flex-wrap gap-1.5">
-                  {phpExts.installed.map(ext => (
-                    <span key={ext} className="px-2 py-0.5 bg-rust-500/10 text-rust-400 rounded text-xs font-mono">{ext}</span>
-                  ))}
+                  {phpExts.installed.map(ext => {
+                    const isCoreBuiltin = [
+                      "core", "standard", "pcre", "spl", "reflection", "date",
+                      "json", "hash", "filter", "ctype", "tokenizer", "session", "random",
+                    ].includes(ext.toLowerCase());
+                    return (
+                      <span key={ext} className="inline-flex items-center gap-1 px-2 py-0.5 bg-rust-500/10 text-rust-400 rounded text-xs font-mono">
+                        {ext}
+                        {desktop && !isCoreBuiltin && (
+                          <button
+                            type="button"
+                            title={`Disable ${ext}`}
+                            disabled={installingExt === ext}
+                            onClick={async () => {
+                              setInstallingExt(ext);
+                              setExtMessage("");
+                              try {
+                                await api.post("/php/extensions/disable", { version: site?.php_version, extension: ext });
+                                loadPhpExtensions();
+                              } catch (e) {
+                                setExtMessage(e instanceof Error ? e.message : `Could not disable ${ext}`);
+                              } finally {
+                                setInstallingExt(null);
+                              }
+                            }}
+                            className="text-rust-300/70 hover:text-danger-400 ml-0.5 disabled:opacity-50"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </span>
+                    );
+                  })}
                 </div>
               </div>
-              {!desktop && (
               <div>
                 <h4 className="text-xs text-dark-300 uppercase font-mono mb-2">Available to install</h4>
                 <div className="flex flex-wrap gap-1.5">
@@ -3410,7 +3524,6 @@ export default function SiteDetail() {
                 </div>
                 {extMessage && <p className="text-xs text-danger-400 mt-2">{extMessage}</p>}
               </div>
-              )}
             </div>
           )}
         </div>
@@ -3442,10 +3555,21 @@ export default function SiteDetail() {
                 setSavingEnv(true);
                 setEnvMsg("");
                 try {
-                  await api.put(`/sites/${id}/env`, { vars: envVars.filter(v => v.key) });
+                  const cleanVars = envVars.filter(v => v.key);
+                  await api.put(`/sites/${id}/env`, { vars: cleanVars });
                   setEnvMsg("Environment variables saved");
-                  showGlobalNotification("success", "Environment variables saved");
-                } catch (e) { setEnvMsg(e instanceof Error ? e.message : "Save failed"); }
+                  showGlobalNotification(
+                    "success",
+                    `Saved ${cleanVars.length} environment variable${cleanVars.length === 1 ? "" : "s"} for ${site?.domain || id}`,
+                    "Environment Updated",
+                    `File:      .env\nVariables: ${cleanVars.length}\nSite:      ${site?.domain || id}`,
+                    { category: "env", target: site?.domain, endpoint: `/sites/${id}/env`, method: "PUT", statusCode: 200 }
+                  );
+                } catch (e) {
+                  const info = buildAlertDetails(e, { context: `Save .env for ${site?.domain || id}`, fallback: "Save failed", category: "env", target: site?.domain });
+                  setEnvMsg(info.message);
+                  showGlobalNotification("error", info.message, "Environment Save Failed", info.details, info.meta);
+                }
                 finally { setSavingEnv(false); }
               }} className="px-3 py-1 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50">
                 {savingEnv ? "Saving..." : "Save"}

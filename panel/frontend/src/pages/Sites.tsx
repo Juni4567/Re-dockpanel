@@ -17,7 +17,7 @@ import PortConflictModal, {
   buildSiteExternalUrl,
 } from "../components/PortConflictModal";
 import { isDesktopApp, formatDesktopDomain } from "../utils/desktop";
-import { showGlobalNotification } from "../context/NotificationContext";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
 import { useAuth } from "../context/AuthContext";
 
 interface SiteMetrics {
@@ -434,7 +434,13 @@ export default function Sites() {
             },
           ],
         });
-        showGlobalNotification("info", `Uploading & importing database for ${created.domain}...`);
+        showGlobalNotification(
+          "info",
+          `Uploading & importing database for ${created.domain}...`,
+          "Database Import Started",
+          `Site: ${created.domain}\nDump: ${selectedDbFile.name} (${fileSizeLabel})`,
+          { category: "database", target: created.domain }
+        );
 
         let uploadLog = initialUploadMsg;
         let lastLoggedBucket = -1;
@@ -547,7 +553,19 @@ export default function Sites() {
               },
             );
             setError(errMsg);
-            showGlobalNotification("error", errMsg);
+            const info = buildAlertDetails(impErr, {
+              context: `Import ${selectedDbFile.name} for ${created.domain}`,
+              fallback: errMsg,
+              category: "database",
+              target: created.domain,
+            });
+            showGlobalNotification(
+              "error",
+              errMsg,
+              "Database Import Failed",
+              uploadLog ? `${info.details ? `${info.details}\n\n` : ""}── Upload Log ──\n${uploadLog}` : info.details,
+              info.meta
+            );
           }
         })();
       } else {
@@ -1734,7 +1752,13 @@ export default function Sites() {
                 }
               : null
           );
-          showGlobalNotification("success", `Local site router switched to port ${newPort}`);
+          showGlobalNotification(
+            "success",
+            `Local site router switched to port ${newPort}`,
+            "Router Port Updated",
+            `Active HTTP Router: http://127.0.0.1:${newPort}`,
+            { category: "router", target: `port ${newPort}` }
+          );
         }}
       />
       </div>

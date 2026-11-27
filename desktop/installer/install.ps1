@@ -17,7 +17,7 @@ if (-not $isAdmin) {
 $ErrorActionPreference = "Stop"
 
 $AppName = "DockPanel Desktop"
-$AppVersion = "2.253.0"
+$AppVersion = "2.254.0"
 $InstallDir = "$env:ProgramFiles\DockPanel Desktop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $RootDir = Split-Path -Parent (Split-Path -Parent $ScriptDir)

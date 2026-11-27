@@ -175,11 +175,59 @@ export function useLayoutState(): LayoutState {
   // SSE connection for real-time notification delivery
   useEffect(() => {
     const es = new EventSource("/api/notifications/stream");
-    es.onmessage = () => {
+    es.onmessage = (event) => {
       // Refresh unread count on any new notification
       api.get<{ count: number }>("/notifications/unread-count")
         .then((d) => setNotifCount(d.count))
         .catch(() => {});
+
+      if (!event?.data || event.data === "keepalive") return;
+      try {
+        const payload = JSON.parse(event.data) as {
+          id?: string;
+          title?: string;
+          message?: string;
+          severity?: string;
+          category?: string;
+          action?: string;
+          target_type?: string;
+          target_name?: string;
+          details?: string;
+          created_at?: string;
+        };
+        if (!payload.message && !payload.title) return;
+        const sev = (payload.severity || "info").toLowerCase();
+        const type =
+          sev === "critical" || sev === "error" || sev === "danger"
+            ? "error"
+            : sev === "warning" || sev === "warn"
+            ? "warn"
+            : sev === "success" || sev === "ok"
+            ? "success"
+            : "info";
+
+        window.dispatchEvent(
+          new CustomEvent("dp:global-notify", {
+            detail: {
+              type,
+              message: payload.message || payload.title || "Notification received",
+              title: payload.title || undefined,
+              details: payload.details || undefined,
+              meta: {
+                source: "live-sse",
+                live: true,
+                category: payload.category || payload.target_type || undefined,
+                target: payload.target_name || undefined,
+                code: payload.action || undefined,
+                timestamp: payload.created_at || new Date().toISOString(),
+                dedupeKey: payload.id || undefined,
+              },
+            },
+          })
+        );
+      } catch {
+        // Ignore malformed/non-JSON SSE frames
+      }
     };
     es.onerror = () => {
       // Browser auto-reconnects EventSource on error

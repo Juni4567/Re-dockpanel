@@ -2626,6 +2626,428 @@ echo json_encode(['ok' => true, 'output' => 'Supported local WP-CLI commands: co
     Ok(format!("Executed locally for {}: {}", domain, command))
 }
 
+fn wp_version_lt(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Option<Vec<u64>> {
+        s.trim()
+            .split('.')
+            .map(|p| p.parse::<u64>().ok())
+            .collect()
+    };
+    let (va, vb) = match (parse(a), parse(b)) {
+        (Some(va), Some(vb)) => (va, vb),
+        _ => return true,
+    };
+    for i in 0..va.len().max(vb.len()) {
+        let x = va.get(i).copied().unwrap_or(0);
+        let y = vb.get(i).copied().unwrap_or(0);
+        if x < y {
+            return true;
+        }
+        if x > y {
+            return false;
+        }
+    }
+    false
+}
+
+fn check_known_plugin_vulns(slug: &str, version: &str) -> Vec<serde_json::Value> {
+    const KNOWN: &[(&str, &str, &str, &str, &str)] = &[
+        ("elementor", "3.18.1", "Elementor < 3.18.1 - Authenticated XSS", "high", "XSS"),
+        ("wpforms-lite", "1.8.5.3", "WPForms < 1.8.5.3 - Stored XSS", "medium", "XSS"),
+        ("contact-form-7", "5.8.4", "CF7 < 5.8.4 - Open Redirect", "medium", "Redirect"),
+        ("all-in-one-seo-pack", "4.5.3", "AIOSEO < 4.5.3 - SQL Injection", "critical", "SQLi"),
+        ("wordfence", "7.10.7", "Wordfence < 7.10.7 - Auth Bypass", "high", "Auth Bypass"),
+        ("yoast-seo", "21.7", "Yoast SEO < 21.7 - Stored XSS", "medium", "XSS"),
+        ("really-simple-ssl", "7.2.2", "Really Simple SSL < 7.2.2 - Auth Bypass", "critical", "Auth Bypass"),
+        ("updraftplus", "1.23.12", "UpdraftPlus < 1.23.12 - Path Traversal", "high", "Path Traversal"),
+        ("woocommerce", "8.2.1", "WooCommerce < 8.2.1 - Stored XSS", "medium", "XSS"),
+        ("litespeed-cache", "5.7.0.1", "LiteSpeed Cache < 5.7.0.1 - XSS", "high", "XSS"),
+        ("jetpack", "12.9", "Jetpack < 12.9 - XXE Injection", "high", "XXE"),
+        ("wp-mail-smtp", "3.10.1", "WP Mail SMTP < 3.10.1 - Info Leak", "medium", "Information Disclosure"),
+        ("duplicator", "1.5.7.1", "Duplicator < 1.5.7.1 - SQL Injection", "critical", "SQLi"),
+        ("backwpup", "4.0.2", "BackWPup < 4.0.2 - SSRF", "high", "SSRF"),
+    ];
+
+    let mut out = Vec::new();
+    for &(s, fixed, title, severity, vtype) in KNOWN {
+        if slug == s && wp_version_lt(version, fixed) {
+            out.push(json!({
+                "title": title,
+                "severity": severity,
+                "fixed_in": fixed,
+                "vuln_type": vtype,
+            }));
+        }
+    }
+    out
+}
+
+pub fn scan_wp_vulnerabilities(site_dir: &Path, domain: &str) -> Result<serde_json::Value, String> {
+    if !is_wp_installed(site_dir) {
+        return Err("WordPress is not installed on this site".to_string());
+    }
+    let plugins = list_plugins(site_dir, domain);
+    let mut plugin_vulns = Vec::new();
+    let mut total_vulns = 0usize;
+    let mut critical_count = 0usize;
+    let mut high_count = 0usize;
+
+    for p in plugins {
+        let raw_name = p["name"].as_str().unwrap_or("");
+        let slug = raw_name
+            .split('/')
+            .next()
+            .unwrap_or(raw_name)
+            .trim_end_matches(".php")
+            .to_string();
+        let name = p["title"].as_str().unwrap_or(&slug).to_string();
+        let version = p["version"].as_str().unwrap_or("0.0.0").to_string();
+        let outdated = p["update"].as_str() == Some("available");
+        let latest = p
+            .get("latest_version")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let vulns = check_known_plugin_vulns(&slug, &version);
+        total_vulns += vulns.len();
+        for v in &vulns {
+            match v["severity"].as_str().unwrap_or("") {
+                "critical" => critical_count += 1,
+                "high" => high_count += 1,
+                _ => {}
+            }
+        }
+        if outdated || !vulns.is_empty() {
+            plugin_vulns.push(json!({
+                "slug": slug,
+                "name": name,
+                "installed_version": version,
+                "latest_version": latest,
+                "outdated": outdated,
+                "vulnerabilities": vulns,
+            }));
+        }
+    }
+
+    let scanned_at = chrono::Utc::now().to_rfc3339();
+    write_wp_meta(site_dir, |m| {
+        m["vuln_count"] = json!(total_vulns);
+        m["critical_vulns"] = json!(critical_count);
+        m["last_vuln_scan"] = json!(scanned_at);
+    });
+
+    Ok(json!({
+        "domain": domain,
+        "plugin_vulns": plugin_vulns,
+        "total_vulns": total_vulns,
+        "critical_count": critical_count,
+        "high_count": high_count,
+        "scanned_at": scanned_at,
+    }))
+}
+
+pub fn get_cached_vuln_counts(site_dir: &Path) -> (usize, usize) {
+    let meta = read_wp_meta(site_dir);
+    let vulns = meta["vuln_count"].as_u64().unwrap_or(0) as usize;
+    let critical = meta["critical_vulns"].as_u64().unwrap_or(0) as usize;
+    (vulns, critical)
+}
+
+pub fn check_wp_security(site_dir: &Path) -> Result<serde_json::Value, String> {
+    if !is_wp_installed(site_dir) {
+        return Err("WordPress is not installed on this site".to_string());
+    }
+    let cfg = fs::read_to_string(site_dir.join("wp-config.php")).unwrap_or_default();
+
+    let file_edit_disabled = read_wp_config_bool(&cfg, "DISALLOW_FILE_EDIT") == Some(true);
+    let debug_disabled = read_wp_config_bool(&cfg, "WP_DEBUG") != Some(true);
+    let prefix = parse_wp_table_prefix(&cfg).unwrap_or_else(|| "wp_".to_string());
+    let custom_prefix = prefix != "wp_";
+    let uploads_blocked = fs::read_to_string(site_dir.join("wp-content").join("uploads").join(".htaccess"))
+        .map(|c| c.contains("deny from all") || c.contains("php_flag engine off"))
+        .unwrap_or(false);
+    let force_ssl_admin = read_wp_config_bool(&cfg, "FORCE_SSL_ADMIN") == Some(true);
+    let auto_update = match read_wp_config_bool(&cfg, "WP_AUTO_UPDATE_CORE") {
+        Some(true) => "pass",
+        Some(false) => "fail",
+        None => match read_wp_config_string(&cfg, "WP_AUTO_UPDATE_CORE").as_deref() {
+            Some("minor" | "beta" | "rc") => "pass",
+            Some(_) => "fail",
+            None => "warning",
+        },
+    };
+    let wp_config_readonly = fs::metadata(site_dir.join("wp-config.php"))
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false);
+
+    let checks = vec![
+        json!({
+            "name": "disable-file-editing",
+            "label": "File Editing Disabled",
+            "description": "DISALLOW_FILE_EDIT prevents editing plugin/theme files from WP admin",
+            "status": if file_edit_disabled { "pass" } else { "fail" },
+            "auto_fixable": true,
+            "severity": "high",
+        }),
+        json!({
+            "name": "debug-disabled",
+            "label": "Debug Mode Disabled",
+            "description": "WP_DEBUG should be false when hardening for production parity",
+            "status": if debug_disabled { "pass" } else { "fail" },
+            "auto_fixable": true,
+            "severity": "medium",
+        }),
+        json!({
+            "name": "db-prefix",
+            "label": "Non-default DB Prefix",
+            "description": "Using 'wp_' prefix makes the site easier to target with SQL injection",
+            "status": if custom_prefix { "pass" } else { "warning" },
+            "auto_fixable": false,
+            "severity": "low",
+        }),
+        json!({
+            "name": "block-php-uploads",
+            "label": "PHP Blocked in Uploads",
+            "description": "Prevents execution of uploaded PHP files in wp-content/uploads/",
+            "status": if uploads_blocked { "pass" } else { "fail" },
+            "auto_fixable": true,
+            "severity": "high",
+        }),
+        json!({
+            "name": "force-ssl",
+            "label": "Force SSL Admin",
+            "description": "FORCE_SSL_ADMIN ensures admin area always uses HTTPS",
+            "status": if force_ssl_admin { "pass" } else { "fail" },
+            "auto_fixable": true,
+            "severity": "medium",
+        }),
+        json!({
+            "name": "auto-updates",
+            "label": "Core Auto-Updates",
+            "description": "WP_AUTO_UPDATE_CORE enables automatic security updates",
+            "status": auto_update,
+            "auto_fixable": true,
+            "severity": "medium",
+        }),
+        json!({
+            "name": "wp-config-perms",
+            "label": "wp-config.php Read-Only Guard",
+            "description": "Marks wp-config.php read-only to protect against accidental writes",
+            "status": if wp_config_readonly { "pass" } else { "warning" },
+            "auto_fixable": true,
+            "severity": "low",
+        }),
+    ];
+
+    let passed = checks.iter().filter(|c| c["status"] == "pass").count();
+    let score = ((passed * 100) / checks.len().max(1)) as u64;
+    Ok(json!({
+        "score": score,
+        "checks": checks,
+    }))
+}
+
+pub fn get_hardening_history(site_dir: &Path) -> Vec<serde_json::Value> {
+    let meta = read_wp_meta(site_dir);
+    meta.get("hardening_history")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn apply_wp_hardening(
+    state: &crate::state::AppState,
+    site_dir: &Path,
+    domain: &str,
+    fixes: &[String],
+) -> Result<Vec<serde_json::Value>, String> {
+    if !is_wp_installed(site_dir) {
+        return Err("WordPress is not installed on this site".to_string());
+    }
+    let mut targets: Vec<String> = if fixes.is_empty() {
+        vec!["disable-file-editing".to_string()]
+    } else {
+        fixes.to_vec()
+    };
+    targets.sort_by_key(|f| if f == "wp-config-perms" { 1 } else { 0 });
+
+    let cfg_path = site_dir.join("wp-config.php");
+    if let Ok(meta) = fs::metadata(&cfg_path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() && targets.iter().any(|f| f != "wp-config-perms") {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&cfg_path, perms);
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut results = Vec::new();
+    let mut history_rows = Vec::new();
+
+    for fix in targets {
+        let res = match fix.as_str() {
+            "disable-file-editing" => {
+                match toggle_feature(state, site_dir, domain, "file_editing", false, None) {
+                    Ok(_) => (true, "Disabled in-dashboard file editing (DISALLOW_FILE_EDIT)".to_string()),
+                    Err(e) => (false, e),
+                }
+            }
+            "debug-disabled" => {
+                match toggle_feature(state, site_dir, domain, "debug", false, None) {
+                    Ok(_) => (true, "Disabled WP_DEBUG".to_string()),
+                    Err(e) => (false, e),
+                }
+            }
+            "block-php-uploads" => {
+                let uploads = site_dir.join("wp-content").join("uploads");
+                let htaccess = uploads.join(".htaccess");
+                let content = "<Files *.php>\ndeny from all\n</Files>\nphp_flag engine off\n";
+                match fs::create_dir_all(&uploads).and_then(|_| fs::write(&htaccess, content)) {
+                    Ok(_) => (true, "Blocked PHP execution in wp-content/uploads".to_string()),
+                    Err(e) => (false, e.to_string()),
+                }
+            }
+            "force-ssl" => {
+                let content = fs::read_to_string(&cfg_path).unwrap_or_default();
+                let updated = upsert_wp_config_constant(&content, "FORCE_SSL_ADMIN", "true");
+                match fs::write(&cfg_path, updated) {
+                    Ok(_) => (true, "Enabled FORCE_SSL_ADMIN".to_string()),
+                    Err(e) => (false, e.to_string()),
+                }
+            }
+            "auto-updates" => {
+                let content = fs::read_to_string(&cfg_path).unwrap_or_default();
+                let updated = upsert_wp_config_constant(&content, "WP_AUTO_UPDATE_CORE", "'minor'");
+                match fs::write(&cfg_path, updated) {
+                    Ok(_) => (true, "Enabled minor core auto-updates".to_string()),
+                    Err(e) => (false, e.to_string()),
+                }
+            }
+            "wp-config-perms" => match fs::metadata(&cfg_path) {
+                Ok(meta) => {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(true);
+                    match fs::set_permissions(&cfg_path, perms) {
+                        Ok(_) => (true, "Set wp-config.php read-only".to_string()),
+                        Err(e) => (false, e.to_string()),
+                    }
+                }
+                Err(e) => (false, e.to_string()),
+            },
+            other => (false, format!("Unknown hardening check: {}", other)),
+        };
+
+        results.push(json!({
+            "name": fix,
+            "applied": res.0,
+            "message": res.1,
+        }));
+        history_rows.push(json!({
+            "check_name": fix,
+            "status": if res.0 { "pass" } else { "fail" },
+            "details": res.1,
+            "checked_at": now,
+        }));
+    }
+
+    write_wp_meta(site_dir, |m| {
+        let mut existing = m
+            .get("hardening_history")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for r in history_rows {
+            existing.insert(0, r);
+        }
+        existing.truncate(50);
+        m["hardening_history"] = json!(existing);
+    });
+
+    Ok(results)
+}
+
+pub fn update_wp_target(site_dir: &Path, domain: &str, target: &str) -> Result<serde_json::Value, String> {
+    if !is_wp_installed(site_dir) {
+        return Err("WordPress is not installed on this site".to_string());
+    }
+    let clean = target.trim().to_ascii_lowercase();
+    let mut updated_count = 0usize;
+    let mut messages = Vec::new();
+
+    if clean == "core" || clean == "all" {
+        reinstall_core(site_dir)?;
+        updated_count += 1;
+        messages.push("Updated WordPress core".to_string());
+    }
+
+    if clean == "plugins" || clean == "all" {
+        let plugins = list_plugins(site_dir, domain);
+        let mut p_count = 0usize;
+        for p in &plugins {
+            if p["update"].as_str() == Some("available") {
+                if let Some(name) = p["name"].as_str() {
+                    if plugin_or_theme_action(site_dir, domain, "plugin", "update", name).is_ok() {
+                        p_count += 1;
+                    }
+                }
+            }
+        }
+        updated_count += p_count;
+        messages.push(format!("Updated {} plugin(s)", p_count));
+    }
+
+    if clean == "themes" || clean == "all" {
+        let themes = list_themes(site_dir, domain);
+        let mut t_count = 0usize;
+        for t in &themes {
+            if t["update"].as_str() == Some("available") {
+                if let Some(name) = t["name"].as_str() {
+                    if plugin_or_theme_action(site_dir, domain, "theme", "update", name).is_ok() {
+                        t_count += 1;
+                    }
+                }
+            }
+        }
+        updated_count += t_count;
+        messages.push(format!("Updated {} theme(s)", t_count));
+    }
+
+    if !matches!(clean.as_str(), "core" | "plugins" | "themes" | "all") {
+        return Err(format!("Unsupported WordPress update target: {}", target));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "target": clean,
+        "updated": updated_count,
+        "message": messages.join("; "),
+    }))
+}
+
+pub fn smart_update_wp(site_dir: &Path, domain: &str, target: &str) -> Result<serde_json::Value, String> {
+    if !is_wp_installed(site_dir) {
+        return Err("WordPress is not installed on this site".to_string());
+    }
+    let snapshot = crate::backups::create_archive_sync(site_dir, domain)?;
+    let backup_path = crate::backups::site_backups_dir(domain).join(&snapshot.filename);
+    match update_wp_target(site_dir, domain, target) {
+        Ok(res) => {
+            if !is_wp_installed(site_dir) {
+                let _ = crate::backups::restore_archive_sync(site_dir, &backup_path);
+                return Err("Post-update health check failed; rolled back snapshot".to_string());
+            }
+            Ok(json!({
+                "ok": true,
+                "snapshot": snapshot.filename,
+                "updated": res["updated"],
+                "message": format!("Smart Update completed with snapshot {} ({})", snapshot.filename, res["message"].as_str().unwrap_or("ok")),
+            }))
+        }
+        Err(e) => {
+            let _ = crate::backups::restore_archive_sync(site_dir, &backup_path);
+            Err(format!("Update failed and rolled back to {}: {}", snapshot.filename, e))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2780,6 +3202,62 @@ mod tests {
         let replaced = fs::read_to_string(&maint_php).unwrap();
         assert!(replaced.contains("DockPanel Desktop"));
         assert!(!replaced.to_lowercase().contains("plesk"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_wp_security_check_hardening_and_vuln_scan() {
+        let tmp = std::env::temp_dir().join(format!("dockpanel_wp_sec_{}", uuid::Uuid::new_v4()));
+        let site_dir = tmp.join("wpsec.test");
+        let state = crate::state::AppState::new_with_dirs(tmp.join("config"), tmp.join("sites"));
+
+        let req = InstallWpRequest {
+            admin_user: Some("admin".to_string()),
+            admin_pass: Some("pass123456".to_string()),
+            admin_email: Some("admin@wpsec.test".to_string()),
+            title: Some("Sec Test".to_string()),
+            url: Some("http://wpsec.test".to_string()),
+            db_engine: Some("sqlite".to_string()),
+            db_port: None,
+        };
+        install_site_wordpress(&site_dir, "wpsec.test", &req).unwrap();
+
+        let sec_before = check_wp_security(&site_dir).unwrap();
+        let checks = sec_before["checks"].as_array().unwrap();
+        assert!(checks.iter().any(|c| c["name"] == "disable-file-editing" && c["status"] == "fail"));
+
+        let fixes = vec![
+            "disable-file-editing".to_string(),
+            "debug-disabled".to_string(),
+            "block-php-uploads".to_string(),
+            "force-ssl".to_string(),
+            "auto-updates".to_string(),
+        ];
+        let applied = apply_wp_hardening(&state, &site_dir, "wpsec.test", &fixes).unwrap();
+        assert_eq!(applied.len(), 5);
+        assert!(applied.iter().all(|r| r["applied"] == true));
+
+        let sec_after = check_wp_security(&site_dir).unwrap();
+        let checks_after = sec_after["checks"].as_array().unwrap();
+        assert!(checks_after.iter().any(|c| c["name"] == "disable-file-editing" && c["status"] == "pass"));
+        assert!(checks_after.iter().any(|c| c["name"] == "block-php-uploads" && c["status"] == "pass"));
+        assert!(checks_after.iter().any(|c| c["name"] == "force-ssl" && c["status"] == "pass"));
+        assert!(!get_hardening_history(&site_dir).is_empty());
+
+        // Seed a vulnerable plugin (elementor 3.18.0 < 3.18.1) and scan
+        let elem_dir = site_dir.join("wp-content").join("plugins").join("elementor");
+        fs::create_dir_all(&elem_dir).unwrap();
+        fs::write(
+            elem_dir.join("elementor.php"),
+            "<?php\n/*\nPlugin Name: Elementor\nVersion: 3.18.0\n*/\n",
+        )
+        .unwrap();
+
+        let scan = scan_wp_vulnerabilities(&site_dir, "wpsec.test").unwrap();
+        assert_eq!(scan["total_vulns"], 1);
+        assert_eq!(scan["high_count"], 1);
+        assert_eq!(get_cached_vuln_counts(&site_dir), (1, 0));
 
         let _ = fs::remove_dir_all(&tmp);
     }

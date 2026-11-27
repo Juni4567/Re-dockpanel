@@ -166,6 +166,16 @@ pub fn ensure_mkcert_ca_ready() -> Result<PathBuf, String> {
 
 /// Generates (or reuses) a trusted TLS certificate + private key for `domain` under `certs_dir/{domain}/`.
 pub fn ensure_site_certificate(certs_dir: &Path, domain: &str) -> Result<(PathBuf, PathBuf), String> {
+    ensure_site_certificate_with_aliases(certs_dir, domain, &[], false)
+}
+
+/// Generates (or reuses) a trusted TLS certificate + private key for `domain` and any `aliases`.
+pub fn ensure_site_certificate_with_aliases(
+    certs_dir: &Path,
+    domain: &str,
+    aliases: &[String],
+    force_regenerate: bool,
+) -> Result<(PathBuf, PathBuf), String> {
     let clean = domain.trim().to_lowercase();
     let site_cert_dir = certs_dir.join(&clean);
     std::fs::create_dir_all(&site_cert_dir)
@@ -173,22 +183,33 @@ pub fn ensure_site_certificate(certs_dir: &Path, domain: &str) -> Result<(PathBu
 
     let cert_path = site_cert_dir.join("cert.pem");
     let key_path = site_cert_dir.join("key.pem");
-    if cert_path.is_file() && key_path.is_file() {
+    if !force_regenerate && cert_path.is_file() && key_path.is_file() {
         return Ok((cert_path, key_path));
     }
 
     let mkcert = ensure_mkcert_ca_ready()?;
+    let cert_str = cert_path.to_string_lossy().to_string();
+    let key_str = key_path.to_string_lossy().to_string();
+    let wildcard = format!("*.{}", clean);
+    let mut args = vec![
+        "-cert-file".to_string(),
+        cert_str,
+        "-key-file".to_string(),
+        key_str,
+        clean.clone(),
+        wildcard,
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ];
+    for alias in aliases {
+        let a = alias.trim().to_lowercase();
+        if !a.is_empty() && !args.iter().any(|x| x == &a) {
+            args.push(a);
+        }
+    }
+
     let mut cmd = std::process::Command::new(&mkcert);
-    cmd.args([
-        "-cert-file",
-        &cert_path.to_string_lossy(),
-        "-key-file",
-        &key_path.to_string_lossy(),
-        &clean,
-        &format!("*.{}", clean),
-        "localhost",
-        "127.0.0.1",
-    ]);
+    cmd.args(&args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

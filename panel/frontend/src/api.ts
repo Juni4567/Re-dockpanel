@@ -32,16 +32,28 @@ export class ApiError extends Error {
   /// the status alone cannot say what happened.
   code?: string;
   body?: Record<string, unknown>;
+  method?: string;
+  endpoint?: string;
+  durationMs?: number;
+  timestamp?: string;
   constructor(
     status: number,
     message: string,
     code?: string,
-    body?: Record<string, unknown>
+    body?: Record<string, unknown>,
+    method?: string,
+    endpoint?: string,
+    durationMs?: number,
+    timestamp?: string
   ) {
     super(message);
     this.status = status;
     this.code = code;
     this.body = body;
+    this.method = method;
+    this.endpoint = endpoint;
+    this.durationMs = durationMs;
+    this.timestamp = timestamp;
   }
 }
 
@@ -49,6 +61,8 @@ async function request<T = unknown>(
   path: string,
   options?: RequestInit
 ): Promise<T> {
+  const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const method = (options?.method || "GET").toUpperCase();
   const headers: Record<string, string> = {
     "X-Requested-With": "DockPanel",
   };
@@ -64,6 +78,11 @@ async function request<T = unknown>(
     headers: { ...headers, ...(options?.headers as Record<string, string>) },
   });
 
+  const durationMs = Math.max(
+    1,
+    Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt)
+  );
+  const timestamp = new Date().toISOString();
   const data = await res.json().catch(() => ({}));
 
   if (res.status === 401) {
@@ -92,7 +111,11 @@ async function request<T = unknown>(
       401,
       (data as { error?: string }).error || "Unauthorized",
       (data as { code?: string }).code,
-      data as Record<string, unknown>
+      data as Record<string, unknown>,
+      method,
+      path,
+      durationMs,
+      timestamp
     );
   }
 
@@ -118,7 +141,11 @@ async function request<T = unknown>(
       res.status,
       message,
       (data as { code?: string }).code,
-      data as Record<string, unknown>
+      data as Record<string, unknown>,
+      method,
+      path,
+      durationMs,
+      timestamp
     );
   }
 
@@ -131,6 +158,7 @@ function uploadWithProgress<T = unknown>(
   onProgress?: (loaded: number, total: number) => void
 ): Promise<T> {
   return new Promise((resolve, reject) => {
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `${BASE}${path}`, true);
     xhr.setRequestHeader("Content-Type", "application/json");
@@ -150,6 +178,11 @@ function uploadWithProgress<T = unknown>(
     }
 
     xhr.onload = () => {
+      const durationMs = Math.max(
+        1,
+        Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt)
+      );
+      const timestamp = new Date().toISOString();
       let data: any = {};
       try {
         data = JSON.parse(xhr.responseText);
@@ -167,7 +200,11 @@ function uploadWithProgress<T = unknown>(
             401,
             data.error || "Unauthorized",
             data.code,
-            data
+            data,
+            "POST",
+            path,
+            durationMs,
+            timestamp
           )
         );
         return;
@@ -183,16 +220,24 @@ function uploadWithProgress<T = unknown>(
         if (data.code === "agent_unreachable") {
           message = "Agent offline — the DockPanel agent is not responding.";
         }
-        reject(new ApiError(xhr.status, message, data.code, data));
+        reject(new ApiError(xhr.status, message, data.code, data, "POST", path, durationMs, timestamp));
       }
     };
 
     xhr.onerror = () => {
-      reject(new ApiError(0, "Network error during upload"));
+      const durationMs = Math.max(
+        1,
+        Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt)
+      );
+      reject(new ApiError(0, "Network error during upload", undefined, undefined, "POST", path, durationMs, new Date().toISOString()));
     };
 
     xhr.ontimeout = () => {
-      reject(new ApiError(408, "Upload timed out"));
+      const durationMs = Math.max(
+        1,
+        Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt)
+      );
+      reject(new ApiError(408, "Upload timed out", undefined, undefined, "POST", path, durationMs, new Date().toISOString()));
     };
 
     xhr.send(JSON.stringify(body));

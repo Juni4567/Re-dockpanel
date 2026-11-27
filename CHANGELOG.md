@@ -4,6 +4,29 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.254.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.254.0 — Real-Time Dynamic Alerts, Tray/Auto-Updater, WP Security Parity, Live Telemetry & Full Local Router/PHP Controls
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.254.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Real-Time Dynamic Alert Stack & Live SSE Integration (`NotificationContext.tsx`, `useLayoutState.ts`, `api.ts`, `state.rs`):**
+  - Replaced the single static top banner with a floating real-time alert HUD stack supporting up to 4 concurrent alerts, slide-in animations, live relative timestamps (`just now`, `Ns ago`), countdown progress bars (auto-pausing on hover, sticky for errors or pinned/expanded alerts), and one-click `Dismiss All`.
+  - Connected `/api/notifications/stream` SSE payloads directly to `GlobalNotificationBanner` with `Live`/`Verified` badges and smart 3.5s target deduplication so backend events enrich matching in-flight action alerts instead of double-popping.
+  - Enhanced `ApiError` (`method`, `endpoint`, `durationMs`, `timestamp`) and added `buildAlertDetails()` so failures and operations across `DesktopSiteActions`, `SiteDetail`, `Sites`, and `Dashboard` surface HTTP status codes, elapsed timing (`ms`), targets, expandable diagnostics, and one-click `Copy Log`.
+- **Desktop PHP Worker Pool, Resource Limits, Extensions, & `.env` Runtime Injection (`state.rs`, `main.rs`, `SiteDetail.tsx`):**
+  - Added multi-worker PHP-CGI pool (`1..=8` `php -S` workers per site with atomic round-robin routing) enforcing `memory_limit`, `upload_max_filesize`, `post_max_size`, and `.env` environment variables with automatic worker restarts.
+  - Implemented real Windows `ext/php_*.dll` extension scanning and `php.ini` toggle handlers (`/api/php/extensions/{version}`, `/install`, `/disable`) and ungated Resource Limits & PHP Extensions in `SiteDetail.tsx`.
+- **WebSockets, Streaming Proxy, Aliases, SAN SSL, & Redirect Rules (`router.rs`, `ssl.rs`, `state.rs`, `main.rs`):**
+  - Added `101 Switching Protocols` bidirectional WebSocket tunneling and true unbuffered streaming request/response proxying.
+  - Added site domain aliases (auto-updating Windows `hosts`, `mkcert` SAN certificates, and `DynamicCertResolver`), wildcard/exact 301/302 redirect matching, and password protection handlers.
+- **WordPress Vulnerability/Hardening Parity & Live Windows Telemetry (`wordpress.rs`, `main.rs`, `Dashboard.tsx`):**
+  - Implemented real CVE vulnerability scanning, 7-point WP security audit & hardening with rollback-safe ZIP smart updates, and bulk WP updates.
+  - Wired Win32 `GetSystemTimes` CPU %, `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` processes, `GetIfTable` network adapter stats, 10s metrics history sampler, and per-site traffic/bandwidth tracking.
+- **Native Windows System Tray, Background Mode, & In-App Auto-Updater (`tray.rs`, `updater.rs`, `Settings.tsx`, `Dashboard.tsx`):**
+  - Added native `Shell_NotifyIconW` system tray (`Show DockPanel Desktop`, `Open Sites Folder`, `Quit DockPanel Desktop`), minimize-to-tray preserving active site runtimes, and `launch_at_startup` HKCU Run integration.
+  - Added 15-minute cached GitHub Releases update checker (`/api/telemetry/update-status`) and SHA-256 verified installer download/launch (`/api/desktop/update/install`).
+
 ## [2.253.0] - 2026-11-27
 
 ### Release: DockPanel Desktop v2.253.0 — Production Build & Installer Release

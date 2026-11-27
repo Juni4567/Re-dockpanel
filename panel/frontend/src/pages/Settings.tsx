@@ -201,6 +201,17 @@ export default function Settings() {
     display_name?: string | null;
   } | null>(null);
   const [clearingCache, setClearingCache] = useState(false);
+  const [minimizeToTray, setMinimizeToTray] = useState(true);
+  const [launchAtStartup, setLaunchAtStartup] = useState(false);
+  const [desktopUpdateInfo, setDesktopUpdateInfo] = useState<{
+    current_version?: string;
+    update_available?: boolean;
+    update_available_version?: string | null;
+    update_release_url?: string;
+    check_error?: string;
+  } | null>(null);
+  const [checkingDesktopUpdate, setCheckingDesktopUpdate] = useState(false);
+  const [installingDesktopUpdate, setInstallingDesktopUpdate] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState<string | null>(null);
   const [health, setHealth] = useState<HealthStatus | null>(null);
@@ -326,8 +337,11 @@ export default function Settings() {
       if (data.default_php_version) setDefaultPhp(data.default_php_version);
       if (data.default_sites_dir) setDefaultSitesDir(data.default_sites_dir);
       if (desktop) {
+        setMinimizeToTray(data.minimize_to_tray !== "false");
+        setLaunchAtStartup(data.launch_at_startup === "true");
         api.get<typeof desktopSvcStatus>("/services/install-status").then(setDesktopSvcStatus).catch(() => {});
         api.get<typeof desktopPortInfo>("/system/ports/conflict").then(setDesktopPortInfo).catch(() => {});
+        api.get<typeof desktopUpdateInfo>("/telemetry/update-status").then(setDesktopUpdateInfo).catch(() => {});
       }
       setPanelName(data.panel_name || "");
       setBaseUrl(data.base_url || "");
@@ -2727,6 +2741,127 @@ export default function Settings() {
                   }
                 }}
               />
+            </div>
+          </div>
+
+          <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden">
+            <div className="px-5 py-3 border-b border-dark-600 flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Background Mode & App Updates</h3>
+                <p className="text-xs text-dark-200 mt-0.5">System tray behavior, Windows startup, and release updates</p>
+              </div>
+              <span className="text-xs font-mono text-dark-300">
+                v{desktopUpdateInfo?.current_version || "2.253.0"}
+              </span>
+            </div>
+            <div className="p-5 space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label className="border border-dark-500 bg-dark-900/50 p-4 rounded-lg flex items-center justify-between gap-3 cursor-pointer">
+                  <div>
+                    <div className="text-sm font-medium text-dark-50">Minimize to System Tray</div>
+                    <p className="text-[11px] text-dark-300 mt-0.5">Keep local sites, MariaDB, and Mail Catcher running when window is closed</p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={minimizeToTray}
+                    onChange={async (e) => {
+                      const next = e.target.checked;
+                      setMinimizeToTray(next);
+                      try {
+                        await api.put("/settings", { minimize_to_tray: next ? "true" : "false" });
+                        setMessage({ text: next ? "Minimize to system tray enabled" : "Closing window will quit DockPanel Desktop", type: "success" });
+                      } catch (err) {
+                        setMinimizeToTray(!next);
+                        setMessage({ text: err instanceof Error ? err.message : "Failed saving preference", type: "error" });
+                      }
+                    }}
+                    className="h-4 w-4 accent-rust-500"
+                  />
+                </label>
+                <label className="border border-dark-500 bg-dark-900/50 p-4 rounded-lg flex items-center justify-between gap-3 cursor-pointer">
+                  <div>
+                    <div className="text-sm font-medium text-dark-50">Launch at Windows Startup</div>
+                    <p className="text-[11px] text-dark-300 mt-0.5">Automatically start DockPanel Desktop when signing in to Windows</p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={launchAtStartup}
+                    onChange={async (e) => {
+                      const next = e.target.checked;
+                      setLaunchAtStartup(next);
+                      try {
+                        await api.put("/settings", { launch_at_startup: next ? "true" : "false" });
+                        setMessage({ text: next ? "Added DockPanel Desktop to Windows startup" : "Removed from Windows startup", type: "success" });
+                      } catch (err) {
+                        setLaunchAtStartup(!next);
+                        setMessage({ text: err instanceof Error ? err.message : "Failed updating Windows startup", type: "error" });
+                      }
+                    }}
+                    className="h-4 w-4 accent-rust-500"
+                  />
+                </label>
+              </div>
+              <div className="border border-dark-500 bg-dark-900/50 p-4 rounded-lg flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <div className="text-sm font-medium text-dark-50">
+                    {desktopUpdateInfo?.update_available && desktopUpdateInfo.update_available_version
+                      ? `Update Available: v${desktopUpdateInfo.update_available_version}`
+                      : "DockPanel Desktop Updates"}
+                  </div>
+                  <p className="text-[11px] text-dark-300 mt-0.5">
+                    {desktopUpdateInfo?.check_error
+                      ? `Could not reach GitHub Releases (${desktopUpdateInfo.check_error})`
+                      : desktopUpdateInfo?.update_available
+                      ? "SHA-256 verified Windows installer ready to download and launch."
+                      : `Up to date (v${desktopUpdateInfo?.current_version || "2.253.0"})`}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={checkingDesktopUpdate}
+                    onClick={async () => {
+                      setCheckingDesktopUpdate(true);
+                      try {
+                        const info = await api.get<typeof desktopUpdateInfo>("/telemetry/update-status?force=1");
+                        setDesktopUpdateInfo(info);
+                        if (info?.update_available) {
+                          setMessage({ text: `DockPanel Desktop v${info.update_available_version} is available`, type: "success" });
+                        } else if (!info?.check_error) {
+                          setMessage({ text: `You are running the latest version (v${info?.current_version || "2.253.0"})`, type: "success" });
+                        }
+                      } catch (e) {
+                        setMessage({ text: e instanceof Error ? e.message : "Update check failed", type: "error" });
+                      } finally {
+                        setCheckingDesktopUpdate(false);
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-dark-700 hover:bg-dark-600 text-dark-100 rounded-lg text-xs font-medium disabled:opacity-50"
+                  >
+                    {checkingDesktopUpdate ? "Checking..." : "Check for Updates"}
+                  </button>
+                  {desktopUpdateInfo?.update_available && (
+                    <button
+                      type="button"
+                      disabled={installingDesktopUpdate}
+                      onClick={async () => {
+                        setInstallingDesktopUpdate(true);
+                        try {
+                          await api.post("/desktop/update/install", {});
+                          setMessage({ text: "Installer downloaded, verified, and launched.", type: "success" });
+                        } catch (e) {
+                          setMessage({ text: e instanceof Error ? e.message : "Failed installing update", type: "error" });
+                        } finally {
+                          setInstallingDesktopUpdate(false);
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium disabled:opacity-50"
+                    >
+                      {installingDesktopUpdate ? "Downloading..." : "Download & Install"}
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
 

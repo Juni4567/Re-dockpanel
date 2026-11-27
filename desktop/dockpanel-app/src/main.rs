@@ -11,6 +11,8 @@ pub mod mariadb;
 pub mod router;
 pub mod ssl;
 mod state;
+mod tray;
+mod updater;
 pub mod wordpress;
 
 use axum::{
@@ -31,7 +33,7 @@ use std::sync::Arc;
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::{ControlFlow, EventLoopBuilder},
     window::WindowBuilder,
 };
 use tower_http::cors::CorsLayer;
@@ -1249,11 +1251,14 @@ async fn site_app_status_handler(
     let Some(site) = state.get_site(&id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
     };
-    let port = state.get_site_worker_port(&site.domain);
+    let ports = state.get_site_worker_ports(&site.domain);
+    let port = ports.first().copied();
     let alive = {
         let mut procs = state.worker_processes.lock().unwrap();
-        if let Some(child) = procs.get_mut(&site.domain.to_lowercase()) {
-            matches!(child.try_wait(), Ok(None))
+        if let Some(children) = procs.get_mut(&site.domain.to_lowercase()) {
+            children
+                .iter_mut()
+                .any(|child| matches!(child.try_wait(), Ok(None)))
         } else {
             false
         }
@@ -1267,6 +1272,8 @@ async fn site_app_status_handler(
         "active": active,
         "status": if active { "running" } else { "stopped" },
         "port": port,
+        "worker_ports": ports,
+        "worker_count": ports.len(),
         "runtime": site.runtime,
         "app_command": site.app_command,
     }))
@@ -1652,9 +1659,180 @@ async fn php_install_log_handler(
         .keep_alive(KeepAlive::default())
 }
 
+fn php_ext_directive(ext: &str) -> &'static str {
+    if ext.eq_ignore_ascii_case("opcache") || ext.eq_ignore_ascii_case("xdebug") {
+        "zend_extension"
+    } else {
+        "extension"
+    }
+}
+
+fn scan_php_dll_extensions(php_exe: &std::path::Path) -> Vec<String> {
+    let mut exts = Vec::new();
+    if let Some(ext_dir) = php_exe.parent().map(|d| d.join("ext")) {
+        if let Ok(entries) = std::fs::read_dir(ext_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let lower = name.to_ascii_lowercase();
+                if lower.starts_with("php_") && lower.ends_with(".dll") && lower.len() > 8 {
+                    let ext_name = lower[4..lower.len() - 4].to_string();
+                    if !ext_name.is_empty() {
+                        exts.push(ext_name);
+                    }
+                }
+            }
+        }
+    }
+    exts.sort();
+    exts.dedup();
+    exts
+}
+
+fn toggle_php_extension_in_ini_text(ini: &str, ext: &str, enable: bool) -> String {
+    let ext_lower = ext.trim().to_ascii_lowercase();
+    let directive = php_ext_directive(&ext_lower);
+    let dll_name = format!("php_{}.dll", ext_lower);
+    let mut lines: Vec<String> = Vec::new();
+    let mut matched = false;
+    let mut has_ext_dir = false;
+
+    for raw_line in ini.lines() {
+        let trimmed = raw_line.trim();
+        let uncommented = trimmed.trim_start_matches(';').trim();
+
+        if enable && uncommented.eq_ignore_ascii_case("extension_dir = \"ext\"") {
+            lines.push("extension_dir = \"ext\"".to_string());
+            has_ext_dir = true;
+            continue;
+        }
+        if uncommented.to_ascii_lowercase().starts_with("extension_dir")
+            && !trimmed.starts_with(';')
+        {
+            has_ext_dir = true;
+        }
+
+        let is_match = if let Some((lhs, rhs)) = uncommented.split_once('=') {
+            let lhs_clean = lhs.trim().to_ascii_lowercase();
+            let rhs_clean = rhs
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase();
+            (lhs_clean == "extension" || lhs_clean == "zend_extension")
+                && (rhs_clean == ext_lower || rhs_clean == dll_name)
+        } else {
+            false
+        };
+
+        if is_match {
+            matched = true;
+            if enable {
+                lines.push(format!("{}={}", directive, ext_lower));
+            } else {
+                lines.push(format!(";{}={}", directive, ext_lower));
+            }
+        } else {
+            lines.push(raw_line.to_string());
+        }
+    }
+
+    if enable && !matched {
+        if !has_ext_dir {
+            lines.push("extension_dir = \"ext\"".to_string());
+        }
+        lines.push(format!("{}={}", directive, ext_lower));
+    }
+
+    let mut out = lines.join("\r\n");
+    if ini.ends_with('\n') && !out.ends_with('\n') {
+        out.push_str("\r\n");
+    }
+    out
+}
+
+fn set_php_extension_enabled(version: &str, ext: &str, enable: bool) -> Result<String, String> {
+    let clean_ext = ext.trim().to_ascii_lowercase();
+    if clean_ext.is_empty()
+        || clean_ext.len() > 64
+        || !clean_ext
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("Invalid PHP extension name".to_string());
+    }
+
+    const CORE_BUILTINS: &[&str] = &[
+        "core",
+        "standard",
+        "pcre",
+        "spl",
+        "reflection",
+        "date",
+        "json",
+        "hash",
+        "filter",
+        "ctype",
+        "tokenizer",
+        "session",
+        "random",
+    ];
+    if !enable && CORE_BUILTINS.contains(&clean_ext.as_str()) {
+        return Err(format!("'{}' is a built-in PHP core module and cannot be disabled", clean_ext));
+    }
+
+    let exe = state::find_php_binary_exact(version)
+        .ok_or_else(|| format!("PHP {} is not installed", version))?;
+    let php_dir = exe
+        .parent()
+        .ok_or_else(|| "Invalid PHP binary directory".to_string())?;
+    let ini_path = php_dir.join("php.ini");
+
+    if !ini_path.is_file() {
+        let dev_ini = php_dir.join("php.ini-development");
+        let prod_ini = php_dir.join("php.ini-production");
+        if dev_ini.is_file() {
+            std::fs::copy(&dev_ini, &ini_path)
+                .map_err(|e| format!("Failed creating php.ini: {}", e))?;
+        } else if prod_ini.is_file() {
+            std::fs::copy(&prod_ini, &ini_path)
+                .map_err(|e| format!("Failed creating php.ini: {}", e))?;
+        } else {
+            std::fs::write(&ini_path, "extension_dir = \"ext\"\r\n")
+                .map_err(|e| format!("Failed creating php.ini: {}", e))?;
+        }
+    }
+
+    if enable {
+        let dll_path = php_dir.join("ext").join(format!("php_{}.dll", clean_ext));
+        if !dll_path.is_file() {
+            return Err(format!(
+                "Extension DLL '{}' was not found in {}",
+                dll_path.display(),
+                php_dir.join("ext").display()
+            ));
+        }
+    }
+
+    let current = std::fs::read_to_string(&ini_path)
+        .map_err(|e| format!("Failed reading {}: {}", ini_path.display(), e))?;
+    let updated = toggle_php_extension_in_ini_text(&current, &clean_ext, enable);
+    std::fs::write(&ini_path, updated)
+        .map_err(|e| format!("Failed writing {}: {}", ini_path.display(), e))?;
+    Ok(ini_path.to_string_lossy().to_string())
+}
+
 async fn php_extensions_handler(Path(version): Path<String>) -> Json<serde_json::Value> {
     let mut installed = Vec::new();
+    let mut dll_available = Vec::new();
+    let mut ini_path_str = String::new();
     if let Some(exe) = state::find_php_binary_exact(&version) {
+        if let Some(dir) = exe.parent() {
+            ini_path_str = dir.join("php.ini").to_string_lossy().to_string();
+        }
+        dll_available = scan_php_dll_extensions(&exe);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -1668,23 +1846,122 @@ async fn php_extensions_handler(Path(version): Path<String>) -> Json<serde_json:
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
                         let t = line.trim();
                         if !t.is_empty() && !t.starts_with('[') {
-                            installed.push(t.to_lowercase());
+                            let lower = t.to_lowercase();
+                            if !installed.iter().any(|x| x == &lower) {
+                                installed.push(lower);
+                            }
                         }
                     }
                 }
             }
         }
     }
-    let common = ["curl", "fileinfo", "gd", "mbstring", "mysqli", "openssl", "pdo_mysql", "pdo_sqlite", "sqlite3", "zip"];
-    let available: Vec<&str> = common
-        .iter()
-        .copied()
+    let common = [
+        "curl", "exif", "fileinfo", "gd", "intl", "mbstring", "mysqli", "opcache", "openssl",
+        "pdo_mysql", "pdo_sqlite", "soap", "sockets", "sodium", "sqlite3", "xsl", "zip",
+    ];
+    let mut available: Vec<String> = dll_available
+        .into_iter()
         .filter(|ext| !installed.iter().any(|i| i == ext))
         .collect();
+    if available.is_empty() {
+        available = common
+            .iter()
+            .filter(|ext| !installed.iter().any(|i| i == *ext))
+            .map(|s| s.to_string())
+            .collect();
+    }
     Json(serde_json::json!({
         "installed": installed,
-        "available": available
+        "available": available,
+        "ini_path": ini_path_str,
     }))
+}
+
+async fn php_extension_install_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let version = payload
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let extension = payload
+        .get("extension")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if version.is_empty() || extension.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Both version and extension are required"})),
+        )
+            .into_response();
+    }
+    match set_php_extension_enabled(version, extension, true) {
+        Ok(ini_path) => {
+            state.restart_sites_for_php_version(version);
+            state.record_event(
+                "php_extension_enable",
+                "php",
+                version,
+                "PHP Extension Enabled",
+                &format!("Enabled {} in PHP {} ({})", extension, version, ini_path),
+                "success",
+            );
+            Json(serde_json::json!({"ok": true, "extension": extension, "ini_path": ini_path}))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn php_extension_disable_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let version = payload
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let extension = payload
+        .get("extension")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if version.is_empty() || extension.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Both version and extension are required"})),
+        )
+            .into_response();
+    }
+    match set_php_extension_enabled(version, extension, false) {
+        Ok(ini_path) => {
+            state.restart_sites_for_php_version(version);
+            state.record_event(
+                "php_extension_disable",
+                "php",
+                version,
+                "PHP Extension Disabled",
+                &format!("Disabled {} in PHP {} ({})", extension, version, ini_path),
+                "info",
+            );
+            Json(serde_json::json!({"ok": true, "extension": extension, "ini_path": ini_path}))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
 }
 
 async fn site_provision_log_handler(
@@ -1932,7 +2209,130 @@ async fn site_env_put_handler(
         }
     }
     let _ = std::fs::write(env_path, lines.join("\n"));
+    if site.status.eq_ignore_ascii_case("active")
+        && (site.runtime == "php" || site.runtime == "node")
+    {
+        state.stop_domain_workers(&site.domain);
+        state.spawn_site_worker(&site);
+    }
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+async fn site_redirects_get_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    Json(serde_json::json!({"redirects": site.redirects})).into_response()
+}
+
+async fn site_redirects_add_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let target = payload.get("target").and_then(|v| v.as_str()).unwrap_or("");
+    let redirect_type = payload
+        .get("redirect_type")
+        .or_else(|| payload.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("301");
+    match state.add_site_redirect(&id, source, target, redirect_type) {
+        Ok(redirects) => Json(serde_json::json!({"ok": true, "redirects": redirects})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn site_redirects_remove_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    match state.remove_site_redirect(&id, source) {
+        Ok(redirects) => Json(serde_json::json!({"ok": true, "redirects": redirects})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn site_aliases_get_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    Json(serde_json::json!({"aliases": site.aliases})).into_response()
+}
+
+async fn site_aliases_add_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let alias = payload.get("alias").and_then(|v| v.as_str()).unwrap_or("");
+    match state.add_site_alias(&id, alias) {
+        Ok(aliases) => Json(serde_json::json!({"ok": true, "aliases": aliases})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn site_aliases_remove_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let alias = payload.get("alias").and_then(|v| v.as_str()).unwrap_or("");
+    match state.remove_site_alias(&id, alias) {
+        Ok(aliases) => Json(serde_json::json!({"ok": true, "aliases": aliases})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn site_pass_protect_get_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    if let Some((user, _hash)) = state.get_site_pass_protect(&site.domain) {
+        Json(serde_json::json!({"paths": ["/"], "users": [user]})).into_response()
+    } else {
+        Json(serde_json::json!({"paths": [], "users": []})).into_response()
+    }
+}
+
+async fn site_pass_protect_add_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let user = payload.get("username").and_then(|v| v.as_str()).unwrap_or("admin");
+    let pass = payload.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    match state.set_site_pass_protect(&site.domain, true, Some(user), Some(pass)) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn site_pass_protect_remove_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    match state.set_site_pass_protect(&site.domain, false, None, None) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2202,14 +2602,19 @@ async fn wordpress_sites_handler(State(state): State<Arc<AppState>>) -> Json<ser
         let site_dir = state.site_dir(&site);
         if wordpress::is_wp_installed(&site_dir) || site.php_preset.as_deref() == Some("wordpress") {
             let ver = wordpress::read_wp_version(&site_dir);
+            let (vulns, critical_vulns) = wordpress::get_cached_vuln_counts(&site_dir);
             rows.push(serde_json::json!({
                 "site_id": site.id,
                 "domain": site.domain,
+                "wp_version": ver,
                 "version": ver,
                 "status": site.status,
                 "ssl_enabled": site.ssl_enabled,
                 "auto_update": false,
-                "vuln_count": 0
+                "update_available": false,
+                "vulns": vulns,
+                "critical_vulns": critical_vulns,
+                "vuln_count": vulns
             }));
         }
     }
@@ -3670,30 +4075,226 @@ async fn wordpress_theme_action_handler(
 async fn wordpress_harden_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    payload: Option<Json<serde_json::Value>>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let fixes: Vec<String> = payload
+        .and_then(|Json(v)| v.get("fixes").and_then(|a| a.as_array()).cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    match wordpress::apply_wp_hardening(&state, &site_dir, &dom, &fixes) {
+        Ok(results) => {
+            let applied_cnt = results.iter().filter(|r| r["applied"] == true).count();
+            state.record_event(
+                "wp_harden",
+                "site",
+                &site.domain,
+                "WordPress Hardened",
+                &format!("Applied {} hardening fix(es) on {}", applied_cnt, site.domain),
+                "success",
+            );
+            Json(serde_json::Value::Array(results)).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn wordpress_vuln_scan_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
 ) -> Response {
     let Some(site) = state.get_site(&id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
     };
     let site_dir = state.site_dir(&site);
     let dom = site.domain.clone();
-    match wordpress::toggle_feature(&state, &site_dir, &dom, "file_editing", false, None) {
-        Ok(_) => {
+    let res = tokio::task::spawn_blocking(move || wordpress::scan_wp_vulnerabilities(&site_dir, &dom)).await;
+    match res {
+        Ok(Ok(val)) => {
             state.record_event(
-                "wp_harden",
+                "wp_vuln_scan",
                 "site",
                 &site.domain,
-                "WordPress Hardened",
-                &format!("Applied security hardening on {}", site.domain),
-                "success",
+                "WordPress Vulnerability Scan",
+                &format!("Found {} vulnerabilities on {}", val["total_vulns"], site.domain),
+                if val["critical_count"].as_u64().unwrap_or(0) > 0 { "warning" } else { "info" },
             );
-            Json(serde_json::json!({
-                "ok": true,
-                "message": "Disabled in-dashboard file editing and hardened local wp-config.php"
-            }))
-            .into_response()
+            Json(val).into_response()
         }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn wordpress_security_check_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    match wordpress::check_wp_security(&site_dir) {
+        Ok(val) => Json(val).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
+}
+
+async fn wordpress_hardening_history_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    Json(serde_json::Value::Array(wordpress::get_hardening_history(&site_dir))).into_response()
+}
+
+async fn wordpress_update_handler(
+    State(state): State<Arc<AppState>>,
+    Path((id, target)): Path<(String, String)>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    let tgt = target.clone();
+    let res = tokio::task::spawn_blocking(move || wordpress::update_wp_target(&site_dir, &dom, &tgt)).await;
+    match res {
+        Ok(Ok(val)) => {
+            state.record_event(
+                "wp_update",
+                "site",
+                &site.domain,
+                "WordPress Updated",
+                val["message"].as_str().unwrap_or("Updated WordPress"),
+                "success",
+            );
+            Json(val).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn wordpress_update_safe_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Option<Json<serde_json::Value>>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let target = payload
+        .and_then(|Json(v)| v.get("target").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_else(|| "all".to_string());
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    let res = tokio::task::spawn_blocking(move || wordpress::smart_update_wp(&site_dir, &dom, &target)).await;
+    match res {
+        Ok(Ok(val)) => {
+            state.record_event(
+                "wp_smart_update",
+                "site",
+                &site.domain,
+                "WordPress Smart Update",
+                val["message"].as_str().unwrap_or("Smart Update completed"),
+                "success",
+            );
+            Json(val).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn wordpress_bulk_update_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let site_ids: Vec<String> = payload
+        .get("site_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let target = payload
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all")
+        .to_string();
+
+    let mut results = Vec::new();
+    for sid in site_ids {
+        let Some(site) = state.get_site(&sid) else {
+            results.push(serde_json::json!({
+                "site_id": sid,
+                "ok": false,
+                "message": "Site not found",
+            }));
+            continue;
+        };
+        let site_dir = state.site_dir(&site);
+        let dom = site.domain.clone();
+        let tgt = target.clone();
+        let outcome = tokio::task::spawn_blocking(move || wordpress::update_wp_target(&site_dir, &dom, &tgt)).await;
+        match outcome {
+            Ok(Ok(val)) => results.push(serde_json::json!({
+                "site_id": site.id,
+                "domain": site.domain,
+                "ok": true,
+                "updated": val["updated"],
+                "message": val["message"],
+            })),
+            Ok(Err(e)) => results.push(serde_json::json!({
+                "site_id": site.id,
+                "domain": site.domain,
+                "ok": false,
+                "message": e,
+            })),
+            Err(e) => results.push(serde_json::json!({
+                "site_id": site.id,
+                "domain": site.domain,
+                "ok": false,
+                "message": e.to_string(),
+            })),
+        }
+    }
+    Json(serde_json::json!({ "results": results })).into_response()
+}
+
+async fn site_stats_handler(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    Json(state.get_site_traffic_stats(&site.domain)).into_response()
+}
+
+async fn site_bandwidth_handler(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Site not found"}))).into_response();
+    };
+    let stats = state.get_site_traffic_stats(&site.domain);
+    let bytes = stats["bytes_sent"].as_u64().unwrap_or(0);
+    let ym = chrono::Local::now().format("%Y-%m").to_string();
+    Json(serde_json::json!({
+        "used_bytes_this_month": bytes,
+        "year_month": ym,
+    }))
+    .into_response()
 }
 
 async fn wordpress_integrity_handler(
@@ -5055,6 +5656,14 @@ async fn update_settings_handler(
     for (k, v) in obj {
         updates.insert(k.clone(), json_val_to_string(v));
     }
+    if let Some(startup_val) = updates.get("launch_at_startup") {
+        let enabled = startup_val.eq_ignore_ascii_case("true") || startup_val == "1";
+        #[cfg(not(test))]
+        if let Err(e) = tray::set_launch_at_startup(enabled) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response();
+        }
+        let _ = enabled;
+    }
     let updated = state.update_settings(updates);
     state.record_event(
         "update_settings",
@@ -5065,6 +5674,34 @@ async fn update_settings_handler(
         "info",
     );
     Json(serde_json::json!(updated)).into_response()
+}
+
+async fn telemetry_update_status_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let force = q
+        .get("force")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    Json(updater::check_for_desktop_update(&state, force).await)
+}
+
+async fn desktop_update_install_handler(State(state): State<Arc<AppState>>) -> Response {
+    match updater::download_and_launch_update(&state).await {
+        Ok(val) => {
+            state.record_event(
+                "desktop_update",
+                "system",
+                "desktop",
+                "Desktop Update Launched",
+                &format!("Launched installer for v{}", val["version"].as_str().unwrap_or("")),
+                "success",
+            );
+            Json(val).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+    }
 }
 
 async fn export_settings_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -5094,7 +5731,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "mariadb_running": mdb_port.is_some(),
         "mariadb_port": mdb_port,
         "default_sites_dir": state.get_default_sites_dir().to_string_lossy().to_string(),
-        "version": "2.252.0"
+        "version": env!("CARGO_PKG_VERSION")
     }))
 }
 
@@ -5324,7 +5961,7 @@ async fn services_install_status_handler(State(state): State<Arc<AppState>>) -> 
     let workers_running = state
         .worker_processes
         .lock()
-        .map(|w| !w.is_empty())
+        .map(|w| w.values().any(|v| !v.is_empty()))
         .unwrap_or(false);
     let mdb_installed = mariadb::find_mariadbd_binary().is_some();
     let mdb_port = state.get_mariadb_port();
@@ -5535,6 +6172,74 @@ mod win_metrics {
         ullAvailExtendedVirtual: u64,
     }
 
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    #[derive(Clone, Copy, Default)]
+    struct FILETIME {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESSENTRY32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; 260],
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    #[derive(Default)]
+    struct PROCESS_MEMORY_COUNTERS {
+        cb: u32,
+        PageFaultCount: u32,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct MIB_IFROW {
+        wszName: [u16; 256],
+        dwIndex: u32,
+        dwType: u32,
+        dwMtu: u32,
+        dwSpeed: u32,
+        dwPhysAddrLen: u32,
+        bPhysAddr: [u8; 8],
+        dwAdminStatus: u32,
+        dwOperStatus: u32,
+        dwLastChange: u32,
+        dwInOctets: u32,
+        dwInUcastPkts: u32,
+        dwInNUcastPkts: u32,
+        dwInDiscards: u32,
+        dwInErrors: u32,
+        dwInUnknownProtos: u32,
+        dwOutOctets: u32,
+        dwOutUcastPkts: u32,
+        dwOutNUcastPkts: u32,
+        dwOutDiscards: u32,
+        dwOutErrors: u32,
+        dwOutQLen: u32,
+        dwDescrLen: u32,
+        bDescr: [u8; 256],
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
@@ -5545,9 +6250,222 @@ mod win_metrics {
             lpTotalNumberOfFreeBytes: *mut u64,
         ) -> i32;
         fn GetTickCount64() -> u64;
+        fn GetSystemTimes(
+            lpIdleTime: *mut FILETIME,
+            lpKernelTime: *mut FILETIME,
+            lpUserTime: *mut FILETIME,
+        ) -> i32;
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> isize;
+        fn Process32FirstW(hSnapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn Process32NextW(hSnapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn CloseHandle(hObject: isize) -> i32;
+        fn K32GetProcessMemoryInfo(
+            Process: isize,
+            ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
+            cb: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn GetIfTable(pIfTable: *mut u8, pdwSize: *mut u32, bOrder: i32) -> u32;
+    }
+
+    static PREV_CPU_TIMES: std::sync::Mutex<Option<(u64, u64, u64)>> = std::sync::Mutex::new(None);
+    static PREV_PROC_TIMES: std::sync::Mutex<Option<std::collections::HashMap<u32, u64>>> =
+        std::sync::Mutex::new(None);
+
+    fn ft_to_u64(ft: FILETIME) -> u64 {
+        ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+    }
+
+    pub fn collect_cpu_usage_pct() -> f64 {
+        let mut idle = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+            return 0.0;
+        }
+        let cur = (ft_to_u64(idle), ft_to_u64(kernel), ft_to_u64(user));
+        let mut prev_guard = PREV_CPU_TIMES.lock().unwrap();
+        let prev = match *prev_guard {
+            Some(p) => {
+                *prev_guard = Some(cur);
+                p
+            }
+            None => {
+                *prev_guard = Some(cur);
+                drop(prev_guard);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+                    return 0.0;
+                }
+                let cur2 = (ft_to_u64(idle), ft_to_u64(kernel), ft_to_u64(user));
+                *PREV_CPU_TIMES.lock().unwrap() = Some(cur2);
+                let idle_d = cur2.0.saturating_sub(cur.0);
+                let total_d = cur2.1.saturating_sub(cur.1) + cur2.2.saturating_sub(cur.2);
+                return if total_d > 0 {
+                    (((total_d.saturating_sub(idle_d)) as f64 / total_d as f64) * 100.0)
+                        .clamp(0.0, 100.0)
+                } else {
+                    0.0
+                };
+            }
+        };
+        let idle_d = cur.0.saturating_sub(prev.0);
+        let total_d = cur.1.saturating_sub(prev.1) + cur.2.saturating_sub(prev.2);
+        if total_d > 0 {
+            (((total_d.saturating_sub(idle_d)) as f64 / total_d as f64) * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn list_processes(limit: usize) -> (Vec<serde_json::Value>, usize) {
+        const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+        const INVALID_HANDLE: isize = -1;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const PROCESS_VM_READ: u32 = 0x0010;
+
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE || snap == 0 {
+            return (Vec::new(), 0);
+        }
+
+        let mut pe = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            cntUsage: 0,
+            th32ProcessID: 0,
+            th32DefaultHeapID: 0,
+            th32ModuleID: 0,
+            cntThreads: 0,
+            th32ParentProcessID: 0,
+            pcPriClassBase: 0,
+            dwFlags: 0,
+            szExeFile: [0; 260],
+        };
+
+        let mut rows: Vec<(u32, String, f64, f64)> = Vec::new();
+        let mut total_count = 0usize;
+        let mut new_times = std::collections::HashMap::new();
+        let prev_times = PREV_PROC_TIMES.lock().unwrap().clone().unwrap_or_default();
+
+        if unsafe { Process32FirstW(snap, &mut pe) } != 0 {
+            loop {
+                total_count += 1;
+                let pid = pe.th32ProcessID;
+                let end = pe
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(pe.szExeFile.len());
+                let name = String::from_utf16_lossy(&pe.szExeFile[..end]);
+                if pid > 0 && !name.is_empty() {
+                    let h = unsafe {
+                        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid)
+                    };
+                    let mem_mb = if h != 0 {
+                        let mut pmc = PROCESS_MEMORY_COUNTERS {
+                            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                            ..Default::default()
+                        };
+                        let ok = unsafe {
+                            K32GetProcessMemoryInfo(
+                                h,
+                                &mut pmc,
+                                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                            )
+                        };
+                        unsafe { CloseHandle(h) };
+                        if ok != 0 {
+                            (pmc.WorkingSetSize as f64) / (1024.0 * 1024.0)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    let _ = prev_times.get(&pid);
+                    new_times.insert(pid, 0u64);
+                    if mem_mb > 0.1 {
+                        rows.push((pid, name, 0.0, mem_mb));
+                    }
+                }
+                if unsafe { Process32NextW(snap, &mut pe) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe { CloseHandle(snap) };
+        *PREV_PROC_TIMES.lock().unwrap() = Some(new_times);
+
+        rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        let top = rows
+            .into_iter()
+            .take(limit)
+            .map(|(pid, name, cpu_pct, mem_mb)| {
+                serde_json::json!({
+                    "pid": pid,
+                    "name": name,
+                    "cpu_pct": (cpu_pct * 10.0).round() / 10.0,
+                    "mem_mb": (mem_mb * 10.0).round() / 10.0,
+                })
+            })
+            .collect();
+        (top, total_count)
+    }
+
+    pub fn list_network() -> Vec<serde_json::Value> {
+        const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+        const NO_ERROR: u32 = 0;
+
+        let mut size: u32 = 0;
+        let rc = unsafe { GetIfTable(std::ptr::null_mut(), &mut size, 1) };
+        if rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR {
+            return Vec::new();
+        }
+        if size < 4 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc2 = unsafe { GetIfTable(buf.as_mut_ptr(), &mut size, 1) };
+        if rc2 != NO_ERROR {
+            return Vec::new();
+        }
+        let num_entries = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let row_size = std::mem::size_of::<MIB_IFROW>();
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..num_entries {
+            let offset = 4 + i * row_size;
+            if offset + row_size > buf.len() {
+                break;
+            }
+            let row = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset) as *const MIB_IFROW) };
+            // Skip software loopback (dwType == 24) if zero traffic, or show active ethernet/wifi/loopback
+            let dlen = (row.dwDescrLen as usize).min(row.bDescr.len());
+            let descr = String::from_utf8_lossy(&row.bDescr[..dlen])
+                .trim_matches('\0')
+                .trim()
+                .to_string();
+            if descr.is_empty() || (row.dwInOctets == 0 && row.dwOutOctets == 0) {
+                continue;
+            }
+            if !seen.insert(descr.clone()) {
+                continue;
+            }
+            out.push(serde_json::json!({
+                "name": descr,
+                "rx_bytes": row.dwInOctets as u64,
+                "tx_bytes": row.dwOutOctets as u64,
+            }));
+        }
+        out
     }
 
     pub struct HostMetrics {
+        pub cpu_usage: f64,
         pub mem_total_mb: u64,
         pub mem_used_mb: u64,
         pub mem_usage_pct: f64,
@@ -5558,6 +6476,7 @@ mod win_metrics {
     }
 
     pub fn collect(drive_root: &std::path::Path) -> HostMetrics {
+        let cpu_usage = collect_cpu_usage_pct();
         let mut mem_status = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
             dwMemoryLoad: 0,
@@ -5611,6 +6530,7 @@ mod win_metrics {
 
         let os_uptime_secs = unsafe { GetTickCount64() / 1000 };
         HostMetrics {
+            cpu_usage,
             mem_total_mb,
             mem_used_mb,
             mem_usage_pct,
@@ -5629,12 +6549,18 @@ async fn system_info_handler(State(state): State<Arc<AppState>>) -> Json<serde_j
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "localhost".into());
-    let worker_count = state.worker_processes.lock().map(|w| w.len()).unwrap_or(0);
+    let worker_count: usize = state
+        .worker_processes
+        .lock()
+        .map(|w| w.values().map(|v| v.len()).sum())
+        .unwrap_or(0);
 
     #[cfg(windows)]
-    let (mem_total_mb, mem_used_mb, mem_usage_pct, disk_total_gb, disk_used_gb, disk_usage_pct, uptime_secs) = {
+    let (cpu_usage, mem_total_mb, mem_used_mb, mem_usage_pct, disk_total_gb, disk_used_gb, disk_usage_pct, uptime_secs, proc_total) = {
         let m = win_metrics::collect(&state.sites_dir);
+        let (_top, total_procs) = win_metrics::list_processes(1);
         (
+            (m.cpu_usage * 10.0).round() / 10.0,
             m.mem_total_mb,
             m.mem_used_mb,
             m.mem_usage_pct,
@@ -5642,10 +6568,12 @@ async fn system_info_handler(State(state): State<Arc<AppState>>) -> Json<serde_j
             m.disk_used_gb,
             m.disk_usage_pct,
             m.os_uptime_secs.max(state.started_at.elapsed().as_secs()),
+            total_procs.max(worker_count + 1),
         )
     };
     #[cfg(not(windows))]
-    let (mem_total_mb, mem_used_mb, mem_usage_pct, disk_total_gb, disk_used_gb, disk_usage_pct, uptime_secs) = (
+    let (cpu_usage, mem_total_mb, mem_used_mb, mem_usage_pct, disk_total_gb, disk_used_gb, disk_usage_pct, uptime_secs, proc_total) = (
+        0.0f64,
         16384u64,
         4096u64,
         25.0f64,
@@ -5653,11 +6581,12 @@ async fn system_info_handler(State(state): State<Arc<AppState>>) -> Json<serde_j
         64.0f64,
         25.0f64,
         state.started_at.elapsed().as_secs(),
+        worker_count + 1,
     );
 
     Json(serde_json::json!({
         "cpu_count": cpu_count,
-        "cpu_usage": 0.0,
+        "cpu_usage": cpu_usage,
         "cpu_model": "Windows Host CPU",
         "cpu_temp": null,
         "mem_total_mb": mem_total_mb,
@@ -5675,8 +6604,53 @@ async fn system_info_handler(State(state): State<Arc<AppState>>) -> Json<serde_j
         "hostname": hostname,
         "os": "Windows",
         "kernel": std::env::consts::ARCH,
-        "process_count": worker_count + 1
+        "process_count": proc_total
     }))
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        let m = win_metrics::collect(&state.sites_dir);
+        Json(serde_json::json!({
+            "cpu_percent": (m.cpu_usage * 10.0).round() / 10.0,
+            "memory_mb": m.mem_used_mb,
+            "disk_gb": (m.disk_used_gb * 10.0).round() / 10.0,
+        }))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Json(serde_json::json!({"cpu_percent": 0.0, "memory_mb": 0, "disk_gb": 0.0}))
+    }
+}
+
+async fn system_processes_handler() -> Json<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        let (procs, _total) = tokio::task::spawn_blocking(|| win_metrics::list_processes(20))
+            .await
+            .unwrap_or_default();
+        Json(serde_json::Value::Array(procs))
+    }
+    #[cfg(not(windows))]
+    {
+        Json(serde_json::json!([]))
+    }
+}
+
+async fn system_network_handler() -> Json<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        let ifaces = tokio::task::spawn_blocking(win_metrics::list_network)
+            .await
+            .unwrap_or_default();
+        Json(serde_json::Value::Array(ifaces))
+    }
+    #[cfg(not(windows))]
+    {
+        Json(serde_json::json!([]))
+    }
 }
 
 pub fn build_api_router(state: Arc<AppState>) -> Router {
@@ -5757,7 +6731,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "cpu_cores": 8,
                     "ram_mb": 16384,
                     "disk_gb": 512,
-                    "agent_version": "2.252.0",
+                    "agent_version": env!("CARGO_PKG_VERSION"),
                     "cpu_usage": 5.0,
                     "mem_used_mb": 2048,
                     "uptime_secs": 3600,
@@ -5789,11 +6763,32 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/sites/{id}/limits", put(update_site_limits_handler))
         .route("/sites/{id}/env", get(site_env_get_handler).put(site_env_put_handler))
         .route("/sites/{id}/staging", get(|| async { Json(serde_json::json!({"exists": false})) }))
-        .route("/sites/{id}/redirects", get(|| async { Json(serde_json::json!({"redirects": []})) }))
-        .route("/sites/{id}/aliases", get(|| async { Json(serde_json::json!({"aliases": []})) }))
-        .route("/sites/{id}/password-protect", get(|| async { Json(serde_json::json!({"paths": [], "users": []})) }))
-        .route("/sites/{id}/stats", get(|| async { Json(serde_json::json!({"total_requests": 0, "total_bytes": 0, "points": []})) }))
-        .route("/sites/{id}/bandwidth-usage", get(|| async { Json(serde_json::json!({"used_bytes_this_month": 0, "year_month": "2026-11"})) }))
+        .route(
+            "/sites/{id}/redirects",
+            get(site_redirects_get_handler).post(site_redirects_add_handler),
+        )
+        .route(
+            "/sites/{id}/redirects/remove",
+            post(site_redirects_remove_handler),
+        )
+        .route(
+            "/sites/{id}/aliases",
+            get(site_aliases_get_handler).post(site_aliases_add_handler),
+        )
+        .route(
+            "/sites/{id}/aliases/remove",
+            post(site_aliases_remove_handler),
+        )
+        .route(
+            "/sites/{id}/password-protect",
+            get(site_pass_protect_get_handler).post(site_pass_protect_add_handler),
+        )
+        .route(
+            "/sites/{id}/password-protect/remove",
+            post(site_pass_protect_remove_handler),
+        )
+        .route("/sites/{id}/stats", get(site_stats_handler))
+        .route("/sites/{id}/bandwidth-usage", get(site_bandwidth_handler))
         .route(
             "/sites/{id}/access-logs",
             get(|State(s): State<Arc<AppState>>, Path(id): Path<String>, Query(q): Query<LogQueryParams>| async move {
@@ -5898,13 +6893,18 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             "/sites/{id}/wordpress/clear-cache",
             post(wordpress_clear_cache_handler),
         )
+        .route("/wordpress/bulk-update", post(wordpress_bulk_update_handler))
         .route(
             "/sites/{id}/wordpress/vuln-scan",
-            post(|| async { Json(serde_json::json!({"vulnerabilities": [], "scanned": true})) }),
+            post(wordpress_vuln_scan_handler),
         )
         .route(
             "/sites/{id}/wordpress/security-check",
-            get(|| async { Json(serde_json::json!({"score": 100, "checks": []})) }),
+            get(wordpress_security_check_handler),
+        )
+        .route(
+            "/sites/{id}/wordpress/hardening-history",
+            get(wordpress_hardening_history_handler),
         )
         .route(
             "/sites/{id}/wordpress/reset-admin-password",
@@ -5936,15 +6936,11 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/sites/{id}/wordpress/update/{target}",
-            post(|Path((_id, target)): Path<(String, String)>| async move {
-                Json(serde_json::json!({ "ok": true, "message": format!("Updated {} cleanly", target) }))
-            }),
+            post(wordpress_update_handler),
         )
         .route(
             "/sites/{id}/wordpress/update-safe",
-            post(|| async {
-                Json(serde_json::json!({ "ok": true, "message": "Verified local WordPress installation" }))
-            }),
+            post(wordpress_update_safe_handler),
         )
         .route("/desktop/open-folder", post(desktop_open_folder_handler))
         .route("/desktop/open-vscode", post(desktop_open_vscode_handler))
@@ -6061,6 +7057,8 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/php/versions", get(php_versions_handler))
         .route("/php/install", post(php_install_handler))
         .route("/php/extensions/{version}", get(php_extensions_handler))
+        .route("/php/extensions/install", post(php_extension_install_handler))
+        .route("/php/extensions/disable", post(php_extension_disable_handler))
         .route("/services/install/{id}/log", get(php_install_log_handler))
         .route("/services/install-status", get(services_install_status_handler))
         .route("/mariadb/status", get(mariadb_status_handler))
@@ -6151,14 +7149,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         )
         .route("/alert-rules", get(|| async { Json(serde_json::json!([])) }))
         .route("/escalation-policies", get(|| async { Json(serde_json::json!([])) }))
-        .route(
-            "/metrics",
-            get(|| async {
-                Json(
-                    serde_json::json!({"cpu_percent": 2.5, "memory_mb": 145, "disk_gb": 12.4}),
-                )
-            }),
-        )
+        .route("/metrics", get(metrics_handler))
         .route(
             "/system/status",
             get(|| async {
@@ -6166,55 +7157,64 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
                     "status": "running",
                     "mode": "desktop",
                     "os": "windows",
-                    "version": "2.252.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }))
             }),
         )
         .route("/system/info", get(system_info_handler))
-        .route(
-            "/system/processes",
-            get(|| async { Json(serde_json::json!([])) }),
-        )
-        .route(
-            "/system/network",
-            get(|| async { Json(serde_json::json!([])) }),
-        )
-        .route(
-            "/telemetry/update-status",
-            get(|| async { Json(serde_json::json!({"update_available": false})) }),
-        )
+        .route("/system/processes", get(system_processes_handler))
+        .route("/system/network", get(system_network_handler))
+        .route("/telemetry/update-status", get(telemetry_update_status_handler))
+        .route("/desktop/update/install", post(desktop_update_install_handler))
         .route(
             "/tls-certificates",
             get(|| async { Json(serde_json::json!([])) }),
         )
         .route(
             "/dashboard/intelligence",
-            get(|| async {
-                Json(serde_json::json!({
-                    "health_score": 100,
-                    "grade": "A+",
-                    "firing_alerts": 0,
-                    "acknowledged_alerts": 0,
-                    "open_incidents": 0,
-                    "stale_backups": 0,
-                    "scan_critical": 0,
-                    "scan_warnings": 0,
-                    "ssl_countdowns": [],
-                    "top_issues": [],
-                    "recommendations": []
-                }))
+            get({
+                let s = state.clone();
+                move || async move {
+                    let sites = s.list_sites();
+                    let mut ssl_countdowns = Vec::new();
+                    for site in &sites {
+                        if site.ssl_enabled {
+                            ssl_countdowns.push(serde_json::json!({
+                                "domain": site.domain,
+                                "days_left": 90
+                            }));
+                        }
+                    }
+                    Json(serde_json::json!({
+                        "health_score": 100,
+                        "grade": "A+",
+                        "firing_alerts": 0,
+                        "acknowledged_alerts": 0,
+                        "open_incidents": 0,
+                        "stale_backups": 0,
+                        "scan_critical": 0,
+                        "scan_warnings": 0,
+                        "ssl_countdowns": ssl_countdowns,
+                        "top_issues": [],
+                        "recommendations": []
+                    }))
+                }
             }),
         )
         .route(
             "/dashboard/fleet",
-            get(|| async {
-                Json(serde_json::json!({
-                    "servers": [],
-                    "total_servers": 1,
-                    "total_firing": 0,
-                    "total_incidents": 0,
-                    "total_sites": 2
-                }))
+            get({
+                let s = state.clone();
+                move || async move {
+                    let total_sites = s.list_sites().len();
+                    Json(serde_json::json!({
+                        "servers": [],
+                        "total_servers": 1,
+                        "total_firing": 0,
+                        "total_incidents": 0,
+                        "total_sites": total_sites
+                    }))
+                }
             }),
         )
         .route(
@@ -6226,7 +7226,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route(
             "/dashboard/docker",
             get(|| async {
-                Json(serde_json::json!({"total": 2, "running": 2, "stopped": 0}))
+                Json(serde_json::json!({"total": 0, "running": 0, "stopped": 0}))
             }),
         )
         .route(
@@ -6265,7 +7265,12 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/dashboard/metrics-history",
-            get(|| async { Json(serde_json::json!({"points": []})) }),
+            get({
+                let s = state.clone();
+                move || async move {
+                    Json(serde_json::json!({"points": s.get_metrics_history()}))
+                }
+            }),
         )
         .fallback(|| async {
             (
@@ -6355,6 +7360,37 @@ fn start_embedded_server(state: Arc<AppState>) -> u16 {
                 .layer(CorsLayer::permissive());
 
             let _ = port_tx.send(port);
+
+            // Sample local Windows CPU/RAM/disk metrics every 10s for Dashboard history charts
+            {
+                let metrics_state = state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        #[cfg(windows)]
+                        let point = {
+                            let s_dir = metrics_state.sites_dir.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let m = win_metrics::collect(&s_dir);
+                                serde_json::json!({
+                                    "cpu": (m.cpu_usage * 10.0).round() / 10.0,
+                                    "mem": (m.mem_usage_pct * 10.0).round() / 10.0,
+                                    "disk": (m.disk_usage_pct * 10.0).round() / 10.0,
+                                    "time": chrono::Local::now().format("%H:%M:%S").to_string(),
+                                })
+                            })
+                            .await
+                            .ok()
+                        };
+                        #[cfg(not(windows))]
+                        let point: Option<serde_json::Value> = None;
+
+                        if let Some(pt) = point {
+                            metrics_state.push_metrics_point(pt);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                });
+            }
 
             // Start local SMTP Mail Catcher (127.0.0.1:1025 or fallback free port) before
             // spawning PHP/Node site workers so every worker receives the bound SMTP port.
@@ -6452,7 +7488,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    let event_loop = EventLoop::new();
+    let event_loop = EventLoopBuilder::<tray::TrayAction>::with_user_event().build();
+    let tray_handle = tray::start_tray(event_loop.create_proxy());
     let window = WindowBuilder::new()
         .with_title("DockPanel Desktop")
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
@@ -6576,15 +7613,48 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     let state_exit = state.clone();
     event_loop.run(move |event, _, control_flow| {
-        let _ = (&_webview, &window);
+        let _ = &_webview;
         *control_flow = ControlFlow::Wait;
-        if let Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } = event
-        {
-            state_exit.stop_all_workers();
-            *control_flow = ControlFlow::Exit;
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                let minimize = state_exit
+                    .get_settings()
+                    .get("minimize_to_tray")
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                if minimize && tray_handle.is_some() {
+                    window.set_visible(false);
+                } else {
+                    state_exit.stop_all_workers();
+                    if let Some(ref th) = tray_handle {
+                        th.shutdown();
+                    }
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
+            Event::UserEvent(action) => match action {
+                tray::TrayAction::ShowWindow => {
+                    window.set_visible(true);
+                    window.set_focus();
+                }
+                tray::TrayAction::OpenSitesFolder => {
+                    let dir = state_exit.get_default_sites_dir();
+                    let _ = std::fs::create_dir_all(&dir);
+                    #[cfg(windows)]
+                    let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+                }
+                tray::TrayAction::QuitApp => {
+                    state_exit.stop_all_workers();
+                    if let Some(ref th) = tray_handle {
+                        th.shutdown();
+                    }
+                    *control_flow = ControlFlow::Exit;
+                }
+            },
+            _ => {}
         }
     });
 }
@@ -7730,6 +8800,123 @@ mod tests {
         assert!(sse_txt.contains("PHP Warning: test warning"), "SSE stream missed PHP log line: {}", sse_txt);
 
         server.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_toggle_php_extension_in_ini_text() {
+        let base_ini = ";extension_dir = \"ext\"\n;extension=intl\nextension=curl\n;zend_extension=opcache\n";
+        let enabled_intl = toggle_php_extension_in_ini_text(base_ini, "intl", true);
+        assert!(enabled_intl.contains("extension_dir = \"ext\""));
+        assert!(enabled_intl.contains("\nextension=intl") || enabled_intl.contains("\r\nextension=intl"));
+
+        let enabled_opcache = toggle_php_extension_in_ini_text(&enabled_intl, "opcache", true);
+        assert!(enabled_opcache.contains("zend_extension=opcache"));
+
+        let disabled_curl = toggle_php_extension_in_ini_text(&enabled_opcache, "curl", false);
+        assert!(disabled_curl.contains(";extension=curl"));
+
+        let appended_soap = toggle_php_extension_in_ini_text(&disabled_curl, "soap", true);
+        assert!(appended_soap.contains("extension=soap"));
+    }
+
+    #[test]
+    fn test_set_php_extension_rejects_invalid_and_builtins() {
+        assert!(set_php_extension_enabled("8.3", "../bad", true).is_err());
+        assert!(set_php_extension_enabled("8.3", "", true).is_err());
+        assert!(set_php_extension_enabled("8.3", "core", false).is_err());
+        assert!(set_php_extension_enabled("8.3", "standard", false).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_win_metrics_cpu_processes_and_network() {
+        let m = win_metrics::collect(std::path::Path::new("C:\\"));
+        assert!(m.cpu_usage >= 0.0 && m.cpu_usage <= 100.0);
+        assert!(m.mem_total_mb > 0);
+        let (procs, total) = win_metrics::list_processes(10);
+        assert!(total > 0);
+        assert!(!procs.is_empty());
+        assert!(procs[0]["mem_mb"].as_f64().unwrap_or(0.0) > 0.0);
+        let _ifaces = win_metrics::list_network();
+    }
+
+    #[tokio::test]
+    async fn test_batch3_wp_endpoints_and_telemetry_api() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_b3_{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites")));
+        let site = state.create_site("b3wp.test", Some("8.3")).unwrap();
+        let site_dir = state.site_dir(&site);
+        wordpress::install_site_wordpress(
+            &site_dir,
+            "b3wp.test",
+            &wordpress::InstallWpRequest {
+                admin_user: Some("admin".to_string()),
+                admin_pass: Some("pass1234".to_string()),
+                admin_email: Some("a@b3wp.test".to_string()),
+                title: Some("B3".to_string()),
+                url: Some("http://b3wp.test".to_string()),
+                db_engine: Some("sqlite".to_string()),
+                db_port: None,
+            },
+        )
+        .unwrap();
+
+        state.record_site_traffic("b3wp.test", "/", 200, 4096, "127.0.0.1");
+        state.push_metrics_point(serde_json::json!({ "cpu": 12.3, "mem": 45.6, "disk": 30.0, "time": "12:00:00" }));
+
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        let health: serde_json::Value = c.get(format!("{}/health", base)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+
+        let stats: serde_json::Value = c.get(format!("{}/sites/{}/stats", base, site.id)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(stats["requests"], 1);
+        assert_eq!(stats["bytes_sent"], 4096);
+
+        let bw: serde_json::Value = c.get(format!("{}/sites/{}/bandwidth-usage", base, site.id)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(bw["used_bytes_this_month"], 4096);
+
+        let hist: serde_json::Value = c.get(format!("{}/dashboard/metrics-history", base)).send().await.unwrap().json().await.unwrap();
+        assert_eq!(hist["points"].as_array().unwrap().len(), 1);
+
+        let harden: serde_json::Value = c
+            .post(format!("{}/sites/{}/wordpress/harden", base, site.id))
+            .json(&serde_json::json!({ "fixes": ["disable-file-editing", "force-ssl"] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(harden.as_array().unwrap().len(), 2);
+
+        let sec: serde_json::Value = c
+            .get(format!("{}/sites/{}/wordpress/security-check", base, site.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(sec["checks"].as_array().unwrap().len() >= 6);
+
+        let scan: serde_json::Value = c
+            .post(format!("{}/sites/{}/wordpress/vuln-scan", base, site.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(scan["domain"], "b3wp.test");
+
+        srv.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
