@@ -1,6 +1,6 @@
 [package]
 name = "dockpanel-app"
-version = "2.252.0"
+version = "2.253.0"
 edition = "2021"
 description = "DockPanel Desktop - Native Pure Rust Windows Application"
 

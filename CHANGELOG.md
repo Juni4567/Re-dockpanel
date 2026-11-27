@@ -4,6 +4,16 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.253.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.253.0 — Production Build & Installer Release
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.253.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Changed
+- **Version Bump & Production Rebuild (`desktop/dockpanel-app`, `desktop/host-helper`, `desktop/installer`, `panel/frontend`):**
+  - Bumped DockPanel Desktop, Host Helper service, frontend package, and Windows installer metadata (`setup.iss`, `install.ps1`) to `2.253.0`.
+  - Rebuilt production frontend bundle, Rust desktop binaries (`dockpanel.exe`, `dockpanel-host-helper.exe`), and `DockPanel-Desktop-Setup.exe` Inno Setup installer.
+
 ## [2.252.0] - 2026-11-27
 
 ### Release: DockPanel Desktop — Real-Time Import Progress, HTTPS Proxy Fix, & Live PHP Logs
