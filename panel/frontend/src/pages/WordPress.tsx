@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useParams, Link } from "react-router-dom";
 import { api, ApiError } from "../api";
 import SiteThumbnail from "../components/SiteThumbnail";
-import { showGlobalNotification } from "../context/NotificationContext";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
 import ProvisionLog, { type ProvisionCompatMeta } from "../components/ProvisionLog";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { buildSiteExternalUrl } from "../components/PortConflictModal";
@@ -467,12 +467,25 @@ export default function WordPress() {
 
   const handlePluginAction = async (name: string, action: string) => {
     setBusy(`plugin-${action}-${name}`);
+    const siteDom = site?.domain || id || "";
     try {
-      await api.post(`/sites/${id}/wordpress/plugin/${action}`, { name });
-      showGlobalNotification("success", `Plugin ${action}d: ${name}`);
+      const res = await api.post<{ ok?: boolean; message?: string }>(`/sites/${id}/wordpress/plugin/${action}`, { name });
+      showGlobalNotification(
+        "success",
+        res?.message || `Plugin ${action}d: ${name}`,
+        "WordPress Plugin Action",
+        `Site: ${siteDom}\nPlugin: ${name}\nAction: ${action}`,
+        { category: "site", target: siteDom, dedupeKey: `wp-plugin:${siteDom}:${name}:${action}` }
+      );
       loadPlugins();
     } catch (e) {
-      showGlobalNotification("error", e instanceof Error ? e.message : `${action} failed`);
+      const info = buildAlertDetails(e, {
+        context: `Plugin ${action} (${name})`,
+        category: "site",
+        target: siteDom,
+        dedupeKey: `wp-plugin:${siteDom}:${name}:${action}`,
+      });
+      showGlobalNotification("error", info.message, "WordPress Plugin Error", info.details, info.meta);
     } finally {
       setBusy("");
     }
@@ -480,12 +493,25 @@ export default function WordPress() {
 
   const handleThemeAction = async (name: string, action: string) => {
     setBusy(`theme-${action}-${name}`);
+    const siteDom = site?.domain || id || "";
     try {
-      await api.post(`/sites/${id}/wordpress/theme/${action}`, { name });
-      showGlobalNotification("success", `Theme ${action}d: ${name}`);
+      const res = await api.post<{ ok?: boolean; message?: string }>(`/sites/${id}/wordpress/theme/${action}`, { name });
+      showGlobalNotification(
+        "success",
+        res?.message || `Theme ${action}d: ${name}`,
+        "WordPress Theme Action",
+        `Site: ${siteDom}\nTheme: ${name}\nAction: ${action}`,
+        { category: "site", target: siteDom, dedupeKey: `wp-theme:${siteDom}:${name}:${action}` }
+      );
       loadThemes();
     } catch (e) {
-      showGlobalNotification("error", e instanceof Error ? e.message : `${action} failed`);
+      const info = buildAlertDetails(e, {
+        context: `Theme ${action} (${name})`,
+        category: "site",
+        target: siteDom,
+        dedupeKey: `wp-theme:${siteDom}:${name}:${action}`,
+      });
+      showGlobalNotification("error", info.message, "WordPress Theme Error", info.details, info.meta);
     } finally {
       setBusy("");
     }
@@ -1783,13 +1809,23 @@ export default function WordPress() {
                               <td className="p-3">
                                 <button
                                   onClick={() => {
-                                    if (!isActive) handleThemeAction(t.name, "activate");
+                                    if (!isActive) {
+                                      handleThemeAction(t.name, "activate");
+                                    } else if (themes.length > 1) {
+                                      handleThemeAction(t.name, "deactivate");
+                                    }
                                   }}
-                                  disabled={busy.startsWith("theme-")}
+                                  disabled={busy.startsWith("theme-") || (isActive && themes.length <= 1)}
                                   className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                                     isActive ? "bg-accent-600" : "bg-dark-600"
                                   }`}
-                                  title={isActive ? "Active theme" : "Click to activate theme"}
+                                  title={
+                                    isActive
+                                      ? themes.length > 1
+                                        ? "Active theme (click to disable & switch to a fallback theme)"
+                                        : "Active theme"
+                                      : "Click to activate theme"
+                                  }
                                 >
                                   <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${isActive ? "translate-x-3.5" : "translate-x-0.5"}`} />
                                 </button>

@@ -598,6 +598,14 @@ async fn delete_site_handler(
         state.delete_site(&id)
     };
     if ok {
+        let thumb_dir = state.config_dir.join("thumbnails");
+        let safe_dom: String = domain
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .collect();
+        let _ = std::fs::remove_file(thumb_dir.join(format!("{}.bin", safe_dom)));
+        let _ = std::fs::remove_file(thumb_dir.join(format!("{}.ct", safe_dom)));
         state.record_event(
             if keep_files { "unregister_site" } else { "delete_site" },
             "site",
@@ -612,6 +620,319 @@ async fn delete_site_handler(
         );
     }
     Json(serde_json::json!({ "success": ok, "kept_files": keep_files }))
+}
+
+fn sanitize_thumb_domain_key(domain: &str) -> String {
+    domain
+        .trim()
+        .to_ascii_lowercase()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("site")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect()
+}
+
+fn is_local_thumbnail_domain(domain: &str) -> bool {
+    let lower = domain.trim().to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".local")
+        || lower.ends_with(".test")
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".lan")
+        || lower.starts_with("127.")
+        || !lower.contains('.')
+}
+
+fn extract_html_icon_or_og_url(html: &str) -> Option<(Option<String>, Option<String>)> {
+    let lower = html.to_ascii_lowercase();
+    let title = lower.find("<title>").and_then(|start| {
+        let after = start + 7;
+        lower[after..].find("</title>").map(|end| {
+            html[after..after + end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    });
+
+    let extract_attr = |tag: &str, attr: &str| -> Option<String> {
+        let tag_low = tag.to_ascii_lowercase();
+        let idx = tag_low.find(attr)?;
+        let rest = tag[idx + attr.len()..].trim_start();
+        let after_eq = rest.strip_prefix('=')?.trim_start();
+        let q = after_eq.chars().next()?;
+        if q == '"' || q == '\'' {
+            let inner = &after_eq[1..];
+            inner.find(q).map(|end| inner[..end].trim().to_string())
+        } else {
+            None
+        }
+    };
+
+    let mut image_url: Option<String> = None;
+    for part in html.split('<').skip(1) {
+        let tag_end = part.find('>').unwrap_or(part.len());
+        let tag = &part[..tag_end];
+        let tl = tag.to_ascii_lowercase();
+        if tl.starts_with("meta")
+            && (tl.contains("og:image") || tl.contains("twitter:image"))
+        {
+            if let Some(u) = extract_attr(tag, "content") {
+                if !u.is_empty() {
+                    image_url = Some(u);
+                    break;
+                }
+            }
+        }
+        if tl.starts_with("link")
+            && (tl.contains("apple-touch-icon") || tl.contains("icon"))
+            && image_url.is_none()
+        {
+            if let Some(u) = extract_attr(tag, "href") {
+                if !u.is_empty() {
+                    image_url = Some(u);
+                }
+            }
+        }
+    }
+
+    Some((title, image_url))
+}
+
+fn build_svg_site_preview(domain: &str, title: Option<&str>, badge: &str, running: bool) -> Vec<u8> {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let clean_dom = esc(domain);
+    let display_title = esc(
+        title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(domain),
+    );
+    let initial = esc(
+        domain
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .as_deref()
+            .unwrap_or("W"),
+    );
+    let badge_esc = esc(badge);
+    let dot_color = if running { "#34d399" } else { "#94a3b8" };
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="600" height="320" viewBox="0 0 600 320">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="55%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ea580c"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+  </defs>
+  <rect width="600" height="320" fill="url(#bg)"/>
+  <rect x="0" y="0" width="600" height="36" fill="#0b1120"/>
+  <circle cx="20" cy="18" r="5" fill="#ef4444"/>
+  <circle cx="36" cy="18" r="5" fill="#f59e0b"/>
+  <circle cx="52" cy="18" r="5" fill="#22c55e"/>
+  <rect x="74" y="8" width="380" height="20" rx="6" fill="#1e293b"/>
+  <text x="86" y="22" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="11" fill="#cbd5e1">{clean_dom}</text>
+  <circle cx="545" cy="18" r="4" fill="{dot_color}"/>
+  <rect x="34" y="64" width="62" height="62" rx="14" fill="url(#accent)"/>
+  <text x="65" y="106" text-anchor="middle" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="30" font-weight="700" fill="#ffffff">{initial}</text>
+  <text x="114" y="92" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="22" font-weight="700" fill="#f8fafc">{display_title}</text>
+  <text x="114" y="118" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" fill="#94a3b8">{clean_dom}  ·  {badge_esc}</text>
+  <rect x="34" y="152" width="532" height="128" rx="10" fill="#0b1120" stroke="#334155" stroke-width="1"/>
+  <rect x="54" y="174" width="220" height="16" rx="4" fill="#1e293b"/>
+  <rect x="54" y="204" width="440" height="10" rx="4" fill="#1e293b" opacity="0.8"/>
+  <rect x="54" y="224" width="360" height="10" rx="4" fill="#1e293b" opacity="0.65"/>
+  <rect x="54" y="248" width="120" height="16" rx="6" fill="#ea580c" opacity="0.85"/>
+</svg>"##
+    );
+    svg.into_bytes()
+}
+
+async fn site_thumbnail_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let raw_domain = params.get("domain").map(String::as_str).unwrap_or("").trim();
+    if raw_domain.is_empty() || raw_domain.contains("..") {
+        return (StatusCode::BAD_REQUEST, "Invalid domain").into_response();
+    }
+    let clean_key = sanitize_thumb_domain_key(raw_domain);
+    let force_refresh = params
+        .get("refresh")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let thumb_dir = state.config_dir.join("thumbnails");
+    let _ = std::fs::create_dir_all(&thumb_dir);
+    let bin_path = thumb_dir.join(format!("{}.bin", clean_key));
+    let ct_path = thumb_dir.join(format!("{}.ct", clean_key));
+
+    // Serve from persistent local cache immediately unless manually refreshed
+    if !force_refresh && bin_path.is_file() {
+        if let Ok(bytes) = std::fs::read(&bin_path) {
+            if !bytes.is_empty() {
+                let ct = std::fs::read_to_string(&ct_path)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "image/png".to_string());
+                return (
+                    [
+                        (axum::http::header::CONTENT_TYPE, ct),
+                        (
+                            axum::http::header::CACHE_CONTROL,
+                            "public, max-age=604800".to_string(),
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let site_opt = state
+        .list_sites()
+        .into_iter()
+        .find(|s| s.domain.eq_ignore_ascii_case(raw_domain) || s.domain.eq_ignore_ascii_case(&clean_key));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .danger_accept_invalid_certs(true)
+        .user_agent("DockPanel-ThumbnailFetcher/1.0")
+        .build()
+        .ok();
+
+    let mut fetched: Option<(Vec<u8>, String)> = None;
+    let mut detected_title: Option<String> = None;
+
+    if let Some(ref c) = client {
+        let local_port = state.get_router_config().active_port;
+        let is_local = is_local_thumbnail_domain(raw_domain) || site_opt.is_some();
+
+        if is_local {
+            // Probe local site directly via router to grab <title> and og:image / favicon
+            let probe_url = format!("http://127.0.0.1:{}/", local_port);
+            if let Ok(resp) = c.get(&probe_url).header("Host", raw_domain).send().await {
+                if let Ok(html) = resp.text().await {
+                    if let Some((t, img_rel)) = extract_html_icon_or_og_url(&html) {
+                        detected_title = t;
+                        if let Some(rel) = img_rel {
+                            let img_url = if rel.starts_with("http://") || rel.starts_with("https://") {
+                                Some(rel)
+                            } else if rel.starts_with("//") {
+                                Some(format!("http:{}", rel))
+                            } else if rel.starts_with('/') {
+                                Some(format!("http://127.0.0.1:{}{}", local_port, rel))
+                            } else {
+                                Some(format!("http://127.0.0.1:{}/{}", local_port, rel))
+                            };
+                            if let Some(u) = img_url {
+                                let req_b = if u.starts_with("http://127.0.0.1") {
+                                    c.get(&u).header("Host", raw_domain)
+                                } else {
+                                    c.get(&u)
+                                };
+                                if let Ok(r2) = req_b.send().await {
+                                    if r2.status().is_success() {
+                                        let ct = r2
+                                            .headers()
+                                            .get(reqwest::header::CONTENT_TYPE)
+                                            .and_then(|v| v.to_str().ok())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if ct.starts_with("image/") {
+                                            if let Ok(b) = r2.bytes().await {
+                                                if b.len() > 256 {
+                                                    fetched = Some((b.to_vec(), ct));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if fetched.is_none() && !is_local_thumbnail_domain(raw_domain) {
+            let candidates = [
+                format!("https://api.microlink.io?url=https%3A%2F%2F{}&screenshot=true&meta=false&embed=screenshot.url", clean_key),
+                format!("https://image.thum.io/get/width/600/crop/400/noanimate/https://{}", clean_key),
+                format!("https://unavatar.io/{}?fallback=false", clean_key),
+                format!("https://www.google.com/s2/favicons?domain={}&sz=128", clean_key),
+            ];
+            for url in candidates {
+                if let Ok(resp) = c.get(&url).send().await {
+                    if resp.status().is_success() {
+                        let ct = resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        if ct.starts_with("image/") {
+                            if let Ok(b) = resp.bytes().await {
+                                if b.len() > 256 {
+                                    fetched = Some((b.to_vec(), ct));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (bytes, ct) = fetched.unwrap_or_else(|| {
+        let badge = site_opt
+            .as_ref()
+            .map(|s| {
+                if s.php_preset.as_deref() == Some("wordpress") {
+                    "WordPress".to_string()
+                } else {
+                    s.runtime.to_ascii_uppercase()
+                }
+            })
+            .unwrap_or_else(|| "Website".to_string());
+        let running = site_opt.as_ref().map(|s| s.status == "active").unwrap_or(false);
+        (
+            build_svg_site_preview(raw_domain, detected_title.as_deref(), &badge, running),
+            "image/svg+xml".to_string(),
+        )
+    });
+
+    let _ = std::fs::write(&bin_path, &bytes);
+    let _ = std::fs::write(&ct_path, &ct);
+
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=604800".to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn start_site_handler(
@@ -8347,6 +8668,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             }),
         )
         .route("/sites", get(list_sites_handler).post(create_site_handler))
+        .route("/sites/thumbnail", get(site_thumbnail_handler))
         .route("/admin/sites", get(list_sites_handler))
         .route(
             "/sites/{id}",
@@ -11158,6 +11480,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_url_resp.status(), StatusCode::BAD_REQUEST);
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_site_thumbnail_cache_and_keep_files_delete() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_thumb_keep_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("cfg");
+        let sites_dir = temp_dir.join("sites");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&sites_dir).unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(config_dir.clone(), sites_dir));
+        let site = state
+            .create_site_with_options("thumbcache.local", Some("php"), None, None, None, None)
+            .unwrap();
+        let site_dir = state.site_dir(&site);
+        std::fs::write(site_dir.join("marker.txt"), "keep me").unwrap();
+
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        // First fetch builds and caches the SVG preview on disk
+        let r1 = c
+            .get(format!("{}/sites/thumbnail?domain=thumbcache.local", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let body1 = r1.text().await.unwrap();
+        assert!(body1.contains("thumbcache.local"));
+
+        // Overwrite cached file on disk to prove subsequent non-refresh request reads disk cache
+        let bin_path = config_dir.join("thumbnails").join("thumbcache.local.bin");
+        assert!(bin_path.is_file());
+        std::fs::write(&bin_path, b"<svg>CACHED_VERSION</svg>").unwrap();
+
+        let r2 = c
+            .get(format!("{}/sites/thumbnail?domain=thumbcache.local", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.text().await.unwrap(), "<svg>CACHED_VERSION</svg>");
+
+        // Manual refresh=1 regenerates and overwrites cache
+        let r3 = c
+            .get(format!("{}/sites/thumbnail?domain=thumbcache.local&refresh=1", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), StatusCode::OK);
+        let body3 = r3.text().await.unwrap();
+        assert!(body3.contains("thumbcache.local"));
+        assert_ne!(body3, "<svg>CACHED_VERSION</svg>");
+
+        // Deleting site with keep_files=true removes registration & thumb cache, keeps folder & marker.txt
+        let del: serde_json::Value = c
+            .delete(format!("{}/sites/{}?keep_files=true", base, site.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(del["success"], true);
+        assert_eq!(del["kept_files"], true);
+        assert!(site_dir.join("marker.txt").is_file());
+        assert!(!bin_path.exists());
 
         srv.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);

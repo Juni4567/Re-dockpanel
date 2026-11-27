@@ -33,6 +33,7 @@ export interface GlobalNotification {
   message: string;
   title?: string;
   details?: string;
+  logs?: string[];
   meta?: NotificationMeta;
   createdAt: number;
   updatedAt?: number;
@@ -183,6 +184,71 @@ function formatRelativeAge(createdAt: number, nowMs: number): string {
   return `${Math.floor(mins / 60)}h ago`;
 }
 
+function appendUniqueLog(existing: string[], line: string): string[] {
+  const clean = line.trim();
+  if (!clean) return existing;
+  const msgPart = clean.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, "").toLowerCase();
+  if (
+    existing.some((e) => {
+      const prevPart = e.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, "").toLowerCase();
+      return prevPart === msgPart;
+    })
+  ) {
+    return existing;
+  }
+  return [...existing, clean].slice(-25);
+}
+
+function buildInitialLogs(
+  nowMs: number,
+  message: string,
+  details?: string,
+  meta?: NotificationMeta
+): string[] {
+  const clock = formatClockTime(nowMs);
+  const stamp = clock ? `[${clock}] ` : "";
+  let logs: string[] = [];
+  if (details) {
+    for (const rawLine of details.split("\n")) {
+      const t = rawLine.trim();
+      if (!t || t.startsWith("──")) continue;
+      if (/^\[?\d{2}:\d{2}:\d{2}\]?/.test(t)) {
+        logs = appendUniqueLog(logs, t);
+      } else if (
+        t.startsWith("Operation:") ||
+        t.startsWith("Target:") ||
+        t.startsWith("Request:") ||
+        t.startsWith("HTTP Code:") ||
+        t.startsWith("Action:") ||
+        t.startsWith("Folder:") ||
+        t.startsWith("Dump:") ||
+        t.startsWith("Error:")
+      ) {
+        logs = appendUniqueLog(logs, `${stamp}${t}`);
+      }
+    }
+  }
+  if (meta?.endpoint && !logs.some((l) => l.includes(meta.endpoint!))) {
+    logs = appendUniqueLog(
+      logs,
+      `${stamp}${meta.method || "API"} /api${meta.endpoint}${
+        meta.statusCode !== undefined ? ` -> HTTP ${meta.statusCode}` : ""
+      }${meta.durationMs !== undefined ? ` (${meta.durationMs}ms)` : ""}`
+    );
+  }
+  if (message.trim()) {
+    logs = appendUniqueLog(logs, `${stamp}${message.trim()}`);
+  }
+  return logs;
+}
+
+function mergeSeverity(prevType: NotificationType, nextType: NotificationType): NotificationType {
+  if (prevType === "error" || nextType === "error") return "error";
+  if (nextType === "warn" || prevType === "warn") return "warn";
+  if (nextType === "success" || prevType === "success") return "success";
+  return nextType;
+}
+
 export function NotificationProvider({ children }: { children: ReactNode }) {
   const [notifications, setNotifications] = useState<GlobalNotification[]>([]);
 
@@ -198,71 +264,130 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
       const autoDismissMs = defaultAutoDismissMs(type, meta);
 
       setNotifications((prev) => {
-        // 1. Exact dedupeKey match inside recent window (prevents SSE replay duplicates)
+        const incomingTarget = normalizeMatchText(meta?.target);
+        const incomingCat = normalizeMatchText(meta?.category);
+        const incomingMsg = normalizeMatchText(message);
+        const incomingTitle = normalizeMatchText(title);
+
+        // Find an existing active notification to coalesce with so multiple
+        // events (e.g., UI action + backend SSE broadcast, or progress -> complete)
+        // merge into ONE card with a consolidated brief log timeline.
+        let matchIdx = -1;
         if (meta?.dedupeKey) {
-          const existingIdx = prev.findIndex((n) => n.meta?.dedupeKey === meta.dedupeKey);
-          if (existingIdx >= 0) {
-            const copy = [...prev];
-            copy[existingIdx] = {
-              ...copy[existingIdx],
-              type,
-              message,
-              title: title || copy[existingIdx].title,
-              details: details || copy[existingIdx].details,
-              meta: { ...copy[existingIdx].meta, ...meta },
-              updatedAt: now,
-            };
-            return copy;
-          }
+          matchIdx = prev.findIndex((n) => n.meta?.dedupeKey === meta.dedupeKey);
         }
 
-        // 2. Real-time SSE event enrichment: if a manual toast for the same target/action
-        // fired within the last 3.5 seconds, enrich it with server confirmation & backend details
-        // rather than popping a confusing duplicate card.
-        if (meta?.live) {
-          const incomingTarget = normalizeMatchText(meta.target);
-          const incomingMsg = normalizeMatchText(message);
-          const matchIdx = prev.findIndex((n) => {
-            if (now - n.createdAt > 3500) return false;
-            if (n.type !== type && !(n.type === "info" && type === "success")) return false;
+        if (matchIdx < 0) {
+          matchIdx = prev.findIndex((n) => {
+            const ageMs = now - (n.updatedAt || n.createdAt);
+            if (ageMs > 15000) return false;
+            // Respect explicit distinct non-empty dedupeKeys (e.g. separate bulk sites)
+            if (
+              meta?.dedupeKey &&
+              n.meta?.dedupeKey &&
+              meta.dedupeKey !== n.meta.dedupeKey
+            ) {
+              return false;
+            }
             const prevTarget = normalizeMatchText(n.meta?.target);
-            if (incomingTarget && prevTarget && incomingTarget === prevTarget) return true;
-            if (incomingTarget && normalizeMatchText(n.message).includes(incomingTarget)) return true;
-            if (incomingMsg && normalizeMatchText(n.message) === incomingMsg) return true;
+            const prevCat = normalizeMatchText(n.meta?.category);
+            const prevMsg = normalizeMatchText(n.message);
+            const prevTitle = normalizeMatchText(n.title);
+
+            // Exact normalized duplicate within window
+            if (incomingMsg && prevMsg === incomingMsg && incomingTarget === prevTarget) {
+              return true;
+            }
+
+            // Bidirectional action <-> live-sse or status progression match for same target/category
+            const compatibleCategory =
+              !incomingCat || !prevCat || incomingCat === prevCat || incomingCat === "site" || prevCat === "site";
+            const oneIsLiveOrAction =
+              Boolean(meta?.live) || Boolean(n.meta?.live) || meta?.source !== n.meta?.source;
+
+            if (incomingTarget && prevTarget && incomingTarget === prevTarget && compatibleCategory) {
+              if (oneIsLiveOrAction) return true;
+              if (n.type === "info" && type !== "info") return true;
+              if (incomingTitle && prevTitle && incomingTitle === prevTitle) return true;
+            }
+
+            if (incomingTarget && prevMsg.includes(incomingTarget) && oneIsLiveOrAction && ageMs <= 8000) {
+              return true;
+            }
+            if (prevTarget && incomingMsg.includes(prevTarget) && oneIsLiveOrAction && ageMs <= 8000) {
+              return true;
+            }
             return false;
           });
-
-          if (matchIdx >= 0) {
-            const existing = prev[matchIdx];
-            const mergedDetails =
-              details && existing.details && details !== existing.details
-                ? `${existing.details}\n\n── Server Event Stream ──\n${details}`
-                : details || existing.details;
-            const copy = [...prev];
-            copy[matchIdx] = {
-              ...existing,
-              type: existing.type === "info" && type === "success" ? "success" : existing.type,
-              title: existing.title || title,
-              details: mergedDetails,
-              updatedAt: now,
-              meta: {
-                ...existing.meta,
-                category: meta.category || existing.meta?.category,
-                target: meta.target || existing.meta?.target,
-                confirmedByServer: true,
-                live: true,
-              },
-            };
-            return copy;
-          }
         }
 
+        if (matchIdx >= 0) {
+          const existing = prev[matchIdx];
+          const nextType = mergeSeverity(existing.type, type);
+          const mergedAutoDismissMs =
+            nextType === "error"
+              ? 0
+              : Math.max(existing.autoDismissMs || 0, defaultAutoDismissMs(nextType, meta));
+
+          let mergedLogs = existing.logs ? [...existing.logs] : [];
+          for (const l of buildInitialLogs(now, message, details, meta)) {
+            mergedLogs = appendUniqueLog(mergedLogs, l);
+          }
+
+          const mergedDetails =
+            details && existing.details && details !== existing.details
+              ? existing.details.includes(details)
+                ? existing.details
+                : `${existing.details}\n\n── ${meta?.live ? "Server Event Stream" : "Action Update"} ──\n${details}`
+              : details || existing.details;
+
+          // Prefer explicit terminal / rich frontend messages over generic filler, or advance info -> final state
+          const nextMessage =
+            nextType === "error"
+              ? type === "error"
+                ? message
+                : existing.message
+              : meta?.source === "live-sse" && existing.meta?.source === "action" && existing.type === type
+              ? existing.message
+              : message || existing.message;
+
+          const copy = [...prev];
+          copy[matchIdx] = {
+            ...existing,
+            type: nextType,
+            title:
+              nextType === "error" && type === "error"
+                ? title || existing.title
+                : existing.meta?.source === "action" && existing.type === nextType
+                ? existing.title || title
+                : title || existing.title,
+            message: nextMessage,
+            details: mergedDetails,
+            logs: mergedLogs,
+            updatedAt: now,
+            autoDismissMs: mergedAutoDismissMs,
+            pinned: nextType === "error" ? true : existing.pinned,
+            meta: {
+              ...existing.meta,
+              ...meta,
+              category: meta?.category || existing.meta?.category,
+              target: meta?.target || existing.meta?.target,
+              confirmedByServer: Boolean(existing.meta?.confirmedByServer || meta?.live),
+              live: Boolean(existing.meta?.live || meta?.live),
+              dedupeKey: meta?.dedupeKey || existing.meta?.dedupeKey,
+            },
+          };
+          return copy;
+        }
+
+        const initialLogs = buildInitialLogs(now, message, details, meta);
         const next: GlobalNotification = {
           id: `${now.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
           type,
           message,
           title,
           details,
+          logs: initialLogs,
           meta: {
             timestamp: new Date(now).toISOString(),
             ...meta,
@@ -522,11 +647,24 @@ function NotificationCard({
       metaLines.push("");
       metaLines.push(item.details);
     }
+    if (item.logs && item.logs.length > 0) {
+      metaLines.push("");
+      metaLines.push("── Event Log ──");
+      for (const l of item.logs) metaLines.push(l);
+    }
     return metaLines.join("\n");
   })();
 
+  const briefLogs = (item.logs && item.logs.length > 0 ? item.logs : []).slice(-3);
+  const fullDetailsText = item.details
+    ? item.meta?.endpoint && !item.details.includes("Request:")
+      ? `${item.details}\n\n── Request Telemetry ──\n${item.meta.method || "API"} /api${item.meta.endpoint}${item.meta.statusCode !== undefined ? ` -> HTTP ${item.meta.statusCode}` : ""}${item.meta.durationMs !== undefined ? ` (${item.meta.durationMs}ms)` : ""}`
+      : item.details
+    : diagnosticDump;
+
   const hasRichDetails = Boolean(
     item.details ||
+      (item.logs && item.logs.length > 0) ||
       item.meta?.endpoint ||
       item.meta?.statusCode !== undefined ||
       item.meta?.durationMs !== undefined
@@ -632,6 +770,21 @@ function NotificationCard({
                 </div>
               )}
 
+              {/* Brief real-time log strip (always visible cleanly, expandable below) */}
+              {briefLogs.length > 0 && !showDetails && (
+                <div className="mt-2 px-2.5 py-1.5 rounded-lg bg-dark-900/75 border border-dark-700/70 space-y-0.5">
+                  {briefLogs.map((line, idx) => (
+                    <div
+                      key={idx}
+                      className="text-[10.5px] font-mono text-dark-300 truncate leading-tight"
+                      title={line}
+                    >
+                      {line}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {/* Actions bar: Details toggle, Copy, Pin */}
               <div className="mt-2 flex items-center gap-3 flex-wrap">
                 {hasRichDetails && (
@@ -640,7 +793,11 @@ function NotificationCard({
                     onClick={() => setShowDetails((v) => !v)}
                     className="text-[11px] font-mono text-dark-300 hover:text-dark-50 underline underline-offset-2 transition-colors"
                   >
-                    {showDetails ? "Hide Details" : "Inspect Details"}
+                    {showDetails
+                      ? "Hide Details"
+                      : item.logs && item.logs.length > 1
+                      ? `Expand Details (${item.logs.length} logs)`
+                      : "Expand Details"}
                   </button>
                 )}
 
@@ -666,12 +823,11 @@ function NotificationCard({
               </div>
 
               {showDetails && hasRichDetails && (
-                <pre className="mt-2 p-2.5 bg-dark-950/90 text-dark-200 border border-dark-700/80 rounded-lg text-[11px] leading-relaxed font-mono overflow-x-auto max-h-48 whitespace-pre-wrap break-words select-text">
-                  {item.details
-                    ? item.meta?.endpoint && !item.details.includes("Request:")
-                      ? `${item.details}\n\n── Request Telemetry ──\n${item.meta.method || "API"} /api${item.meta.endpoint}${item.meta.statusCode !== undefined ? ` -> HTTP ${item.meta.statusCode}` : ""}${item.meta.durationMs !== undefined ? ` (${item.meta.durationMs}ms)` : ""}`
-                      : item.details
-                    : diagnosticDump}
+                <pre className="mt-2 p-2.5 bg-dark-950/90 text-dark-200 border border-dark-700/80 rounded-lg text-[11px] leading-relaxed font-mono overflow-x-auto max-h-56 whitespace-pre-wrap break-words select-text">
+                  {fullDetailsText}
+                  {item.logs && item.logs.length > 0 && !fullDetailsText.includes(item.logs[0])
+                    ? `\n\n── Timeline Logs (${item.logs.length}) ──\n${item.logs.join("\n")}`
+                    : ""}
                 </pre>
               )}
             </div>

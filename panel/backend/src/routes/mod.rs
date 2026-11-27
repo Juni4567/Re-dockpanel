@@ -1117,6 +1117,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/users/{id}/reset-2fa", post(users::reset_2fa))
         // Sites
         .route("/api/sites", get(sites::list).post(sites::create))
+        .route("/api/sites/thumbnail", get(sites::thumbnail))
         .route("/api/sites/metrics-overview", get(sites::metrics_overview))
         // Read-only, admin-only, and the ONLY site read that looks past
         // `user_id`. It is what makes `POST /api/sites/{id}/transfer` reversible

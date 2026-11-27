@@ -157,6 +157,7 @@ function SiteLifecycleToggle({
         {
           category: "site",
           target: domain,
+          dedupeKey: `site-runtime:${domain}`,
           endpoint: `/sites/${siteId}/${isRunning ? "stop" : "start"}`,
           method: "POST",
           statusCode: 200,

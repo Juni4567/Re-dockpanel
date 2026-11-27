@@ -11,7 +11,7 @@ import ConfirmDialog from "../components/ConfirmDialog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
 import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
-import SiteThumbnail from "../components/SiteThumbnail";
+import SiteThumbnail, { warmSiteThumbnailCache } from "../components/SiteThumbnail";
 import SiteFavicon from "../components/SiteFavicon";
 import DesktopSiteActions from "../components/DesktopSiteActions";
 import DiscoveredFoldersPanel, {
@@ -145,6 +145,7 @@ export default function Sites() {
   const [discoveredFolders, setDiscoveredFolders] = useState<DiscoveredFolder[]>([]);
   const [discoveredRootDbFiles, setDiscoveredRootDbFiles] = useState<DetectedDbFile[]>([]);
   const [scanningFolders, setScanningFolders] = useState(false);
+  const [hasScannedFolders, setHasScannedFolders] = useState(false);
   const [failedFolderImports, setFailedFolderImports] = useState<Record<string, FailedFolderImportState>>({});
   const [compatPrompt, setCompatPrompt] = useState<{
     error: string;
@@ -239,6 +240,7 @@ export default function Sites() {
   const discoverFolders = () => {
     if (!isDesktopApp()) return;
     setScanningFolders(true);
+    setHasScannedFolders(true);
     api
       .get<{
         sites_dir?: string;
@@ -266,7 +268,6 @@ export default function Sites() {
         if (s?.default_sites_dir) setDefaultSitesDir(s.default_sites_dir);
       })
       .catch(() => {});
-    discoverFolders();
   }, []);
 
   useEffect(() => {
@@ -449,7 +450,7 @@ export default function Sites() {
       setBackupFrequency("daily");
       setBackupRetention(7);
       fetchSites();
-      discoverFolders();
+      if (hasScannedFolders) discoverFolders();
 
       await runAfterCreateFlow(created, {
         isConnectExisting,
@@ -538,6 +539,8 @@ export default function Sites() {
     }
   ) => {
     const memLimitMb = opts.memoryLimitMb ?? 1024;
+    // Fetch and cache site thumbnail once on site initialization
+    warmSiteThumbnailCache(created.domain, false);
     activeImportRef.current = opts.isConnectExisting
       ? {
           siteId: created.id,
@@ -626,7 +629,7 @@ export default function Sites() {
         `Uploading & importing database for ${created.domain}...`,
         "Database Import Started",
         `Site: ${created.domain}\nDump: ${dbFilename} (${fileSizeLabel})\nMemory Limit: ${memLimitMb <= 0 ? "Unlimited" : `${memLimitMb} MB`}`,
-        { category: "database", target: created.domain }
+        { category: "database", target: created.domain, dedupeKey: `site-op:${created.domain}` }
       );
 
       let uploadLog = initialUploadMsg;
@@ -748,7 +751,7 @@ export default function Sites() {
               });
             }
             fetchSites();
-            discoverFolders();
+            if (hasScannedFolders) discoverFolders();
           }
         } catch (impErr) {
           const snapshot = activeImportRef.current;
@@ -787,6 +790,7 @@ export default function Sites() {
             fallback: errMsg,
             category: "database",
             target: created.domain,
+            dedupeKey: `site-op:${created.domain}`,
           });
           showGlobalNotification(
             "error",
@@ -813,7 +817,7 @@ export default function Sites() {
           : `Creating local site ${created.domain}...`,
         opts.isConnectExisting ? "Importing Site" : "Provisioning Site",
         opts.folderPath ? `Domain: ${created.domain}\nFolder: ${opts.folderPath}` : `Domain: ${created.domain}`,
-        { category: "site", target: created.domain }
+        { category: "site", target: created.domain, dedupeKey: `site-op:${created.domain}` }
       );
     }
   };
@@ -843,7 +847,7 @@ export default function Sites() {
         return copy;
       });
       fetchSites();
-      discoverFolders();
+      if (hasScannedFolders) discoverFolders();
       await runAfterCreateFlow(created, {
         isConnectExisting: true,
         isWordPress: req.folder.inspection.is_wordpress,
@@ -920,7 +924,7 @@ export default function Sites() {
     try {
       const recreated = await api.post<Site>("/sites", body);
       fetchSites();
-      discoverFolders();
+      if (hasScannedFolders) discoverFolders();
       await runAfterCreateFlow(recreated, {
         isConnectExisting: snapshot.isConnectExisting,
         isWordPress: snapshot.isWordPress,
@@ -1036,6 +1040,20 @@ export default function Sites() {
               </svg>
             </button>
           </div>
+          {!isClient && isDesktopApp() && (
+            <button
+              type="button"
+              onClick={discoverFolders}
+              disabled={scanningFolders}
+              className="inline-flex items-center gap-1.5 px-3 py-2 bg-dark-800 border border-dark-600 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-700 disabled:opacity-50 transition-colors"
+              title={defaultSitesDir ? `Scan ${defaultSitesDir} for existing site folders` : "Scan local sites directory"}
+            >
+              <svg className={`w-4 h-4 ${scanningFolders ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 0 0-1.883 2.542l.857 6a2.25 2.25 0 0 0 2.227 1.932H19.05a2.25 2.25 0 0 0 2.227-1.932l.857-6a2.25 2.25 0 0 0-1.883-2.542m-16.5 0V6A2.25 2.25 0 0 1 6 3.75h3.879a1.5 1.5 0 0 1 1.06.44l2.122 2.12a1.5 1.5 0 0 0 1.06.44H18A2.25 2.25 0 0 1 20.25 9v.776" />
+              </svg>
+              {scanningFolders ? "Scanning..." : "Scan Local Folders"}
+            </button>
+          )}
           {!isClient && (
             <button
               onClick={() => setShowForm(!showForm)}
@@ -1092,7 +1110,45 @@ export default function Sites() {
         />
       )}
 
-      {/* Discovered folders in Default Websites Directory */}
+      {/* Manual local folder scan trigger + Discovered folders in Default Websites Directory */}
+      {isDesktopApp() && !isClient && !hasScannedFolders && discoveredFolders.length === 0 && !scanningFolders && (
+        <div className="mb-6 rounded-xl border border-dark-600/80 bg-dark-800/70 px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-dark-100">
+              Scan Default Websites Directory
+            </div>
+            <div className="text-xs font-mono text-dark-400 truncate mt-0.5" title={defaultSitesDir}>
+              {defaultSitesDir || "Configured local sites directory"} — Scan manually to discover and import existing folders &amp; SQL dumps.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={discoverFolders}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-accent-600 hover:bg-accent-500 text-white text-xs font-semibold transition-colors shrink-0"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+            </svg>
+            Scan Local Folder
+          </button>
+        </div>
+      )}
+
+      {isDesktopApp() && !isClient && hasScannedFolders && discoveredFolders.length === 0 && !scanningFolders && (
+        <div className="mb-6 rounded-xl border border-dark-700 bg-dark-800/50 px-4 py-2.5 flex items-center justify-between gap-3 flex-wrap text-xs text-dark-300">
+          <span className="truncate font-mono" title={defaultSitesDir}>
+            No unregistered folders found in {defaultSitesDir || "websites directory"}.
+          </span>
+          <button
+            type="button"
+            onClick={discoverFolders}
+            className="px-2.5 py-1 rounded border border-dark-600 bg-dark-800 hover:bg-dark-700 text-dark-200 transition-colors shrink-0"
+          >
+            Scan Again
+          </button>
+        </div>
+      )}
+
       {isDesktopApp() && !isClient && (
         <DiscoveredFoldersPanel
           sitesDir={defaultSitesDir}
@@ -1800,7 +1856,7 @@ export default function Sites() {
                             </div>
 
                             <div className="mb-3">
-                              <SiteThumbnail domain={site.domain} className="w-full h-28 rounded border border-dark-600 object-cover" />
+                              <SiteThumbnail domain={site.domain} showRefresh className="w-full h-28 rounded border border-dark-600 object-cover" />
                             </div>
 
                             <div className="space-y-1.5 text-xs text-dark-200 mb-4">

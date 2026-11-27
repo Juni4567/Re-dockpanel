@@ -457,7 +457,9 @@ pub async fn plugin_action(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     const ALLOWED_PLUGIN_ACTIONS: &[&str] = &[
         "activate",
+        "enable",
         "deactivate",
+        "disable",
         "delete",
         "update",
         "install",
@@ -492,6 +494,9 @@ pub async fn theme_action(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     const ALLOWED_THEME_ACTIONS: &[&str] = &[
         "activate",
+        "enable",
+        "deactivate",
+        "disable",
         "delete",
         "update",
         "install",

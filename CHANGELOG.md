@@ -4,6 +4,24 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.256.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.256.0 — Direct-DB WordPress Recovery Engine, Manual Folder Scan, Keep-Files Deletion, Coalesced Alerts & Cached Site Previews
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.256.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added & Changed
+- **Resilient Direct-DB WordPress Toolkit Engine (`wordpress.rs`, `panel/agent/src/services/wordpress.rs`, `panel/backend/src/routes/wordpress.rs`, `WordPress.tsx`, `WordPressToolkit.tsx`):**
+  - Bypassed `wp-load.php` / `wp-config.php` execution for listing plugins & themes, activating/deactivating themes, toggling/deactivating plugins, auto-updates, `blog_public` search indexing, setup/password resets, transient clearing, and WP-CLI commands so fatal PHP errors in broken themes/plugins (`Cannot redeclare function ...`) never break toolkit recovery.
+  - Added theme `deactivate` support (auto-switching directly in DB to a healthy fallback theme) and UI controls across Desktop and Cloud.
+- **Manual Local Folder Scan Trigger (`Sites.tsx`):**
+  - Disabled automatic folder scanning on Sites page load; added manual **Scan Local Folders** / **Scan Local Folder** triggers showing the configured Default Websites Directory.
+- **Preserve Website Folder & Files on Deletion (`SiteDetail.tsx`, `ConfirmDialog.tsx`, `panel/backend/src/routes/sites.rs`, `panel/agent/src/routes/nginx.rs`):**
+  - Added a **"Delete website folder and files from disk"** checkbox (checked by default) in the Delete Site confirmation dialog so users can uncheck it to unregister a site while keeping its files on disk (`?keep_files=true`) across Desktop and Cloud.
+- **Coalesced Single-Card Alerts with Brief Logs & Expandable Details (`NotificationContext.tsx`, `DesktopSiteActions.tsx`, `Sites.tsx`, `SiteDetail.tsx`, `WordPress.tsx`):**
+  - Implemented bidirectional coalescing (`action` ↔ `live-sse`) so one user action produces a single dynamic notification card with a timestamped brief log strip and an expandable full diagnostic log view.
+- **Cached Website Preview Thumbnails (`main.rs`, `panel/backend/src/routes/sites.rs`, `panel/backend/src/routes/mod.rs`, `SiteThumbnail.tsx`):**
+  - Added persistent disk-cached `/api/sites/thumbnail` endpoints and client cache versioning, warming the site preview once on initialization and supporting manual re-fetch via the refresh icon.
+
 ## [2.255.0] - 2026-11-27
 
 ### Release: DockPanel Desktop v2.255.0 — Folder Discovery, Recursive SQL Picker, Confirmation-First SQL Compat Fixer, DB Cleanup/Optimize, & Admin Git Repo Management

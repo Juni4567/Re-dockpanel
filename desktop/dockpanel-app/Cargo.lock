@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "dockpanel-app"
-version = "2.255.0"
+version = "2.256.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

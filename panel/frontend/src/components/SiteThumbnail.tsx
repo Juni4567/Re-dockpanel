@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 interface SiteThumbnailProps {
   domain: string;
@@ -8,47 +8,101 @@ interface SiteThumbnailProps {
   showRefresh?: boolean;
 }
 
+const THUMB_VERSION_PREFIX = "dp:site-thumb-ver:v1:";
+const THUMB_REFRESH_EVENT = "dp:site-thumb-refresh";
+
+function readCachedThumbVersion(cleanDomain: string): string {
+  try {
+    return localStorage.getItem(`${THUMB_VERSION_PREFIX}${cleanDomain}`) || "1";
+  } catch {
+    return "1";
+  }
+}
+
+export function warmSiteThumbnailCache(domain: string, forceRefresh = false): void {
+  const cleanDomain = domain.trim().toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, "");
+  if (!cleanDomain) return;
+  const ver = forceRefresh ? String(Date.now()) : readCachedThumbVersion(cleanDomain);
+  if (forceRefresh) {
+    try {
+      localStorage.setItem(`${THUMB_VERSION_PREFIX}${cleanDomain}`, ver);
+    } catch {
+      // Ignore storage quota issues
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent(THUMB_REFRESH_EVENT, { detail: { domain: cleanDomain, version: ver } })
+      );
+    }
+  }
+  const url = `/api/sites/thumbnail?domain=${encodeURIComponent(cleanDomain)}${
+    forceRefresh ? "&refresh=1" : ""
+  }&v=${encodeURIComponent(ver)}`;
+  if (typeof fetch === "function") {
+    fetch(url, { credentials: "same-origin" }).catch(() => {});
+  }
+}
+
 export default function SiteThumbnail({
   domain,
   className = "w-12 h-8",
-  w = 600,
   alt,
   showRefresh = false,
 }: SiteThumbnailProps) {
-  const [stage, setStage] = useState<"microlink" | "thum" | "unavatar" | "googleFavicon" | "placeholder">("microlink");
-  const [loaded, setLoaded] = useState(false);
-  const [cacheBuster, setCacheBuster] = useState(Date.now());
-
   const cleanDomain = domain.trim().toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, "");
-  
-  // 1. High-resolution Headless Chrome Screenshot via Microlink API
-  const microlinkUrl = `https://api.microlink.io?url=https%3A%2F%2F${cleanDomain}&screenshot=true&meta=false&embed=screenshot.url&t=${cacheBuster}`;
-  // 2. Fast Fallback Screenshot via Thum.io
-  const thumUrl = `https://image.thum.io/get/width/${w}/crop/400/noanimate/https://${cleanDomain}?t=${cacheBuster}`;
-  // 3. Fallback High-Res Icon/Favicon via Unavatar
-  const unavatarUrl = `https://unavatar.io/${cleanDomain}?fallback=false&t=${cacheBuster}`;
-  // 4. Fallback Google Favicon
-  const googleFaviconUrl = `https://www.google.com/s2/favicons?domain=${cleanDomain}&sz=128`;
+  const [stage, setStage] = useState<"backend" | "placeholder">("backend");
+  const [loaded, setLoaded] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [forceRefreshOnce, setForceRefreshOnce] = useState(false);
+  const [version, setVersion] = useState<string>(() => readCachedThumbVersion(cleanDomain));
+
+  useEffect(() => {
+    setVersion(readCachedThumbVersion(cleanDomain));
+    setStage("backend");
+    setLoaded(false);
+    setForceRefreshOnce(false);
+  }, [cleanDomain]);
+
+  useEffect(() => {
+    const onRefresh = (e: Event) => {
+      const detail = (e as CustomEvent<{ domain?: string; version?: string }>).detail;
+      if (detail?.domain === cleanDomain && detail.version) {
+        setVersion(detail.version);
+        setStage("backend");
+        setLoaded(false);
+      }
+    };
+    window.addEventListener(THUMB_REFRESH_EVENT, onRefresh);
+    return () => window.removeEventListener(THUMB_REFRESH_EVENT, onRefresh);
+  }, [cleanDomain]);
+
+  const backendUrl = `/api/sites/thumbnail?domain=${encodeURIComponent(cleanDomain)}${
+    forceRefreshOnce ? "&refresh=1" : ""
+  }&v=${encodeURIComponent(version)}`;
 
   const handleRefresh = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    const nextVer = String(Date.now());
+    try {
+      localStorage.setItem(`${THUMB_VERSION_PREFIX}${cleanDomain}`, nextVer);
+    } catch {
+      // Ignore storage errors
+    }
+    setRefreshing(true);
     setLoaded(false);
-    setStage("microlink");
-    setCacheBuster(Date.now());
+    setForceRefreshOnce(true);
+    setStage("backend");
+    setVersion(nextVer);
+    window.dispatchEvent(
+      new CustomEvent(THUMB_REFRESH_EVENT, { detail: { domain: cleanDomain, version: nextVer } })
+    );
   };
 
   const handleImageError = () => {
     setLoaded(false);
-    if (stage === "microlink") {
-      setStage("thum");
-    } else if (stage === "thum") {
-      setStage("unavatar");
-    } else if (stage === "unavatar") {
-      setStage("googleFavicon");
-    } else {
-      setStage("placeholder");
-    }
+    setRefreshing(false);
+    setStage("placeholder");
   };
 
   const initial = cleanDomain.charAt(0).toUpperCase() || "W";
@@ -65,12 +119,25 @@ export default function SiteThumbnail({
 
   const refreshBtn = showRefresh ? (
     <button
+      type="button"
       onClick={handleRefresh}
-      className="absolute bottom-2 right-2 p-1.5 bg-dark-900/80 hover:bg-dark-900 text-white rounded shadow-md opacity-80 hover:opacity-100 transition-opacity z-10"
-      title="Refresh thumbnail preview"
+      disabled={refreshing}
+      className="absolute bottom-1.5 right-1.5 p-1.5 bg-dark-900/85 hover:bg-dark-900 text-white rounded-md shadow-md opacity-85 hover:opacity-100 transition-opacity z-20 disabled:opacity-60"
+      title="Refresh cached website preview"
+      aria-label={`Refresh preview for ${cleanDomain}`}
     >
-      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+      <svg
+        className={`w-3.5 h-3.5 ${refreshing ? "animate-spin" : ""}`}
+        fill="none"
+        viewBox="0 0 24 24"
+        stroke="currentColor"
+      >
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+        />
       </svg>
     </button>
   ) : null;
@@ -87,31 +154,10 @@ export default function SiteThumbnail({
     );
   }
 
-  if (stage === "unavatar" || stage === "googleFavicon") {
-    const currentFaviconUrl = stage === "unavatar" ? unavatarUrl : googleFaviconUrl;
-    return (
-      <div
-        className={`rounded border border-dark-600/60 bg-dark-800/90 shrink-0 overflow-hidden relative shadow-xs flex items-center justify-center ${className}`}
-        title={`${domain}`}
-      >
-        <img
-          src={currentFaviconUrl}
-          alt={alt || `${domain} favicon`}
-          loading="lazy"
-          onError={handleImageError}
-          className="w-10 h-10 object-contain drop-shadow"
-        />
-        {refreshBtn}
-      </div>
-    );
-  }
-
-  const currentUrl = stage === "microlink" ? microlinkUrl : thumUrl;
-
   return (
     <div
       className={`rounded border border-dark-600/60 bg-dark-800/90 shrink-0 overflow-hidden relative shadow-xs flex items-center justify-center group ${className}`}
-      title={`${domain} live preview`}
+      title={`${domain} cached preview`}
     >
       {!loaded && (
         <div className="absolute inset-0 bg-dark-700/50 animate-pulse flex items-center justify-center">
@@ -122,17 +168,13 @@ export default function SiteThumbnail({
         </div>
       )}
       <img
-        src={currentUrl}
-        alt={alt || `${domain} screenshot preview`}
+        src={backendUrl}
+        alt={alt || `${domain} website preview`}
         loading="lazy"
-        onLoad={(e) => {
-          // If image is suspiciously tiny (e.g. 1x1 blank tracker or failed thumbnail), move to next stage
-          const img = e.currentTarget;
-          if (img.naturalWidth > 0 && img.naturalWidth < 40 && img.naturalHeight < 40) {
-            handleImageError();
-          } else {
-            setLoaded(true);
-          }
+        onLoad={() => {
+          setLoaded(true);
+          setRefreshing(false);
+          setForceRefreshOnce(false);
         }}
         onError={handleImageError}
         className={`w-full h-full object-cover object-top transition-all duration-300 ${

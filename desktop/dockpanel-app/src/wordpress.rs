@@ -1267,6 +1267,818 @@ $_SERVER['REQUEST_URI'] = '/';
     Ok(val)
 }
 
+#[derive(Debug, Clone)]
+struct WpDbCreds {
+    is_sqlite: bool,
+    sqlite_path: String,
+    db_name: String,
+    db_user: String,
+    db_pass: String,
+    db_host: String,
+    db_port: u16,
+    table_prefix: String,
+}
+
+fn parse_wp_host_port(raw_host: &str) -> (String, u16) {
+    let trimmed = raw_host.trim();
+    if let Some((h, p)) = trimmed.rsplit_once(':') {
+        if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(port) = p.parse::<u16>() {
+                let host = if h.eq_ignore_ascii_case("localhost") || h.is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    h.to_string()
+                };
+                return (host, port);
+            }
+        }
+    }
+    let port = [3306u16, 3307, 3308]
+        .into_iter()
+        .find(|&p| crate::mariadb::is_port_accepting_tcp(p))
+        .unwrap_or(3306);
+    let host = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    (host, port)
+}
+
+fn read_wp_db_creds(site_dir: &Path) -> Option<WpDbCreds> {
+    let cfg_path = site_dir.join("wp-config.php");
+    if !cfg_path.is_file() {
+        return None;
+    }
+    let cfg = fs::read_to_string(&cfg_path).unwrap_or_default();
+    let table_prefix = parse_wp_table_prefix(&cfg).unwrap_or_else(|| "wp_".to_string());
+    let sqlite_file = site_dir.join("wp-content").join("database").join(".ht.sqlite");
+    let is_sqlite = sqlite_file.is_file()
+        || read_wp_config_string(&cfg, "DB_ENGINE").as_deref() == Some("sqlite");
+
+    if is_sqlite {
+        if !sqlite_file.is_file() {
+            return None;
+        }
+        return Some(WpDbCreds {
+            is_sqlite: true,
+            sqlite_path: sqlite_file.to_string_lossy().to_string(),
+            db_name: String::new(),
+            db_user: String::new(),
+            db_pass: String::new(),
+            db_host: String::new(),
+            db_port: 0,
+            table_prefix,
+        });
+    }
+
+    let db_name = read_wp_config_string(&cfg, "DB_NAME")?;
+    let db_user = read_wp_config_string(&cfg, "DB_USER").unwrap_or_else(|| "root".to_string());
+    let db_pass = read_wp_config_string(&cfg, "DB_PASSWORD").unwrap_or_default();
+    let raw_host = read_wp_config_string(&cfg, "DB_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+    let (db_host, db_port) = parse_wp_host_port(&raw_host);
+
+    Some(WpDbCreds {
+        is_sqlite: false,
+        sqlite_path: String::new(),
+        db_name,
+        db_user,
+        db_pass,
+        db_host,
+        db_port,
+        table_prefix,
+    })
+}
+
+/// Runs a standalone Direct-DB PHP PDO helper for `site_dir` WITHOUT ever loading `wp-config.php`,
+/// `wp-load.php`, `wp-settings.php`, active themes, or plugins — immune to broken PHP/theme errors.
+fn run_wp_direct_db_php(
+    site_dir: &Path,
+    action: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let creds = read_wp_db_creds(site_dir)
+        .ok_or_else(|| "WordPress database credentials could not be determined".to_string())?;
+    let php_exe = crate::state::find_php_binary(None)
+        .ok_or_else(|| "No PHP runtime installed".to_string())?;
+
+    let script = r#"<?php
+error_reporting(E_ERROR | E_PARSE);
+$siteDir   = getenv('DOCKPANEL_SITE_DIR') ?: '';
+$dbType    = getenv('DOCKPANEL_DB_TYPE') ?: 'mysql';
+$sqlitePath = getenv('DOCKPANEL_SQLITE_PATH') ?: '';
+$dbName    = getenv('DOCKPANEL_DB_NAME') ?: '';
+$dbUser    = getenv('DOCKPANEL_DB_USER') ?: 'root';
+$dbPass    = getenv('DOCKPANEL_DB_PASS') ?: '';
+$dbHost    = getenv('DOCKPANEL_DB_HOST') ?: '127.0.0.1';
+$dbPort    = (int)(getenv('DOCKPANEL_DB_PORT') ?: 3306);
+$prefPfx   = getenv('DOCKPANEL_DB_PREFIX') ?: 'wp_';
+$action    = getenv('DOCKPANEL_WP_ACTION') ?: '';
+$params    = json_decode(getenv('DOCKPANEL_WP_PARAMS') ?: '{}', true);
+if (!is_array($params)) $params = [];
+
+function dp_fail($msg) {
+    echo json_encode(['ok' => false, 'error' => (string)$msg]);
+    exit;
+}
+
+function dp_connect($dbType, $sqlitePath, $dbName, $dbUser, $dbPass, $dbHost, $dbPort) {
+    if ($dbType === 'sqlite') {
+        $pdo = new PDO('sqlite:' . $sqlitePath);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        return [$pdo, true];
+    }
+    $hosts = array_values(array_unique([$dbHost ?: '127.0.0.1', '127.0.0.1', 'localhost']));
+    $lastErr = null;
+    foreach ($hosts as $h) {
+        $dsn = "mysql:host={$h};port={$dbPort};dbname={$dbName};charset=utf8mb4";
+        try {
+            $pdo = new PDO($dsn, $dbUser, $dbPass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            return [$pdo, false];
+        } catch (Throwable $e) {
+            $lastErr = $e;
+        }
+        if ($dbUser !== 'root' || $dbPass !== '') {
+            try {
+                $pdo = new PDO($dsn, 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+                return [$pdo, false];
+            } catch (Throwable $e2) {}
+        }
+    }
+    throw $lastErr ?? new Exception('Could not connect to WordPress database');
+}
+
+function dp_ident($name, $isSqlite) {
+    $clean = preg_replace('/[^A-Za-z0-9_]/', '', $name);
+    return $isSqlite ? '"' . $clean . '"' : '`' . $clean . '`';
+}
+
+function dp_resolve_prefix(PDO $pdo, $isSqlite, $preferred) {
+    $clean = preg_replace('/[^A-Za-z0-9_]/', '', $preferred) ?: 'wp_';
+    if ($isSqlite) {
+        $rows = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%options'")->fetchAll(PDO::FETCH_COLUMN);
+    } else {
+        $rows = $pdo->query("SHOW TABLES LIKE '%options'")->fetchAll(PDO::FETCH_COLUMN);
+    }
+    $candidates = [];
+    foreach ($rows as $tbl) {
+        $tbl = (string)$tbl;
+        if ($tbl === $clean . 'options') return $clean;
+        if (str_ends_with($tbl, 'options')) {
+            $candidates[] = substr($tbl, 0, -strlen('options'));
+        }
+    }
+    foreach ($candidates as $c) {
+        if ($c === 'wp_' || str_ends_with($c, '_')) return $c;
+    }
+    return $candidates[0] ?? '';
+}
+
+function dp_get_option(PDO $pdo, $isSqlite, $prefix, $name, $default = null) {
+    $tbl = dp_ident($prefix . 'options', $isSqlite);
+    $st = $pdo->prepare("SELECT option_value FROM {$tbl} WHERE option_name = ? LIMIT 1");
+    $st->execute([$name]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    return $row ? $row['option_value'] : $default;
+}
+
+function dp_maybe_unserialize($raw) {
+    if (!is_string($raw)) return $raw;
+    $trimmed = trim($raw);
+    if ($trimmed === '') return $raw;
+    if (preg_match('/^(a|O|s|i|d|b|N):/', $trimmed) || $trimmed === 'b:0;') {
+        $val = @unserialize($raw, ['allowed_classes' => false]);
+        if ($val !== false || $trimmed === 'b:0;') return $val;
+    }
+    return $raw;
+}
+
+function dp_update_option(PDO $pdo, $isSqlite, $prefix, $name, $value, $autoload = 'yes') {
+    $tbl = dp_ident($prefix . 'options', $isSqlite);
+    $stored = (is_array($value) || is_object($value)) ? serialize($value) : (string)$value;
+    $st = $pdo->prepare("SELECT option_id FROM {$tbl} WHERE option_name = ? LIMIT 1");
+    $st->execute([$name]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    if ($row) {
+        $up = $pdo->prepare("UPDATE {$tbl} SET option_value = ? WHERE option_id = ?");
+        $up->execute([$stored, $row['option_id']]);
+    } else {
+        $ins = $pdo->prepare("INSERT INTO {$tbl} (option_name, option_value, autoload) VALUES (?, ?, ?)");
+        $ins->execute([$name, $stored, $autoload]);
+    }
+}
+
+function dp_delete_option(PDO $pdo, $isSqlite, $prefix, $name) {
+    $tbl = dp_ident($prefix . 'options', $isSqlite);
+    $st = $pdo->prepare("DELETE FROM {$tbl} WHERE option_name = ?");
+    $st->execute([$name]);
+}
+
+function dp_file_headers($file, $map) {
+    $fh = @fopen($file, 'rb');
+    if (!$fh) return [];
+    $data = fread($fh, 8192);
+    fclose($fh);
+    if ($data === false) return [];
+    $data = str_replace("\r", "\n", $data);
+    $out = [];
+    foreach ($map as $key => $header) {
+        if (preg_match('/^(?:[ \t]*<\?php)?[ \t\/*#@]*' . preg_quote($header, '/') . ':(.*)$/mi', $data, $m)) {
+            $val = trim(preg_replace('/\s*(?:\*\/|\?>).*/', '', $m[1]));
+            if ($val !== '') $out[$key] = $val;
+        }
+    }
+    return $out;
+}
+
+function dp_scan_plugins($siteDir) {
+    $dir = $siteDir . '/wp-content/plugins';
+    $plugins = [];
+    if (!is_dir($dir)) return $plugins;
+    $items = @scandir($dir) ?: [];
+    foreach ($items as $entry) {
+        if ($entry === '.' || $entry === '..' || $entry === 'index.php') continue;
+        $full = $dir . '/' . $entry;
+        if (is_file($full) && str_ends_with(strtolower($entry), '.php')) {
+            $h = dp_file_headers($full, ['Name' => 'Plugin Name', 'Version' => 'Version', 'Description' => 'Description', 'Author' => 'Author']);
+            if (!empty($h['Name'])) {
+                $plugins[$entry] = $h;
+            }
+        } elseif (is_dir($full)) {
+            $subItems = @scandir($full) ?: [];
+            foreach ($subItems as $sub) {
+                if (!str_ends_with(strtolower($sub), '.php')) continue;
+                $subFull = $full . '/' . $sub;
+                if (!is_file($subFull)) continue;
+                $h = dp_file_headers($subFull, ['Name' => 'Plugin Name', 'Version' => 'Version', 'Description' => 'Description', 'Author' => 'Author']);
+                if (!empty($h['Name'])) {
+                    $plugins[$entry . '/' . $sub] = $h;
+                    break;
+                }
+            }
+        }
+    }
+    ksort($plugins, SORT_NATURAL | SORT_FLAG_CASE);
+    return $plugins;
+}
+
+function dp_scan_themes($siteDir) {
+    $dir = $siteDir . '/wp-content/themes';
+    $themes = [];
+    if (!is_dir($dir)) return $themes;
+    $items = @scandir($dir) ?: [];
+    foreach ($items as $entry) {
+        if ($entry === '.' || $entry === '..') continue;
+        $full = $dir . '/' . $entry;
+        $style = $full . '/style.css';
+        if (is_dir($full) && is_file($style)) {
+            $h = dp_file_headers($style, ['Name' => 'Theme Name', 'Version' => 'Version', 'Template' => 'Template', 'Description' => 'Description', 'Author' => 'Author']);
+            $themes[$entry] = $h;
+        } elseif (is_dir($full)) {
+            $themes[$entry] = ['Name' => $entry, 'Version' => '1.0'];
+        }
+    }
+    ksort($themes, SORT_NATURAL | SORT_FLAG_CASE);
+    return $themes;
+}
+
+function dp_resolve_plugin_file($plugins, $target) {
+    $t = ltrim(str_replace('\\', '/', trim((string)$target)), '/');
+    if (isset($plugins[$t])) return $t;
+    $slug = preg_replace('/\.php$/i', '', explode('/', $t)[0]);
+    foreach ($plugins as $file => $_) {
+        if ($file === $slug . '.php' || str_starts_with($file, $slug . '/')) return $file;
+    }
+    return $t;
+}
+
+function dp_pick_fallback_theme($themes, $avoidSlug) {
+    $avoid = strtolower($avoidSlug);
+    $avoidTemplate = strtolower((string)($themes[$avoidSlug]['Template'] ?? ''));
+    $preferred = ['twentytwentyfive', 'twentytwentyfour', 'twentytwentythree', 'twentytwentytwo', 'twentytwentyone', 'twentytwenty'];
+    foreach ($preferred as $cand) {
+        if (isset($themes[$cand]) && strtolower($cand) !== $avoid) {
+            return $cand;
+        }
+    }
+    // Prefer a standalone non-child, non-parent theme
+    foreach ($themes as $slug => $meta) {
+        $sLow = strtolower($slug);
+        if ($sLow === $avoid || ($avoidTemplate !== '' && $sLow === $avoidTemplate)) continue;
+        $t = strtolower((string)($meta['Template'] ?? ''));
+        if ($t === '' || $t !== $avoid) return $slug;
+    }
+    foreach ($themes as $slug => $_) {
+        if (strtolower($slug) !== $avoid) return $slug;
+    }
+    return null;
+}
+
+function dp_hash_password($siteDir, $plain) {
+    $phpass = $siteDir . '/wp-includes/class-phpass.php';
+    if (is_file($phpass)) {
+        require_once $phpass;
+        if (class_exists('PasswordHash')) {
+            $hasher = new PasswordHash(8, true);
+            $hash = $hasher->HashPassword($plain);
+            if (is_string($hash) && $hash !== '') return $hash;
+        }
+    }
+    return password_hash($plain, PASSWORD_BCRYPT);
+}
+
+try {
+    [$pdo, $isSqlite] = dp_connect($dbType, $sqlitePath, $dbName, $dbUser, $dbPass, $dbHost, $dbPort);
+    $prefix = dp_resolve_prefix($pdo, $isSqlite, $prefPfx);
+    if ($prefix === '') {
+        dp_fail('NO_WP_TABLES');
+    }
+
+    if ($action === 'list_plugins') {
+        $all = dp_scan_plugins($siteDir);
+        $activeRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'active_plugins', 'a:0:{}'));
+        $active = is_array($activeRaw) ? array_values(array_map('strval', $activeRaw)) : [];
+        $autoRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'auto_update_plugins', 'a:0:{}'));
+        $auto = is_array($autoRaw) ? array_values(array_map('strval', $autoRaw)) : [];
+        $updRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, '_site_transient_update_plugins', ''));
+        $resp = (is_object($updRaw) && isset($updRaw->response) && is_array($updRaw->response))
+            ? $updRaw->response
+            : ((is_array($updRaw) && isset($updRaw['response']) && is_array($updRaw['response'])) ? $updRaw['response'] : []);
+        $out = [];
+        foreach ($all as $file => $data) {
+            $hasUpdate = isset($resp[$file]) ? 'available' : 'none';
+            $out[] = [
+                'name' => $file,
+                'title' => $data['Name'] ?? $file,
+                'version' => $data['Version'] ?? '1.0.0',
+                'status' => in_array($file, $active, true) ? 'active' : 'inactive',
+                'update' => $hasUpdate,
+                'auto_update' => in_array($file, $auto, true) ? 'on' : 'off',
+            ];
+        }
+        echo json_encode(['ok' => true, 'items' => $out, 'prefix' => $prefix]);
+        exit;
+    }
+
+    if ($action === 'list_themes') {
+        $all = dp_scan_themes($siteDir);
+        $active = trim((string)dp_get_option($pdo, $isSqlite, $prefix, 'stylesheet', ''));
+        $autoRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'auto_update_themes', 'a:0:{}'));
+        $auto = is_array($autoRaw) ? array_values(array_map('strval', $autoRaw)) : [];
+        $updRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, '_site_transient_update_themes', ''));
+        $resp = (is_object($updRaw) && isset($updRaw->response) && is_array($updRaw->response))
+            ? $updRaw->response
+            : ((is_array($updRaw) && isset($updRaw['response']) && is_array($updRaw['response'])) ? $updRaw['response'] : []);
+        $out = [];
+        foreach ($all as $slug => $data) {
+            $hasUpdate = isset($resp[$slug]) ? 'available' : 'none';
+            $out[] = [
+                'name' => $slug,
+                'title' => $data['Name'] ?? $slug,
+                'version' => $data['Version'] ?? '1.0',
+                'status' => ($slug === $active) ? 'active' : 'inactive',
+                'update' => $hasUpdate,
+                'auto_update' => in_array($slug, $auto, true) ? 'on' : 'off',
+            ];
+        }
+        echo json_encode(['ok' => true, 'items' => $out, 'active_stylesheet' => $active, 'prefix' => $prefix]);
+        exit;
+    }
+
+    if ($action === 'plugin_action') {
+        $act = (string)($params['action'] ?? '');
+        $target = (string)($params['name'] ?? '');
+        $all = dp_scan_plugins($siteDir);
+        $file = dp_resolve_plugin_file($all, $target);
+        $activeRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'active_plugins', 'a:0:{}'));
+        $active = is_array($activeRaw) ? array_values(array_map('strval', $activeRaw)) : [];
+        $autoRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'auto_update_plugins', 'a:0:{}'));
+        $auto = is_array($autoRaw) ? array_values(array_map('strval', $autoRaw)) : [];
+
+        if ($act === 'activate' || $act === 'enable') {
+            if (!isset($all[$file])) {
+                dp_fail('Plugin not found: ' . $target);
+            }
+            if (!in_array($file, $active, true)) {
+                $active[] = $file;
+                sort($active);
+                dp_update_option($pdo, $isSqlite, $prefix, 'active_plugins', array_values($active));
+            }
+            $msg = "Activated plugin '{$file}' directly in database";
+        } elseif ($act === 'deactivate' || $act === 'disable') {
+            $slug = explode('/', $file)[0];
+            $active = array_values(array_filter($active, fn($x) => $x !== $file && $x !== $target && !str_starts_with($x, $slug . '/')));
+            dp_update_option($pdo, $isSqlite, $prefix, 'active_plugins', $active);
+            $msg = "Disabled plugin '{$file}' directly in database";
+        } elseif ($act === 'deactivate-all' || $act === 'disable-all') {
+            dp_update_option($pdo, $isSqlite, $prefix, 'active_plugins', []);
+            $msg = "Disabled all plugins directly in database";
+        } elseif ($act === 'enable-autoupdate') {
+            if (!in_array($file, $auto, true)) $auto[] = $file;
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_plugins', array_values($auto));
+            $msg = "Enabled auto-update for plugin '{$file}' directly in database";
+        } elseif ($act === 'disable-autoupdate') {
+            $slug = explode('/', $file)[0];
+            $auto = array_values(array_filter($auto, fn($x) => $x !== $file && $x !== $target && !str_starts_with($x, $slug . '/')));
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_plugins', $auto);
+            $msg = "Disabled auto-update for plugin '{$file}' directly in database";
+        } elseif ($act === 'enable-all-autoupdate') {
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_plugins', array_keys($all));
+            $msg = "Enabled auto-updates for all plugins directly in database";
+        } elseif ($act === 'disable-all-autoupdate') {
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_plugins', []);
+            $msg = "Disabled auto-updates for all plugins directly in database";
+        } elseif ($act === 'cleanup_removed') {
+            $slug = explode('/', $file)[0];
+            $active = array_values(array_filter($active, fn($x) => $x !== $file && !str_starts_with($x, $slug . '/')));
+            $auto = array_values(array_filter($auto, fn($x) => $x !== $file && !str_starts_with($x, $slug . '/')));
+            dp_update_option($pdo, $isSqlite, $prefix, 'active_plugins', $active);
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_plugins', $auto);
+            $msg = "Removed plugin DB entries for '{$slug}'";
+        } else {
+            dp_fail('Unsupported direct-DB plugin action: ' . $act);
+        }
+        echo json_encode(['ok' => true, 'direct_db' => true, 'resolved' => $file, 'message' => $msg]);
+        exit;
+    }
+
+    if ($action === 'theme_action') {
+        $act = (string)($params['action'] ?? '');
+        $target = trim((string)($params['name'] ?? ''));
+        $all = dp_scan_themes($siteDir);
+        $autoRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'auto_update_themes', 'a:0:{}'));
+        $auto = is_array($autoRaw) ? array_values(array_map('strval', $autoRaw)) : [];
+
+        $applyTheme = function($slug) use ($pdo, $isSqlite, $prefix, $all) {
+            $meta = $all[$slug] ?? ['Name' => $slug];
+            $tpl = trim((string)($meta['Template'] ?? ''));
+            $template = ($tpl !== '' && isset($all[$tpl])) ? $tpl : $slug;
+            $title = trim((string)($meta['Name'] ?? $slug)) ?: $slug;
+            $prevSheet = trim((string)dp_get_option($pdo, $isSqlite, $prefix, 'stylesheet', ''));
+            dp_update_option($pdo, $isSqlite, $prefix, 'stylesheet', $slug);
+            dp_update_option($pdo, $isSqlite, $prefix, 'template', $template);
+            dp_update_option($pdo, $isSqlite, $prefix, 'current_theme', $title);
+            if ($prevSheet !== '' && $prevSheet !== $slug) {
+                dp_update_option($pdo, $isSqlite, $prefix, 'theme_switched', $prevSheet);
+            }
+            return [$slug, $template, $title];
+        };
+
+        if ($act === 'activate' || $act === 'enable') {
+            if (!isset($all[$target])) {
+                dp_fail('Theme not found: ' . $target);
+            }
+            [$slug, $tpl, $_title] = $applyTheme($target);
+            $msg = ($tpl !== $slug)
+                ? "Activated child theme '{$slug}' (parent '{$tpl}') directly in database"
+                : "Activated theme '{$slug}' directly in database";
+            echo json_encode(['ok' => true, 'direct_db' => true, 'active_theme' => $slug, 'template' => $tpl, 'message' => $msg]);
+            exit;
+        }
+        if ($act === 'deactivate' || $act === 'disable') {
+            $currentActive = trim((string)dp_get_option($pdo, $isSqlite, $prefix, 'stylesheet', ''));
+            $fallback = dp_pick_fallback_theme($all, $target);
+            if ($fallback === null) {
+                dp_fail("Cannot disable theme '{$target}' because no other fallback theme is installed");
+            }
+            if ($currentActive === $target || $currentActive === '') {
+                [$slug, $tpl, $_title] = $applyTheme($fallback);
+                $msg = "Disabled theme '{$target}' and switched active theme to '{$slug}' directly in database";
+            } else {
+                $slug = $currentActive;
+                $msg = "Theme '{$target}' is already inactive (active: '{$currentActive}')";
+            }
+            echo json_encode(['ok' => true, 'direct_db' => true, 'active_theme' => $slug, 'message' => $msg]);
+            exit;
+        }
+        if ($act === 'enable-autoupdate') {
+            if (!in_array($target, $auto, true)) $auto[] = $target;
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_themes', array_values($auto));
+            echo json_encode(['ok' => true, 'direct_db' => true, 'message' => "Enabled auto-update for theme '{$target}' directly in database"]);
+            exit;
+        }
+        if ($act === 'disable-autoupdate') {
+            $auto = array_values(array_diff($auto, [$target]));
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_themes', $auto);
+            echo json_encode(['ok' => true, 'direct_db' => true, 'message' => "Disabled auto-update for theme '{$target}' directly in database"]);
+            exit;
+        }
+        if ($act === 'enable-all-autoupdate') {
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_themes', array_keys($all));
+            echo json_encode(['ok' => true, 'direct_db' => true, 'message' => "Enabled auto-updates for all themes directly in database"]);
+            exit;
+        }
+        if ($act === 'disable-all-autoupdate') {
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_themes', []);
+            echo json_encode(['ok' => true, 'direct_db' => true, 'message' => "Disabled auto-updates for all themes directly in database"]);
+            exit;
+        }
+        if ($act === 'cleanup_removed') {
+            $auto = array_values(array_diff($auto, [$target]));
+            dp_update_option($pdo, $isSqlite, $prefix, 'auto_update_themes', $auto);
+            $currentActive = trim((string)dp_get_option($pdo, $isSqlite, $prefix, 'stylesheet', ''));
+            if ($currentActive === $target) {
+                if (($fb = dp_pick_fallback_theme($all, $target)) !== null) {
+                    $applyTheme($fb);
+                }
+            }
+            echo json_encode(['ok' => true, 'direct_db' => true, 'message' => "Cleaned DB state for removed theme '{$target}'"]);
+            exit;
+        }
+        dp_fail('Unsupported direct-DB theme action: ' . $act);
+    }
+
+    if ($action === 'features_status') {
+        $blogPublic = (string)dp_get_option($pdo, $isSqlite, $prefix, 'blog_public', '1');
+        $blogName   = (string)dp_get_option($pdo, $isSqlite, $prefix, 'blogname', '');
+        $adminEmail = (string)dp_get_option($pdo, $isSqlite, $prefix, 'admin_email', '');
+        $usersTbl = dp_ident($prefix . 'users', $isSqlite);
+        $metaTbl  = dp_ident($prefix . 'usermeta', $isSqlite);
+        $capKey   = $prefix . 'capabilities';
+        $st = $pdo->prepare("SELECT u.user_login, u.user_email FROM {$usersTbl} u INNER JOIN {$metaTbl} m ON m.user_id = u.ID WHERE m.meta_key = ? AND m.meta_value LIKE '%administrator%' ORDER BY u.ID ASC LIMIT 1");
+        $st->execute([$capKey]);
+        $adm = $st->fetch(PDO::FETCH_ASSOC);
+        $adminUser = $adm['user_login'] ?? '';
+        if ($adminEmail === '' && !empty($adm['user_email'])) $adminEmail = (string)$adm['user_email'];
+        echo json_encode([
+            'ok' => true,
+            'blog_public' => $blogPublic,
+            'blogname' => $blogName,
+            'admin_email' => $adminEmail,
+            'admin_user' => $adminUser,
+        ]);
+        exit;
+    }
+
+    if ($action === 'set_blog_public') {
+        $val = !empty($params['enabled']) ? '1' : '0';
+        dp_update_option($pdo, $isSqlite, $prefix, 'blog_public', $val);
+        echo json_encode(['ok' => true, 'direct_db' => true, 'blog_public' => $val]);
+        exit;
+    }
+
+    if ($action === 'clear_transients') {
+        $tbl = dp_ident($prefix . 'options', $isSqlite);
+        $deleted = $pdo->exec("DELETE FROM {$tbl} WHERE option_name LIKE '\_transient\_%' OR option_name LIKE '\_site\_transient\_%'");
+        echo json_encode(['ok' => true, 'direct_db' => true, 'deleted_rows' => (int)$deleted]);
+        exit;
+    }
+
+    if ($action === 'setup_admin') {
+        $title = trim((string)($params['site_title'] ?? ''));
+        $login = trim((string)($params['admin_user'] ?? ''));
+        $email = trim((string)($params['admin_email'] ?? ''));
+        $pass  = (string)($params['admin_pass'] ?? '');
+        if ($title !== '') dp_update_option($pdo, $isSqlite, $prefix, 'blogname', $title);
+        if ($email !== '') dp_update_option($pdo, $isSqlite, $prefix, 'admin_email', $email);
+
+        $usersTbl = dp_ident($prefix . 'users', $isSqlite);
+        $metaTbl  = dp_ident($prefix . 'usermeta', $isSqlite);
+        $targetId = null;
+        if ($login !== '') {
+            $st = $pdo->prepare("SELECT ID FROM {$usersTbl} WHERE user_login = ? LIMIT 1");
+            $st->execute([$login]);
+            $targetId = $st->fetchColumn();
+        }
+        if (!$targetId) {
+            $capKey = $prefix . 'capabilities';
+            $st = $pdo->prepare("SELECT u.ID FROM {$usersTbl} u INNER JOIN {$metaTbl} m ON m.user_id = u.ID WHERE m.meta_key = ? AND m.meta_value LIKE '%administrator%' ORDER BY u.ID ASC LIMIT 1");
+            $st->execute([$capKey]);
+            $targetId = $st->fetchColumn();
+        }
+        if ($targetId) {
+            if ($email !== '') {
+                $pdo->prepare("UPDATE {$usersTbl} SET user_email = ? WHERE ID = ?")->execute([$email, $targetId]);
+            }
+            if ($pass !== '') {
+                $hash = dp_hash_password($siteDir, $pass);
+                $pdo->prepare("UPDATE {$usersTbl} SET user_pass = ? WHERE ID = ?")->execute([$hash, $targetId]);
+            }
+        } elseif ($pass !== '') {
+            dp_fail('No WordPress administrator user found in database');
+        }
+        echo json_encode(['ok' => true, 'direct_db' => true, 'user_id' => $targetId]);
+        exit;
+    }
+
+    if ($action === 'cli') {
+        $raw = trim((string)($params['command'] ?? ''));
+        $raw = preg_replace('/^wp\s+/i', '', $raw);
+        $parts = str_getcsv($raw, ' ', '"');
+        $cmd = strtolower((string)($parts[0] ?? ''));
+        $sub = strtolower((string)($parts[1] ?? ''));
+
+        if ($cmd === 'core' && $sub === 'version') {
+            $verFile = $siteDir . '/wp-includes/version.php';
+            $ver = '';
+            if (is_file($verFile) && preg_match('/\$wp_version\s*=\s*[\'"]([^\'"]+)[\'"]/', file_get_contents($verFile), $m)) {
+                $ver = $m[1];
+            }
+            echo json_encode(['ok' => true, 'output' => $ver]);
+            exit;
+        }
+        if ($cmd === 'option' && $sub === 'get' && isset($parts[2])) {
+            $val = dp_get_option($pdo, $isSqlite, $prefix, $parts[2], null);
+            if ($val === null) dp_fail("Option '{$parts[2]}' not found in {$prefix}options");
+            $un = dp_maybe_unserialize($val);
+            echo json_encode(['ok' => true, 'output' => is_scalar($un) ? (string)$un : json_encode($un)]);
+            exit;
+        }
+        if ($cmd === 'option' && $sub === 'update' && isset($parts[2], $parts[3])) {
+            dp_update_option($pdo, $isSqlite, $prefix, $parts[2], $parts[3]);
+            echo json_encode(['ok' => true, 'output' => "Success: Updated '{$parts[2]}' directly in {$prefix}options."]);
+            exit;
+        }
+        if ($cmd === 'option' && $sub === 'delete' && isset($parts[2])) {
+            dp_delete_option($pdo, $isSqlite, $prefix, $parts[2]);
+            echo json_encode(['ok' => true, 'output' => "Success: Deleted '{$parts[2]}' from {$prefix}options."]);
+            exit;
+        }
+        if ($cmd === 'plugin' && $sub === 'list') {
+            $all = dp_scan_plugins($siteDir);
+            $activeRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'active_plugins', 'a:0:{}'));
+            $active = is_array($activeRaw) ? array_values(array_map('strval', $activeRaw)) : [];
+            $lines = [];
+            foreach ($all as $f => $d) {
+                $lines[] = sprintf("%-40s %-10s %s", $f, in_array($f, $active, true) ? 'active' : 'inactive', $d['Version'] ?? '1.0.0');
+            }
+            echo json_encode(['ok' => true, 'output' => implode("\n", $lines)]);
+            exit;
+        }
+        if ($cmd === 'plugin' && in_array($sub, ['activate', 'deactivate', 'enable', 'disable'], true) && isset($parts[2])) {
+            $all = dp_scan_plugins($siteDir);
+            $activeRaw = dp_maybe_unserialize(dp_get_option($pdo, $isSqlite, $prefix, 'active_plugins', 'a:0:{}'));
+            $active = is_array($activeRaw) ? array_values(array_map('strval', $activeRaw)) : [];
+            if ($parts[2] === '--all' && ($sub === 'deactivate' || $sub === 'disable')) {
+                dp_update_option($pdo, $isSqlite, $prefix, 'active_plugins', []);
+                echo json_encode(['ok' => true, 'output' => "Success: Deactivated all plugins directly in {$prefix}options."]);
+                exit;
+            }
+            $file = dp_resolve_plugin_file($all, $parts[2]);
+            if ($sub === 'activate' || $sub === 'enable') {
+                if (!isset($all[$file])) dp_fail("Plugin not found: {$parts[2]}");
+                if (!in_array($file, $active, true)) { $active[] = $file; sort($active); }
+                dp_update_option($pdo, $isSqlite, $prefix, 'active_plugins', $active);
+                echo json_encode(['ok' => true, 'output' => "Success: Activated '{$file}' directly in {$prefix}options."]);
+                exit;
+            }
+            $slug = explode('/', $file)[0];
+            $active = array_values(array_filter($active, fn($x) => $x !== $file && $x !== $parts[2] && !str_starts_with($x, $slug . '/')));
+            dp_update_option($pdo, $isSqlite, $prefix, 'active_plugins', $active);
+            echo json_encode(['ok' => true, 'output' => "Success: Deactivated '{$file}' directly in {$prefix}options."]);
+            exit;
+        }
+        if ($cmd === 'theme' && $sub === 'list') {
+            $all = dp_scan_themes($siteDir);
+            $cur = trim((string)dp_get_option($pdo, $isSqlite, $prefix, 'stylesheet', ''));
+            $lines = [];
+            foreach ($all as $slug => $t) {
+                $lines[] = sprintf("%-30s %-10s %s", $slug, ($slug === $cur) ? 'active' : 'inactive', $t['Version'] ?? '1.0');
+            }
+            echo json_encode(['ok' => true, 'output' => implode("\n", $lines)]);
+            exit;
+        }
+        if ($cmd === 'theme' && ($sub === 'activate' || $sub === 'enable' || $sub === 'deactivate' || $sub === 'disable') && isset($parts[2])) {
+            $all = dp_scan_themes($siteDir);
+            $target = $parts[2];
+            if ($sub === 'deactivate' || $sub === 'disable') {
+                $fb = dp_pick_fallback_theme($all, $target);
+                if ($fb === null) dp_fail("No fallback theme installed to replace '{$target}'");
+                $target = $fb;
+            }
+            if (!isset($all[$target])) dp_fail("Theme not found: {$target}");
+            $tpl = trim((string)($all[$target]['Template'] ?? ''));
+            $template = ($tpl !== '' && isset($all[$tpl])) ? $tpl : $target;
+            $title = trim((string)($all[$target]['Name'] ?? $target)) ?: $target;
+            dp_update_option($pdo, $isSqlite, $prefix, 'stylesheet', $target);
+            dp_update_option($pdo, $isSqlite, $prefix, 'template', $template);
+            dp_update_option($pdo, $isSqlite, $prefix, 'current_theme', $title);
+            echo json_encode(['ok' => true, 'output' => "Success: Switched active theme to '{$target}' (template: '{$template}') directly in {$prefix}options."]);
+            exit;
+        }
+        if ($cmd === 'user' && $sub === 'list') {
+            $usersTbl = dp_ident($prefix . 'users', $isSqlite);
+            $metaTbl  = dp_ident($prefix . 'usermeta', $isSqlite);
+            $capKey   = $prefix . 'capabilities';
+            $st = $pdo->prepare("SELECT u.ID, u.user_login, u.user_email, m.meta_value AS caps FROM {$usersTbl} u LEFT JOIN {$metaTbl} m ON m.user_id = u.ID AND m.meta_key = ? ORDER BY u.ID ASC LIMIT 200");
+            $st->execute([$capKey]);
+            $lines = [];
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $u) {
+                $caps = dp_maybe_unserialize((string)($u['caps'] ?? ''));
+                $roles = is_array($caps) ? implode(',', array_keys(array_filter($caps))) : '';
+                $lines[] = sprintf("%-5s %-20s %-30s %s", $u['ID'], $u['user_login'], $u['user_email'], $roles);
+            }
+            echo json_encode(['ok' => true, 'output' => implode("\n", $lines)]);
+            exit;
+        }
+        if ($cmd === 'user' && $sub === 'update' && isset($parts[2])) {
+            $usersTbl = dp_ident($prefix . 'users', $isSqlite);
+            $uKey = $parts[2];
+            $st = $pdo->prepare("SELECT ID FROM {$usersTbl} WHERE user_login = ? OR ID = ? LIMIT 1");
+            $st->execute([$uKey, ctype_digit($uKey) ? (int)$uKey : -1]);
+            $uid = $st->fetchColumn();
+            if (!$uid) dp_fail("User not found: {$uKey}");
+            foreach (array_slice($parts, 3) as $arg) {
+                if (str_starts_with($arg, '--user_pass=')) {
+                    $pw = substr($arg, strlen('--user_pass='));
+                    $pdo->prepare("UPDATE {$usersTbl} SET user_pass = ? WHERE ID = ?")->execute([dp_hash_password($siteDir, $pw), $uid]);
+                } elseif (str_starts_with($arg, '--user_email=')) {
+                    $em = substr($arg, strlen('--user_email='));
+                    $pdo->prepare("UPDATE {$usersTbl} SET user_email = ? WHERE ID = ?")->execute([$em, $uid]);
+                }
+            }
+            echo json_encode(['ok' => true, 'output' => "Success: Updated user '{$uKey}' directly in {$prefix}users."]);
+            exit;
+        }
+        if ($cmd === 'cache' && $sub === 'flush') {
+            $tbl = dp_ident($prefix . 'options', $isSqlite);
+            $pdo->exec("DELETE FROM {$tbl} WHERE option_name LIKE '\_transient\_%' OR option_name LIKE '\_site\_transient\_%'");
+            echo json_encode(['ok' => true, 'output' => 'Success: Cleared transients and flushed cache directly in database.']);
+            exit;
+        }
+        if ($cmd === 'db' && $sub === 'query' && isset($parts[2])) {
+            $sql = implode(' ', array_slice($parts, 2));
+            $q = $pdo->query($sql);
+            $rows = $q ? $q->fetchAll(PDO::FETCH_ASSOC) : [];
+            echo json_encode(['ok' => true, 'output' => json_encode($rows, JSON_PRETTY_PRINT)]);
+            exit;
+        }
+        if ($cmd === 'config' && $sub === 'set' && isset($parts[2], $parts[3])) {
+            echo json_encode(['ok' => true, 'action' => 'config_set', 'key' => $parts[2], 'val' => $parts[3], 'output' => 'Updated wp-config.php constant ' . $parts[2]]);
+            exit;
+        }
+        echo json_encode(['ok' => false, 'error' => 'UNSUPPORTED_DIRECT_CLI']);
+        exit;
+    }
+
+    dp_fail('Unknown direct-DB action: ' . $action);
+} catch (Throwable $e) {
+    dp_fail($e->getMessage());
+}
+"#;
+
+    let temp_script = std::env::temp_dir().join(format!("dockpanel_wp_db_{}.php", uuid::Uuid::new_v4()));
+    fs::write(&temp_script, script).map_err(|e| e.to_string())?;
+
+    let mut cmd = std::process::Command::new(&php_exe);
+    cmd.arg(&temp_script)
+        .current_dir(site_dir)
+        .env("DOCKPANEL_SITE_DIR", site_dir.to_string_lossy().as_ref())
+        .env("DOCKPANEL_DB_TYPE", if creds.is_sqlite { "sqlite" } else { "mysql" })
+        .env("DOCKPANEL_SQLITE_PATH", &creds.sqlite_path)
+        .env("DOCKPANEL_DB_NAME", &creds.db_name)
+        .env("DOCKPANEL_DB_USER", &creds.db_user)
+        .env("DOCKPANEL_DB_PASS", &creds.db_pass)
+        .env("DOCKPANEL_DB_HOST", &creds.db_host)
+        .env("DOCKPANEL_DB_PORT", creds.db_port.to_string())
+        .env("DOCKPANEL_DB_PREFIX", &creds.table_prefix)
+        .env("DOCKPANEL_WP_ACTION", action)
+        .env("DOCKPANEL_WP_PARAMS", serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string()));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output();
+    let _ = fs::remove_file(&temp_script);
+
+    let output = out.map_err(|e| format!("Failed invoking Direct-DB PHP: {}", e))?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let val: serde_json::Value = crate::databases::parse_php_json_output(&raw).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.trim().is_empty() {
+            format!("Unexpected Direct-DB output: {}", raw.trim())
+        } else {
+            format!("Direct-DB PHP error: {}", stderr.trim())
+        }
+    })?;
+
+    if val.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(val["error"].as_str().unwrap_or("Direct-DB error").to_string());
+    }
+    Ok(val)
+}
+
+fn parse_wp_header_field(content: &str, field: &str) -> Option<String> {
+    let needle = format!("{}:", field).to_ascii_lowercase();
+    for line in content.lines().take(60) {
+        let trimmed = line.trim().trim_start_matches('*').trim_start_matches('#').trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with(&needle) {
+            let val = trimmed[needle.len()..]
+                .split("*/")
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub fn read_wp_version(site_dir: &Path) -> String {
     let version_file = site_dir.join("wp-includes").join("version.php");
     if let Ok(content) = fs::read_to_string(version_file) {
@@ -2072,37 +2884,16 @@ pub fn get_wp_db_info(site_dir: &Path, site_id: &str, domain: &str, mariadb_port
     })
 }
 
-/// Lists WordPress plugins with real active/inactive status, versions, and autoupdate flags.
-pub fn list_plugins(site_dir: &Path, domain: &str) -> Vec<serde_json::Value> {
-    if site_dir.join("wp-load.php").is_file() {
-        let code = r#"
-require_once __DIR__ . '/wp-load.php';
-require_once ABSPATH . 'wp-admin/includes/plugin.php';
-$all = get_plugins();
-$auto = (array) get_site_option('auto_update_plugins', []);
-$updates = get_site_transient('update_plugins');
-$out = [];
-foreach ($all as $file => $data) {
-    $hasUpdate = isset($updates->response[$file]) ? 'available' : 'none';
-    $out[] = [
-        'name' => $file,
-        'title' => $data['Name'] ?: $file,
-        'version' => $data['Version'] ?: '1.0.0',
-        'status' => is_plugin_active($file) ? 'active' : 'inactive',
-        'update' => $hasUpdate,
-        'auto_update' => in_array($file, $auto, true) ? 'on' : 'off',
-    ];
-}
-echo json_encode($out);
-"#;
-        if let Ok(val) = run_wp_php(site_dir, domain, code, &[]) {
-            if let Some(arr) = val.as_array() {
-                return arr.clone();
-            }
+/// Lists WordPress plugins directly from database options and plugin file headers,
+/// immune to fatal PHP errors in broken themes or plugins.
+pub fn list_plugins(site_dir: &Path, _domain: &str) -> Vec<serde_json::Value> {
+    if let Ok(val) = run_wp_direct_db_php(site_dir, "list_plugins", &json!({})) {
+        if let Some(arr) = val["items"].as_array() {
+            return arr.clone();
         }
     }
 
-    // Filesystem fallback when PHP runtime isn't present
+    // Filesystem header scan + metadata fallback when database is not yet initialized or PHP absent
     let meta = read_wp_meta(site_dir);
     let active_list: Vec<String> = meta["active_plugins"]
         .as_array()
@@ -2114,55 +2905,82 @@ echo json_encode($out);
         for entry in entries.flatten() {
             if let Ok(ft) = entry.file_type() {
                 let raw = entry.file_name().to_string_lossy().to_string();
-                if ft.is_dir() || raw.ends_with(".php") {
-                    let clean_name = raw.trim_end_matches(".php").to_string();
-                    let status = if active_list.is_empty() || active_list.contains(&clean_name) {
-                        "active"
-                    } else {
-                        "inactive"
-                    };
-                    plugins.push(json!({
-                        "name": clean_name,
-                        "status": status,
-                        "version": "1.0.0",
-                        "update": "none",
-                        "auto_update": "off",
-                        "title": clean_name,
-                    }));
+                if raw == "index.php" {
+                    continue;
                 }
+                let mut item_name = raw.clone();
+                let mut title = raw.trim_end_matches(".php").to_string();
+                let mut version = "1.0.0".to_string();
+                let mut found_header = false;
+
+                if ft.is_dir() {
+                    if let Ok(sub_entries) = fs::read_dir(entry.path()) {
+                        for sub in sub_entries.flatten() {
+                            let sname = sub.file_name().to_string_lossy().to_string();
+                            if sname.ends_with(".php") && sub.path().is_file() {
+                                if let Ok(hdr) = fs::read_to_string(sub.path()) {
+                                    if let Some(pn) = parse_wp_header_field(&hdr, "Plugin Name") {
+                                        item_name = format!("{}/{}", raw, sname);
+                                        title = pn;
+                                        if let Some(v) = parse_wp_header_field(&hdr, "Version") {
+                                            version = v;
+                                        }
+                                        found_header = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !found_header {
+                        item_name = raw.clone();
+                    }
+                } else if raw.ends_with(".php") {
+                    if let Ok(hdr) = fs::read_to_string(entry.path()) {
+                        if let Some(pn) = parse_wp_header_field(&hdr, "Plugin Name") {
+                            title = pn;
+                            if let Some(v) = parse_wp_header_field(&hdr, "Version") {
+                                version = v;
+                            }
+                            found_header = true;
+                        }
+                    }
+                    if !found_header {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                let slug = raw.trim_end_matches(".php");
+                let status = if active_list.is_empty()
+                    || active_list.iter().any(|x| x == &item_name || x == slug || x.starts_with(&format!("{}/", slug)))
+                {
+                    "active"
+                } else {
+                    "inactive"
+                };
+                plugins.push(json!({
+                    "name": item_name,
+                    "status": status,
+                    "version": version,
+                    "update": "none",
+                    "auto_update": "off",
+                    "title": title,
+                }));
             }
         }
     }
+    plugins.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     plugins
 }
 
-/// Lists WordPress themes where at most ONE active theme has `status: "active"`.
-pub fn list_themes(site_dir: &Path, domain: &str) -> Vec<serde_json::Value> {
-    if site_dir.join("wp-load.php").is_file() {
-        let code = r#"
-require_once __DIR__ . '/wp-load.php';
-$themes = wp_get_themes();
-$active = get_stylesheet();
-$auto = (array) get_site_option('auto_update_themes', []);
-$updates = get_site_transient('update_themes');
-$out = [];
-foreach ($themes as $slug => $theme) {
-    $hasUpdate = isset($updates->response[$slug]) ? 'available' : 'none';
-    $out[] = [
-        'name' => $slug,
-        'title' => $theme->get('Name') ?: $slug,
-        'version' => $theme->get('Version') ?: '1.0',
-        'status' => ($slug === $active) ? 'active' : 'inactive',
-        'update' => $hasUpdate,
-        'auto_update' => in_array($slug, $auto, true) ? 'on' : 'off',
-    ];
-}
-echo json_encode($out);
-"#;
-        if let Ok(val) = run_wp_php(site_dir, domain, code, &[]) {
-            if let Some(arr) = val.as_array() {
-                return arr.clone();
-            }
+/// Lists WordPress themes directly from database `stylesheet`/`template` options and `style.css` headers,
+/// immune to fatal PHP errors in broken themes or plugins.
+pub fn list_themes(site_dir: &Path, _domain: &str) -> Vec<serde_json::Value> {
+    if let Ok(val) = run_wp_direct_db_php(site_dir, "list_themes", &json!({})) {
+        if let Some(arr) = val["items"].as_array() {
+            return arr.clone();
         }
     }
 
@@ -2176,13 +2994,9 @@ echo json_encode($out);
             if entry.path().is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let style = fs::read_to_string(entry.path().join("style.css")).unwrap_or_default();
-                let title = style
-                    .lines()
-                    .find_map(|l| l.trim().strip_prefix("Theme Name:").map(|s| s.trim().to_string()))
+                let title = parse_wp_header_field(&style, "Theme Name")
                     .unwrap_or_else(|| name.clone());
-                let version = style
-                    .lines()
-                    .find_map(|l| l.trim().strip_prefix("Version:").map(|s| s.trim().to_string()))
+                let version = parse_wp_header_field(&style, "Version")
                     .unwrap_or_else(|| "1.0".to_string());
                 dirs.push((name, title, version));
             }
@@ -2247,18 +3061,10 @@ pub fn get_wp_features_status(
     let hotlink_protect = meta["hotlink_protect"].as_bool().unwrap_or(false);
     let vuln_protect = meta["vuln_protect"].as_bool().unwrap_or(true);
 
-    // Query live WordPress DB for authoritative blog_public / blogname / admin_email when available
-    if installed && site_dir.join("wp-load.php").is_file() {
-        let code = r#"
-require_once __DIR__ . '/wp-load.php';
-echo json_encode([
-    'ok' => true,
-    'blog_public' => (string) get_option('blog_public', '1'),
-    'blogname' => (string) get_option('blogname', ''),
-    'admin_email' => (string) get_option('admin_email', ''),
-]);
-"#;
-        if let Ok(val) = run_wp_php(site_dir, domain, code, &[]) {
+    // Query WordPress DB directly for authoritative blog_public / blogname / admin_email / admin_user
+    // without loading wp-load.php, themes, or plugins.
+    if installed {
+        if let Ok(val) = run_wp_direct_db_php(site_dir, "features_status", &json!({})) {
             if let Some(bp) = val["blog_public"].as_str() {
                 search_indexing = bp != "0";
             }
@@ -2267,6 +3073,9 @@ echo json_encode([
             }
             if let Some(ae) = val["admin_email"].as_str().filter(|s| !s.is_empty()) {
                 email = ae.to_string();
+            }
+            if let Some(au) = val["admin_user"].as_str().filter(|s| !s.is_empty()) {
+                user = au.to_string();
             }
         }
     }
@@ -2402,13 +3211,8 @@ pub fn toggle_feature(
             Ok(json!({ "ok": true, "pass_protect": enabled }))
         }
         "search_indexing" => {
-            if site_dir.join("wp-load.php").is_file() {
-                let code = r#"
-require_once __DIR__ . '/wp-load.php';
-update_option('blog_public', $argv[1] === '1' ? '1' : '0');
-echo json_encode(['ok' => true, 'blog_public' => get_option('blog_public')]);
-"#;
-                run_wp_php(site_dir, domain, code, &[if enabled { "1" } else { "0" }])?;
+            if read_wp_db_creds(site_dir).is_some() {
+                let _ = run_wp_direct_db_php(site_dir, "set_blog_public", &json!({ "enabled": enabled }));
             }
             write_wp_meta(site_dir, |m| {
                 m["search_indexing"] = json!(enabled);
@@ -2467,7 +3271,7 @@ echo json_encode(['ok' => true, 'blog_public' => get_option('blog_public')]);
     }
 }
 
-pub fn clear_wp_cache(site_dir: &Path, domain: &str) -> Result<serde_json::Value, String> {
+pub fn clear_wp_cache(site_dir: &Path, _domain: &str) -> Result<serde_json::Value, String> {
     for rel in ["wp-content/cache", "wp-content/litespeed"] {
         let dir = site_dir.join(rel);
         if dir.is_dir() {
@@ -2475,20 +3279,13 @@ pub fn clear_wp_cache(site_dir: &Path, domain: &str) -> Result<serde_json::Value
             let _ = fs::create_dir_all(&dir);
         }
     }
-    if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
-        let code = r#"
-require_once __DIR__ . '/wp-load.php';
-if (function_exists('wp_cache_flush')) wp_cache_flush();
-echo json_encode(['ok' => true]);
-"#;
-        let _ = run_wp_php(site_dir, domain, code, &[]);
-    }
+    let _ = run_wp_direct_db_php(site_dir, "clear_transients", &json!({}));
     Ok(json!({ "ok": true, "message": "WordPress cache purged cleanly" }))
 }
 
 pub fn setup_wp(
     site_dir: &Path,
-    domain: &str,
+    _domain: &str,
     admin_user: Option<&str>,
     admin_email: Option<&str>,
     admin_pass: Option<&str>,
@@ -2513,44 +3310,21 @@ pub fn setup_wp(
     }
     fs::write(&cfg_path, cfg).map_err(|e| e.to_string())?;
 
-    if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
-        let code = r#"
-require_once __DIR__ . '/wp-load.php';
-$title = $argv[1];
-$userLogin = $argv[2];
-$email = $argv[3];
-$newPass = $argv[4];
-if ($title !== '') update_option('blogname', $title);
-if ($email !== '') update_option('admin_email', $email);
-$targetUser = $userLogin !== '' ? get_user_by('login', $userLogin) : null;
-if (!$targetUser) {
-    $admins = get_users(['role' => 'administrator', 'number' => 1]);
-    $targetUser = $admins[0] ?? null;
-}
-if ($targetUser) {
-    if ($email !== '') {
-        wp_update_user(['ID' => $targetUser->ID, 'user_email' => $email]);
-    }
-    if ($newPass !== '') {
-        wp_set_password($newPass, $targetUser->ID);
-    }
-} elseif ($newPass !== '') {
-    echo json_encode(['ok' => false, 'error' => 'No WordPress administrator user found']);
-    exit;
-}
-echo json_encode(['ok' => true]);
-"#;
-        run_wp_php(
+    if read_wp_db_creds(site_dir).is_some() && crate::state::find_php_binary(None).is_some() {
+        match run_wp_direct_db_php(
             site_dir,
-            domain,
-            code,
-            &[
-                site_title.unwrap_or("").trim(),
-                admin_user.unwrap_or("").trim(),
-                admin_email.unwrap_or("").trim(),
-                admin_pass.unwrap_or(""),
-            ],
-        )?;
+            "setup_admin",
+            &json!({
+                "site_title": site_title.unwrap_or("").trim(),
+                "admin_user": admin_user.unwrap_or("").trim(),
+                "admin_email": admin_email.unwrap_or("").trim(),
+                "admin_pass": admin_pass.unwrap_or(""),
+            }),
+        ) {
+            Ok(_) => {}
+            Err(e) if e == "NO_WP_TABLES" => {}
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(json!({ "ok": true, "message": "WordPress setup credentials updated" }))
@@ -2611,7 +3385,7 @@ pub fn plugin_or_theme_action(
     action: &str,
     name: &str,
 ) -> Result<serde_json::Value, String> {
-    let item_name = if action.contains("-all-") {
+    let item_name = if action.contains("-all-") || action == "deactivate-all" || action == "disable-all" {
         name.trim().to_string()
     } else {
         validate_wp_item_name(name)?
@@ -2620,84 +3394,112 @@ pub fn plugin_or_theme_action(
     let slug = item_name.split('/').next().unwrap_or(&item_name).trim_end_matches(".php");
 
     match action {
-        "activate" | "deactivate" | "enable" | "disable" | "enable-autoupdate" | "disable-autoupdate"
+        "activate" | "deactivate" | "enable" | "disable" | "deactivate-all" | "disable-all"
+        | "enable-autoupdate" | "disable-autoupdate"
         | "enable-all-autoupdate" | "disable-all-autoupdate" => {
-            if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
-                let code = r#"
+            // Themes, plugin deactivation, and autoupdate toggles modify options directly in DB
+            // without loading wp-load.php / functions.php / plugin PHP files (immune to fatal site errors).
+            let db_res = if kind == "theme" {
+                run_wp_direct_db_php(
+                    site_dir,
+                    "theme_action",
+                    &json!({ "action": action, "name": item_name }),
+                )
+            } else if action == "activate" || action == "enable" {
+                // For plugin activation on a healthy site, try running WP activation hooks first;
+                // if the site throws a fatal PHP error (broken theme or plugin), automatically apply in DB.
+                if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
+                    let code = r#"
 require_once __DIR__ . '/wp-load.php';
 require_once ABSPATH . 'wp-admin/includes/plugin.php';
-$kind   = $argv[1];
-$action = $argv[2];
-$target = $argv[3];
-
-if ($kind === 'plugin') {
-    if ($action === 'activate' || $action === 'enable') {
-        $res = activate_plugin($target);
-        if (is_wp_error($res)) {
-            echo json_encode(['ok' => false, 'error' => $res->get_error_message()]);
-            exit;
-        }
-    } elseif ($action === 'deactivate' || $action === 'disable') {
-        deactivate_plugins($target);
-    } elseif ($action === 'enable-autoupdate' || $action === 'disable-autoupdate') {
-        $auto = (array) get_site_option('auto_update_plugins', []);
-        if ($action === 'enable-autoupdate') {
-            if (!in_array($target, $auto, true)) $auto[] = $target;
-        } else {
-            $auto = array_values(array_diff($auto, [$target]));
-        }
-        update_site_option('auto_update_plugins', $auto);
-    } elseif ($action === 'enable-all-autoupdate' || $action === 'disable-all-autoupdate') {
-        $auto = $action === 'enable-all-autoupdate' ? array_keys(get_plugins()) : [];
-        update_site_option('auto_update_plugins', $auto);
-    }
-} else {
-    if ($action === 'activate' || $action === 'enable') {
-        $theme = wp_get_theme($target);
-        if (!$theme->exists()) {
-            echo json_encode(['ok' => false, 'error' => 'Theme not found: ' . $target]);
-            exit;
-        }
-        switch_theme($target);
-    } elseif ($action === 'enable-autoupdate' || $action === 'disable-autoupdate') {
-        $auto = (array) get_site_option('auto_update_themes', []);
-        if ($action === 'enable-autoupdate') {
-            if (!in_array($target, $auto, true)) $auto[] = $target;
-        } else {
-            $auto = array_values(array_diff($auto, [$target]));
-        }
-        update_site_option('auto_update_themes', $auto);
-    } elseif ($action === 'enable-all-autoupdate' || $action === 'disable-all-autoupdate') {
-        $auto = $action === 'enable-all-autoupdate' ? array_keys(wp_get_themes()) : [];
-        update_site_option('auto_update_themes', $auto);
-    }
+$res = activate_plugin($argv[1]);
+if (is_wp_error($res)) {
+    echo json_encode(['ok' => false, 'error' => $res->get_error_message()]);
+    exit;
 }
 echo json_encode(['ok' => true]);
 "#;
-                run_wp_php(site_dir, domain, code, &[kind, action, &item_name])?;
-            } else if kind == "theme" && (action == "activate" || action == "enable") {
-                write_wp_meta(site_dir, |m| {
-                    m["active_theme"] = json!(slug);
-                });
-            } else if kind == "plugin" {
-                write_wp_meta(site_dir, |m| {
-                    let mut list: Vec<String> = m["active_plugins"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                        .unwrap_or_default();
-                    if action == "activate" || action == "enable" {
-                        if !list.contains(&slug.to_string()) {
-                            list.push(slug.to_string());
-                        }
-                    } else if action == "deactivate" || action == "disable" {
-                        list.retain(|x| x != slug);
+                    match run_wp_php(site_dir, domain, code, &[&item_name]) {
+                        Ok(v) => Ok(v),
+                        Err(_) => run_wp_direct_db_php(
+                            site_dir,
+                            "plugin_action",
+                            &json!({ "action": action, "name": item_name }),
+                        ),
                     }
-                    m["active_plugins"] = json!(list);
-                });
+                } else {
+                    run_wp_direct_db_php(
+                        site_dir,
+                        "plugin_action",
+                        &json!({ "action": action, "name": item_name }),
+                    )
+                }
+            } else {
+                run_wp_direct_db_php(
+                    site_dir,
+                    "plugin_action",
+                    &json!({ "action": action, "name": item_name }),
+                )
+            };
+
+            let sync_meta_fallback = |target_slug: &str| {
+                if kind == "theme" {
+                    if action == "activate" || action == "enable" {
+                        write_wp_meta(site_dir, |m| {
+                            m["active_theme"] = json!(target_slug);
+                        });
+                    }
+                } else if kind == "plugin" {
+                    write_wp_meta(site_dir, |m| {
+                        let mut list: Vec<String> = m["active_plugins"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        if action == "activate" || action == "enable" {
+                            if !list.contains(&slug.to_string()) {
+                                list.push(slug.to_string());
+                            }
+                        } else if action == "deactivate" || action == "disable" {
+                            list.retain(|x| x != slug);
+                        } else if action == "deactivate-all" || action == "disable-all" {
+                            list.clear();
+                        }
+                        m["active_plugins"] = json!(list);
+                    });
+                }
+            };
+
+            match db_res {
+                Ok(val) => {
+                    if let Some(active_th) = val["active_theme"].as_str() {
+                        sync_meta_fallback(active_th);
+                    } else {
+                        sync_meta_fallback(slug);
+                    }
+                    let msg = val["message"]
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("{} {}", action, item_name));
+                    Ok(json!({
+                        "ok": true,
+                        "direct_db": val["direct_db"].as_bool().unwrap_or(true),
+                        "active_theme": val["active_theme"],
+                        "message": msg,
+                    }))
+                }
+                Err(e) if e == "NO_WP_TABLES" || read_wp_db_creds(site_dir).is_none() || crate::state::find_php_binary(None).is_none() => {
+                    sync_meta_fallback(slug);
+                    Ok(json!({ "ok": true, "message": format!("{} {}", action, item_name) }))
+                }
+                Err(e) => Err(e),
             }
-            Ok(json!({ "ok": true, "message": format!("{} {}", action, item_name) }))
         }
         "delete" => {
+            let _ = run_wp_direct_db_php(
+                site_dir,
+                if kind == "theme" { "theme_action" } else { "plugin_action" },
+                &json!({ "action": "cleanup_removed", "name": item_name }),
+            );
             let folder = site_dir.join("wp-content").join(sub).join(slug);
             let single_file = site_dir.join("wp-content").join(sub).join(format!("{}.php", slug));
             if folder.is_dir() {
@@ -2747,6 +3549,30 @@ pub fn run_wp_cli_command(site_dir: &Path, domain: &str, command: &str) -> Resul
     if !is_wp_installed(site_dir) {
         return Err("WordPress is not installed on this site".to_string());
     }
+    if crate::state::find_php_binary(None).is_some() {
+        // 1. Try resilient Direct-DB handler first (immune to broken themes/plugins/drop-ins)
+        match run_wp_direct_db_php(site_dir, "cli", &json!({ "command": command })) {
+            Ok(val) => {
+                if val["action"].as_str() == Some("config_set") {
+                    if let (Some(k), Some(v)) = (val["key"].as_str(), val["val"].as_str()) {
+                        let cfg_path = site_dir.join("wp-config.php");
+                        if cfg_path.is_file() {
+                            let esc = v.replace('\\', "\\\\").replace('\'', "\\'");
+                            let content = fs::read_to_string(&cfg_path).unwrap_or_default();
+                            let updated = upsert_wp_config_constant(&content, k, &format!("'{}'", esc));
+                            let _ = fs::write(&cfg_path, updated);
+                        }
+                    }
+                }
+                return Ok(val["output"].as_str().unwrap_or("OK").to_string());
+            }
+            Err(e) if e != "UNSUPPORTED_DIRECT_CLI" && e != "NO_WP_TABLES" => {
+                return Err(e);
+            }
+            Err(_) => {}
+        }
+    }
+
     if site_dir.join("wp-load.php").is_file() && crate::state::find_php_binary(None).is_some() {
         let code = r#"
 require_once __DIR__ . '/wp-load.php';
@@ -2804,7 +3630,7 @@ if ($cmd === 'config' && $sub === 'set' && isset($parts[2], $parts[3])) {
     echo json_encode(['ok' => true, 'action' => 'config_set', 'key' => $parts[2], 'val' => $parts[3], 'output' => 'Updated wp-config.php constant ' . $parts[2]]);
     exit;
 }
-echo json_encode(['ok' => true, 'output' => 'Supported local WP-CLI commands: core version, plugin list, theme list, user list, option get/update, cache flush, config set']);
+echo json_encode(['ok' => true, 'output' => 'Supported local WP-CLI commands (Direct-DB resilient): core version, plugin list/activate/deactivate, theme list/activate/deactivate, user list/update, option get/update/delete, db query, cache flush, config set']);
 "#;
         let val = run_wp_php(site_dir, domain, code, &[command])?;
         if val["action"].as_str() == Some("config_set") {
@@ -3456,6 +4282,143 @@ mod tests {
         assert_eq!(scan["total_vulns"], 1);
         assert_eq!(scan["high_count"], 1);
         assert_eq!(get_cached_vuln_counts(&site_dir), (1, 0));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_direct_db_toolkit_recovers_broken_wp_theme_and_plugins() {
+        let Some(php_exe) = crate::state::find_php_binary(None) else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("dockpanel_wp_directdb_{}", uuid::Uuid::new_v4()));
+        let site_dir = tmp.join("brokenwp.local");
+        fs::create_dir_all(site_dir.join("wp-content").join("database")).unwrap();
+        fs::create_dir_all(site_dir.join("wp-content").join("themes").join("boxshop-child")).unwrap();
+        fs::create_dir_all(site_dir.join("wp-content").join("themes").join("boxshop")).unwrap();
+        fs::create_dir_all(site_dir.join("wp-content").join("themes").join("twentytwentyfour")).unwrap();
+        fs::create_dir_all(site_dir.join("wp-content").join("plugins").join("broken-plugin")).unwrap();
+
+        fs::write(
+            site_dir.join("wp-config.php"),
+            "<?php\ndefine('DB_ENGINE', 'sqlite');\ndefine('DB_NAME', 'unused');\n$table_prefix = 'wpl8_';\nrequire_once __DIR__ . '/wp-settings.php';\n",
+        )
+        .unwrap();
+        // Deliberately simulate a site whose wp-load.php triggers a fatal PHP error (e.g. redeclared theme function)
+        fs::write(
+            site_dir.join("wp-settings.php"),
+            "<?php\nrequire_once __DIR__ . '/wp-content/themes/boxshop-child/functions.php';\nrequire_once __DIR__ . '/wp-content/themes/boxshop/functions.php';\n",
+        )
+        .unwrap();
+        fs::write(
+            site_dir.join("wp-load.php"),
+            "<?php\nrequire_once __DIR__ . '/wp-config.php';\n",
+        )
+        .unwrap();
+        fs::write(
+            site_dir.join("wp-content").join("themes").join("boxshop-child").join("style.css"),
+            "/*\nTheme Name: BoxShop Child\nTemplate: boxshop\nVersion: 1.0.0\n*/\n",
+        )
+        .unwrap();
+        fs::write(
+            site_dir.join("wp-content").join("themes").join("boxshop-child").join("functions.php"),
+            "<?php function juni_deregister_boxshop_scripts() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            site_dir.join("wp-content").join("themes").join("boxshop").join("style.css"),
+            "/*\nTheme Name: BoxShop\nVersion: 2.3.1\n*/\n",
+        )
+        .unwrap();
+        fs::write(
+            site_dir.join("wp-content").join("themes").join("boxshop").join("functions.php"),
+            "<?php function juni_deregister_boxshop_scripts() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            site_dir.join("wp-content").join("themes").join("twentytwentyfour").join("style.css"),
+            "/*\nTheme Name: Twenty Twenty-Four\nVersion: 1.2\n*/\n",
+        )
+        .unwrap();
+        fs::write(
+            site_dir.join("wp-content").join("plugins").join("broken-plugin").join("broken-plugin.php"),
+            "<?php\n/*\nPlugin Name: Broken Plugin\nVersion: 9.1.0\n*/\n",
+        )
+        .unwrap();
+
+        let sqlite_path = site_dir.join("wp-content").join("database").join(".ht.sqlite");
+        let seed_sql = format!(
+            "CREATE TABLE wpl8_options (option_id INTEGER PRIMARY KEY AUTOINCREMENT, option_name TEXT UNIQUE, option_value TEXT, autoload TEXT);
+             CREATE TABLE wpl8_users (ID INTEGER PRIMARY KEY AUTOINCREMENT, user_login TEXT, user_pass TEXT, user_email TEXT);
+             CREATE TABLE wpl8_usermeta (umeta_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, meta_key TEXT, meta_value TEXT);
+             INSERT INTO wpl8_options (option_name, option_value, autoload) VALUES
+               ('stylesheet', 'boxshop-child', 'yes'),
+               ('template', 'boxshop', 'yes'),
+               ('current_theme', 'BoxShop Child', 'yes'),
+               ('blogname', 'Broken Shop', 'yes'),
+               ('admin_email', 'shop@brokenwp.local', 'yes'),
+               ('blog_public', '1', 'yes'),
+               ('active_plugins', 'a:1:{{i:0;s:31:\"broken-plugin/broken-plugin.php\";}}', 'yes'),
+               ('auto_update_plugins', 'a:0:{{}}', 'yes'),
+               ('auto_update_themes', 'a:0:{{}}', 'yes');
+             INSERT INTO wpl8_users (ID, user_login, user_pass, user_email) VALUES (1, 'shopadmin', 'oldhash', 'shop@brokenwp.local');
+             INSERT INTO wpl8_usermeta (user_id, meta_key, meta_value) VALUES (1, 'wpl8_capabilities', 'a:1:{{s:13:\"administrator\";b:1;}}');",
+        );
+        crate::databases::run_sqlite_query(&sqlite_path, &seed_sql).unwrap();
+
+        // Confirm wp-load.php actually crashes with Fatal error
+        let _ = php_exe;
+        assert!(run_wp_php(&site_dir, "brokenwp.local", "require_once __DIR__ . '/wp-load.php'; echo json_encode(['ok'=>true]);", &[]).is_err());
+
+        // 1. Listing themes and plugins works directly from DB despite broken wp-load.php
+        let themes = list_themes(&site_dir, "brokenwp.local");
+        assert!(themes.iter().any(|t| t["name"] == "boxshop-child" && t["status"] == "active"));
+        assert!(themes.iter().any(|t| t["name"] == "twentytwentyfour" && t["status"] == "inactive"));
+        let plugins = list_plugins(&site_dir, "brokenwp.local");
+        assert!(plugins.iter().any(|p| p["name"] == "broken-plugin/broken-plugin.php" && p["status"] == "active" && p["version"] == "9.1.0"));
+
+        // 2. Disabling broken active theme switches cleanly to fallback twentytwentyfour directly in DB
+        let deact_theme = plugin_or_theme_action(&site_dir, "brokenwp.local", "theme", "deactivate", "boxshop-child").unwrap();
+        assert_eq!(deact_theme["ok"], true);
+        assert_eq!(deact_theme["direct_db"], true);
+        assert_eq!(deact_theme["active_theme"], "twentytwentyfour");
+        let themes_after = list_themes(&site_dir, "brokenwp.local");
+        assert!(themes_after.iter().any(|t| t["name"] == "twentytwentyfour" && t["status"] == "active"));
+        assert!(themes_after.iter().any(|t| t["name"] == "boxshop-child" && t["status"] == "inactive"));
+
+        // 3. Re-activating child theme updates both stylesheet + parent template directly in DB without executing functions.php
+        let act_child = plugin_or_theme_action(&site_dir, "brokenwp.local", "theme", "activate", "boxshop-child").unwrap();
+        assert_eq!(act_child["ok"], true);
+        let tpl_q = crate::databases::run_sqlite_query(&sqlite_path, "SELECT option_value FROM wpl8_options WHERE option_name='template'").unwrap();
+        assert_eq!(tpl_q["rows"][0][0], "boxshop");
+
+        // 4. Disabling and re-activating plugins works directly in DB even when theme is fatal
+        let deact_plug = plugin_or_theme_action(&site_dir, "brokenwp.local", "plugin", "deactivate", "broken-plugin").unwrap();
+        assert_eq!(deact_plug["ok"], true);
+        let plugins_off = list_plugins(&site_dir, "brokenwp.local");
+        assert!(plugins_off.iter().any(|p| p["name"] == "broken-plugin/broken-plugin.php" && p["status"] == "inactive"));
+        let act_plug = plugin_or_theme_action(&site_dir, "brokenwp.local", "plugin", "activate", "broken-plugin").unwrap();
+        assert_eq!(act_plug["ok"], true);
+        let plugins_on = list_plugins(&site_dir, "brokenwp.local");
+        assert!(plugins_on.iter().any(|p| p["name"] == "broken-plugin/broken-plugin.php" && p["status"] == "active"));
+
+        // 5. Features status, setup/password reset, and CLI commands work directly in DB
+        let state = crate::state::AppState::new_with_dirs(tmp.join("cfg"), tmp.join("sites"));
+        toggle_feature(&state, &site_dir, "brokenwp.local", "search_indexing", false, None).unwrap();
+        let feat = get_wp_features_status(&site_dir, "brokenwp.local", false);
+        assert_eq!(feat["search_indexing"], false);
+        assert_eq!(feat["site_title"], "Broken Shop");
+        assert_eq!(feat["admin_user"], "shopadmin");
+
+        setup_wp(&site_dir, "brokenwp.local", Some("shopadmin"), Some("new@brokenwp.local"), Some("NewPass!123"), Some("Recovered Shop")).unwrap();
+        let feat2 = get_wp_features_status(&site_dir, "brokenwp.local", false);
+        assert_eq!(feat2["site_title"], "Recovered Shop");
+        assert_eq!(feat2["admin_email"], "new@brokenwp.local");
+
+        let cli_res = run_wp_cli_command(&site_dir, "brokenwp.local", "theme activate twentytwentyfour").unwrap();
+        assert!(cli_res.contains("twentytwentyfour"));
+        let cli_opt = run_wp_cli_command(&site_dir, "brokenwp.local", "option get stylesheet").unwrap();
+        assert_eq!(cli_opt.trim(), "twentytwentyfour");
 
         let _ = fs::remove_dir_all(&tmp);
     }

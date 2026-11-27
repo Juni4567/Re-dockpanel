@@ -2,12 +2,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 import React from "react";
 import { renderToString } from "react-dom/server";
 import { ApiError } from "../api";
-import {
-  NotificationProvider,
-  GlobalNotificationBanner,
-  buildAlertDetails,
-  defaultAutoDismissMs,
-} from "../context/NotificationContext";
+import { NotificationProvider, GlobalNotificationBanner, buildAlertDetails, defaultAutoDismissMs } from "../context/NotificationContext";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 describe("NotificationContext & Real-Time Alerts", () => {
   beforeEach(() => {
@@ -79,5 +75,24 @@ describe("NotificationContext & Real-Time Alerts", () => {
       )
     );
     expect(html).toBe("");
+  });
+
+  it("renders ConfirmDialog with keep-files checkbox option", () => {
+    const html = renderToString(
+      React.createElement(ConfirmDialog, {
+        title: 'Remove "shop.local"?',
+        label: "Confirm removal",
+        checkbox: {
+          label: "Delete website folder and files from disk",
+          description: "Uncheck to keep files.",
+          checked: false,
+          onChange: () => {},
+        },
+        onConfirm: () => {},
+        onCancel: () => {},
+      })
+    );
+    expect(html).toContain("Delete website folder and files from disk");
+    expect(html).toContain("Uncheck to keep files.");
   });
 });

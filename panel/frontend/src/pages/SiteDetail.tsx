@@ -86,6 +86,7 @@ export default function SiteDetail() {
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteFilesOnDisk, setDeleteFilesOnDisk] = useState(true);
   const [showInstallWpModal, setShowInstallWpModal] = useState(false);
 
   // App Process management
@@ -656,8 +657,20 @@ export default function SiteDetail() {
   const handleDelete = async () => {
     setDeleting(true);
     try {
-      await api.delete(`/sites/${id}`);
-      showGlobalNotification("info", `Site ${site?.domain || id} has been permanently deleted`, "Site Deleted");
+      await api.delete(deleteFilesOnDisk ? `/sites/${id}` : `/sites/${id}?keep_files=true`);
+      showGlobalNotification(
+        "info",
+        deleteFilesOnDisk
+          ? `Site ${site?.domain || id} and its files have been deleted`
+          : `Removed ${site?.domain || id} from DockPanel (website folder & files kept on disk)`,
+        deleteFilesOnDisk ? "Site Deleted" : "Site Unregistered",
+        `Domain: ${site?.domain || id}\nFiles on disk: ${deleteFilesOnDisk ? "Deleted" : "Preserved"}`,
+        {
+          category: "site",
+          target: site?.domain || id,
+          dedupeKey: `site-delete:${site?.domain || id}`,
+        }
+      );
       navigate("/sites");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Delete failed");
@@ -799,7 +812,7 @@ export default function SiteDetail() {
       <div className="flex items-start justify-between mb-6">
         <div className="flex items-start gap-4">
           <div className="w-20 h-14 rounded-lg border border-dark-600 bg-dark-800 shrink-0 overflow-hidden relative shadow-md group/thumb">
-            <SiteThumbnail domain={site.domain} className="w-full h-full" w={400} />
+            <SiteThumbnail domain={site.domain} showRefresh className="w-full h-full" w={400} />
             <a
               href={
                 desktop
@@ -1059,7 +1072,10 @@ export default function SiteDetail() {
                 )
               )}
               <button
-                onClick={() => setConfirmDelete(true)}
+                onClick={() => {
+                  setDeleteFilesOnDisk(true);
+                  setConfirmDelete(true);
+                }}
                 className="px-4 py-2 bg-danger-500/10 text-danger-400 rounded-lg text-sm font-medium hover:bg-danger-500/20 transition-colors"
               >
                 Delete
@@ -1068,24 +1084,48 @@ export default function SiteDetail() {
         </div>
         {confirmDelete && (
           <ConfirmDialog
-            title={`Permanently Delete "${site?.domain}"?`}
-            label={`You are about to permanently delete ${site?.domain}. This is an irreversible destructive action.`}
+            title={`Remove "${site?.domain}"?`}
+            label={
+              deleteFilesOnDisk
+                ? `You are about to permanently delete ${site?.domain} and its files on disk.`
+                : `You are about to unregister ${site?.domain} from DockPanel while keeping its folder and files on disk.`
+            }
             consequences={
               desktop
                 ? [
-                    `Local site files for ${site?.domain} will be permanently deleted.`,
+                    deleteFilesOnDisk
+                      ? `Local site files for ${site?.domain} will be permanently deleted.`
+                      : `Website folder & files for ${site?.domain} will be kept intact on disk (available under Discovered Folders if you scan again).`,
                     "The local hosts entry and router mapping for this domain will be removed.",
-                    "Any attached local database records for this site will be cleaned up.",
+                    deleteFilesOnDisk
+                      ? "Any attached local database records for this site will be cleaned up."
+                      : "Site registration will be removed from DockPanel.",
                   ]
                 : [
-                    `All web files and directories located in /var/www/${site?.domain} will be permanently wiped.`,
+                    deleteFilesOnDisk
+                      ? `All web files and directories located in /var/www/${site?.domain} will be permanently wiped.`
+                      : `Website files in /var/www/${site?.domain} will be kept intact on disk.`,
                     "Nginx reverse proxy virtual host configuration will be removed and Nginx reloaded.",
                     "Active background application services (Node.js, Python, or PHP-FPM pools) will be stopped and deleted.",
                     "All SSL/TLS certificates, environment variables (.env), and associated staging clones will be removed.",
                   ]
             }
-            confirmLabel={deleting ? "Deleting Site..." : "Permanently Delete Site"}
-            tone="danger"
+            checkbox={{
+              label: "Delete website folder and files from disk",
+              description: deleteFilesOnDisk
+                ? "Uncheck this box if you want to remove the site from DockPanel but keep all website files and folders."
+                : "Checked OFF — DockPanel will preserve your website folder and files on disk.",
+              checked: deleteFilesOnDisk,
+              onChange: setDeleteFilesOnDisk,
+            }}
+            confirmLabel={
+              deleting
+                ? "Deleting Site..."
+                : deleteFilesOnDisk
+                ? "Permanently Delete Site & Files"
+                : "Remove Site (Keep Files)"
+            }
+            tone={deleteFilesOnDisk ? "danger" : "warn"}
             onConfirm={handleDelete}
             onCancel={() => setConfirmDelete(false)}
           />
