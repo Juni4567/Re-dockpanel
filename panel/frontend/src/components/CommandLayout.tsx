@@ -9,6 +9,7 @@ import Sidebar from "./Sidebar";
 import { PANEL_VERSION } from "../constants";
 import { useState, useRef, useEffect } from "react";
 import { GlobalNotificationBanner } from "../context/NotificationContext";
+import ServiceReadinessBanner from "./ServiceReadinessBanner";
 
 export default function CommandLayout() {
   const state = useLayoutState();
@@ -159,6 +160,7 @@ export default function CommandLayout() {
         )}
 
         <main id="main-content" className={`flex-1 ${showHeader ? "overflow-y-auto bg-dark-950" : "overflow-auto"}`}>
+          <ServiceReadinessBanner />
           <GlobalNotificationBanner />
           <Outlet />
         </main>

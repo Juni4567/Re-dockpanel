@@ -331,15 +331,196 @@ fn is_hop_by_hop_or_framing_header(name: &str) -> bool {
     )
 }
 
+fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
+    let upgrade_ws = headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let conn_upgrade = headers
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false);
+    upgrade_ws && conn_upgrade
+}
+
+async fn proxy_websocket_upgrade(
+    worker_port: u16,
+    target_path_and_query: &str,
+    mut req: axum::extract::Request,
+) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let proto = req
+        .extensions()
+        .get::<IsHttps>()
+        .map(|h| h.0)
+        .unwrap_or(false);
+    let method = req.method().as_str().to_string();
+    let headers_snapshot = req.headers().clone();
+    let on_upgrade = hyper::upgrade::on(&mut req);
+
+    let mut upstream = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(("127.0.0.1", worker_port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return render_error_page(
+                StatusCode::BAD_GATEWAY,
+                "502 Bad Gateway",
+                &format!("WebSocket worker connection failed: {}", e),
+            );
+        }
+        Err(_) => {
+            return render_error_page(
+                StatusCode::GATEWAY_TIMEOUT,
+                "504 Gateway Timeout",
+                "Timed out connecting to WebSocket worker.",
+            );
+        }
+    };
+
+    let mut raw_req = format!("{} {} HTTP/1.1\r\n", method, target_path_and_query);
+    let original_host = headers_snapshot
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if let Some(ref host_str) = original_host {
+        raw_req.push_str(&format!("Host: {}\r\n", host_str));
+        raw_req.push_str(&format!("X-Forwarded-Host: {}\r\n", host_str));
+    } else {
+        raw_req.push_str(&format!("Host: 127.0.0.1:{}\r\n", worker_port));
+    }
+    raw_req.push_str(&format!(
+        "X-Forwarded-Proto: {}\r\nX-Forwarded-For: 127.0.0.1\r\n",
+        if proto { "https" } else { "http" }
+    ));
+
+    for (name, val) in headers_snapshot.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "host" | "x-forwarded-host" | "x-forwarded-proto" | "x-forwarded-for" | "content-length"
+        ) {
+            continue;
+        }
+        if let Ok(v_str) = val.to_str() {
+            raw_req.push_str(&format!("{}: {}\r\n", name.as_str(), v_str));
+        }
+    }
+    raw_req.push_str("\r\n");
+
+    if let Err(e) = upstream.write_all(raw_req.as_bytes()).await {
+        return render_error_page(
+            StatusCode::BAD_GATEWAY,
+            "502 Bad Gateway",
+            &format!("Failed sending WebSocket upgrade to worker: {}", e),
+        );
+    }
+
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 2048];
+    let header_end = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), upstream.read(&mut tmp)).await
+        {
+            Ok(Ok(0)) => {
+                return render_error_page(
+                    StatusCode::BAD_GATEWAY,
+                    "502 Bad Gateway",
+                    "Worker closed connection before completing WebSocket handshake.",
+                );
+            }
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if buf.len() > 32 * 1024 {
+                    return render_error_page(
+                        StatusCode::BAD_GATEWAY,
+                        "502 Bad Gateway",
+                        "WebSocket handshake headers exceeded 32 KB limit.",
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                return render_error_page(
+                    StatusCode::BAD_GATEWAY,
+                    "502 Bad Gateway",
+                    &format!("WebSocket handshake read error: {}", e),
+                );
+            }
+            Err(_) => {
+                return render_error_page(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "504 Gateway Timeout",
+                    "WebSocket handshake timed out.",
+                );
+            }
+        }
+    };
+
+    let head_str = String::from_utf8_lossy(&buf[..header_end]);
+    let leftover = buf[header_end..].to_vec();
+    let mut lines = head_str.split("\r\n");
+    let status_line = lines.next().unwrap_or("HTTP/1.1 502 Bad Gateway");
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+
+    let mut res_builder = Response::builder().status(status_code);
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if let (Ok(hk), Ok(hv)) = (
+                axum::http::HeaderName::from_bytes(k.trim().as_bytes()),
+                axum::http::HeaderValue::from_bytes(v.trim().as_bytes()),
+            ) {
+                res_builder = res_builder.header(hk, hv);
+            }
+        }
+    }
+
+    if status_code == StatusCode::SWITCHING_PROTOCOLS {
+        tokio::spawn(async move {
+            if let Ok(upgraded) = on_upgrade.await {
+                let mut client_io = hyper_util::rt::TokioIo::new(upgraded);
+                if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client_io, &mut upstream).await;
+            }
+        });
+        return res_builder.body(axum::body::Body::empty()).unwrap();
+    }
+
+    res_builder.body(axum::body::Body::from(leftover)).unwrap()
+}
+
 async fn proxy_to_worker(
     worker_port: u16,
     target_path_and_query: &str,
     req: axum::extract::Request,
 ) -> Response {
+    if is_websocket_upgrade(req.headers()) {
+        return proxy_websocket_upgrade(worker_port, target_path_and_query, req).await;
+    }
+
     static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_default()
@@ -390,20 +571,7 @@ async fn proxy_to_worker(
     }
     builder = builder.header("x-forwarded-proto", if proto { "https" } else { "http" });
     builder = builder.header("x-forwarded-for", "127.0.0.1");
-
-    let body_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(axum::body::Body::from(format!("Failed to read request body: {}", e)))
-                .unwrap();
-        }
-    };
-
-    if !body_bytes.is_empty() {
-        builder = builder.body(body_bytes);
-    }
+    builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
 
     match builder.send().await {
         Ok(resp) => {
@@ -423,26 +591,66 @@ async fn proxy_to_worker(
                 }
             }
 
-            match resp.bytes().await {
-                Ok(bytes) => res_builder.body(axum::body::Body::from(bytes)).unwrap(),
-                Err(e) => Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(axum::body::Body::from(format!("Error reading worker response: {}", e)))
-                    .unwrap(),
-            }
+            res_builder
+                .body(axum::body::Body::from_stream(resp.bytes_stream()))
+                .unwrap()
         }
         Err(e) => Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
             .body(axum::body::Body::from(format!(
-                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1><p>Error connecting to PHP worker: {}</p></body></html>",
+                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1><p>Error connecting to worker: {}</p></body></html>",
                 html_escape(&e.to_string())
             )))
             .unwrap(),
     }
 }
 
+fn match_site_redirect(
+    redirects: &[crate::state::SiteRedirect],
+    req_path: &str,
+) -> Option<(StatusCode, String)> {
+    for r in redirects {
+        let src = r.source.trim();
+        let tgt = r.target.trim();
+        if src.is_empty() || tgt.is_empty() {
+            continue;
+        }
+        let status = if r.redirect_type.trim() == "302" {
+            StatusCode::FOUND
+        } else {
+            StatusCode::MOVED_PERMANENTLY
+        };
+        if let Some(prefix) = src.strip_suffix("/*") {
+            let norm_prefix = if prefix.is_empty() { "/" } else { prefix };
+            if req_path == norm_prefix || req_path.starts_with(&format!("{}/", norm_prefix.trim_end_matches('/'))) {
+                let suffix = req_path
+                    .strip_prefix(norm_prefix.trim_end_matches('/'))
+                    .unwrap_or("");
+                let dest = if let Some(base) = tgt.strip_suffix("/*") {
+                    format!("{}{}", base.trim_end_matches('/'), suffix)
+                } else {
+                    tgt.to_string()
+                };
+                return Some((status, dest));
+            }
+        } else if req_path == src {
+            return Some((status, tgt.to_string()));
+        }
+    }
+    None
+}
+
 pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppState>) -> Response {
+    let req_started = std::time::Instant::now();
+    let method_str = req.method().as_str().to_string();
+    let is_https = req.extensions().get::<IsHttps>().map(|h| h.0).unwrap_or(false);
+    let path_and_query_for_log = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
     // 1. Extract Host header. Strip port if present.
     let host_header = match req.headers().get(axum::http::header::HOST).and_then(|h| h.to_str().ok()) {
         Some(h) if !h.trim().is_empty() => h.trim(),
@@ -457,8 +665,8 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
 
     let domain = host_header.split(':').next().unwrap_or(host_header).trim();
 
-    // 2. Lookup site in AppState::get_site
-    let site = match state.get_site(domain) {
+    // 2. Lookup site by primary domain or alias
+    let site = match state.resolve_site_by_host(domain) {
         Some(s) => s,
         None => {
             // 3. Domain not registered in DockPanel
@@ -466,6 +674,49 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
         }
     };
 
+    let req_path_only = req.uri().path().to_string();
+    let client_ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+
+    let resp = route_matched_site_request(req, &state, &site).await;
+    let elapsed_ms = req_started.elapsed().as_millis();
+    let status_code = resp.status().as_u16();
+    let resp_bytes = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    state.record_site_traffic(&site.domain, &req_path_only, status_code, resp_bytes, &client_ip);
+    let scheme = if is_https { "HTTPS" } else { "HTTP" };
+    let location_note = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|loc| format!(" (Location: {})", loc))
+        .unwrap_or_default();
+    state.append_site_access_log(
+        &site.domain,
+        &format!(
+            "{} {} {} -> {}{} [{}ms]",
+            scheme, method_str, path_and_query_for_log, status_code, location_note, elapsed_ms
+        ),
+    );
+    resp
+}
+
+async fn route_matched_site_request(
+    req: axum::extract::Request,
+    state: &Arc<AppState>,
+    site: &crate::state::LocalSite,
+) -> Response {
     // 4. If site status is "stopped"
     if site.status.eq_ignore_ascii_case("stopped") {
         return render_stopped_page(&site.domain);
@@ -508,6 +759,15 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| uri_path.clone());
+
+    // 5a. Enforce per-site redirect rules (301 / 302) before serving or proxying
+    if let Some((redir_status, location)) = match_site_redirect(&site.redirects, &uri_path) {
+        return Response::builder()
+            .status(redir_status)
+            .header(axum::http::header::LOCATION, location)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
     let safe_rel = sanitize_path(&uri_path);
     let doc_root = state.site_dir(&site);
     let target_path = doc_root.join(&safe_rel);
@@ -561,6 +821,7 @@ pub async fn handle_router_request(req: axum::extract::Request, state: Arc<AppSt
                 Ok(content) => Response::builder()
                     .status(StatusCode::OK)
                     .header(axum::http::header::CONTENT_TYPE, content_type)
+                    .header(axum::http::header::CONTENT_LENGTH, content.len())
                     .body(axum::body::Body::from(content))
                     .unwrap(),
                 Err(_) => Response::builder()
@@ -1201,6 +1462,170 @@ Active Connections
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "hello-from-node-worker");
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_site_aliases_and_redirects_routing() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_alias_redir_{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites")));
+        let site = state.create_site("main.test", Some("8.3")).unwrap();
+        std::fs::write(Path::new(&site.document_root).join("index.html"), "Primary Content").unwrap();
+
+        let aliases = state.add_site_alias(&site.id, "www.main.test").unwrap();
+        assert_eq!(aliases, vec!["www.main.test".to_string()]);
+
+        state.add_site_redirect(&site.id, "/old", "https://main.test/new", "301").unwrap();
+        state.add_site_redirect(&site.id, "/docs/*", "https://docs.main.test/*", "302").unwrap();
+
+        // Request via alias domain serves site content
+        let alias_req = axum::http::Request::builder()
+            .header("host", "www.main.test")
+            .uri("/index.html")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let alias_resp = handle_router_request(alias_req, state.clone()).await;
+        assert_eq!(alias_resp.status(), StatusCode::OK);
+        let alias_body = axum::body::to_bytes(alias_resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&alias_body).unwrap(), "Primary Content");
+
+        // Exact 301 redirect
+        let redir1 = axum::http::Request::builder()
+            .header("host", "main.test")
+            .uri("/old")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let r1 = handle_router_request(redir1, state.clone()).await;
+        assert_eq!(r1.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(r1.headers().get("location").unwrap(), "https://main.test/new");
+
+        // Wildcard 302 redirect preserves suffix
+        let redir2 = axum::http::Request::builder()
+            .header("host", "www.main.test")
+            .uri("/docs/getting-started")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let r2 = handle_router_request(redir2, state.clone()).await;
+        assert_eq!(r2.status(), StatusCode::FOUND);
+        assert_eq!(
+            r2.headers().get("location").unwrap(),
+            "https://docs.main.test/getting-started"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_websocket_upgrade_tunnel_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_ws_e2e_{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites")));
+        let site = state
+            .create_site_with_options("ws-app.test", Some("node"), None, None, Some("node server.js"), None)
+            .unwrap();
+
+        // Mock WebSocket echo TCP server
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_port = ws_listener.local_addr().unwrap().port();
+        let ws_task = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = ws_listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req_txt = String::from_utf8_lossy(&buf[..n]);
+                assert!(req_txt.contains("Upgrade: websocket") || req_txt.contains("upgrade: websocket"));
+                sock.write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                let mut echo_buf = [0u8; 64];
+                if let Ok(m) = sock.read(&mut echo_buf).await {
+                    let _ = sock.write_all(&echo_buf[..m]).await;
+                }
+            }
+        });
+        state.set_site_worker_port(&site.domain, worker_port);
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let router_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let router_handle = start_site_router(state.clone(), router_port);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", router_port))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: ws-app.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut resp_buf = [0u8; 2048];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        let resp_txt = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp_txt.contains("101 Switching Protocols"), "Unexpected WS response: {}", resp_txt);
+        assert!(resp_txt.contains("test-accept"));
+
+        client.write_all(b"ping-tunnel").await.unwrap();
+        let mut echoed = [0u8; 32];
+        let en = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&echoed[..en], b"ping-tunnel");
+
+        router_handle.abort();
+        ws_task.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_response_e2e() {
+        use tokio_stream::StreamExt;
+
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_stream_e2e_{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites")));
+        let site = state
+            .create_site_with_options("stream-app.test", Some("node"), None, None, Some("node server.js"), None)
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker_port = listener.local_addr().unwrap().port();
+        let mock_app = axum::Router::new().fallback(|| async {
+            let s = tokio_stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: chunk1\n\n")),
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: chunk2\n\n")),
+            ]);
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(s))
+                .unwrap()
+        });
+        let worker_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+        state.set_site_worker_port(&site.domain, worker_port);
+
+        let req = axum::http::Request::builder()
+            .header("host", "stream-app.test")
+            .uri("/events")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = handle_router_request(req, state.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut data_stream = resp.into_body().into_data_stream();
+        let mut combined = String::new();
+        while let Some(Ok(chunk)) = data_stream.next().await {
+            combined.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(combined.contains("data: chunk1"));
+        assert!(combined.contains("data: chunk2"));
+
+        worker_task.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

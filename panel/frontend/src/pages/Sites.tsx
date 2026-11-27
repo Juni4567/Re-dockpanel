@@ -1,15 +1,27 @@
-import { useState, useEffect, FormEvent } from "react";
+import { useState, useEffect, useRef, FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { formatDate, formatSize } from "../utils/format";
 import { statusColors, runtimeLabels } from "../constants";
-import ProvisionLog from "../components/ProvisionLog";
+import ProvisionLog, {
+  type ProvisionStep,
+  type ProvisionCompatMeta,
+} from "../components/ProvisionLog";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
 import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
-import SiteThumbnail from "../components/SiteThumbnail";
+import SiteThumbnail, { warmSiteThumbnailCache } from "../components/SiteThumbnail";
 import SiteFavicon from "../components/SiteFavicon";
 import DesktopSiteActions from "../components/DesktopSiteActions";
+import DiscoveredFoldersPanel, {
+  type DiscoveredFolder,
+  type FolderImportRequest,
+  type FailedFolderImportState,
+  type DetectedDbFile,
+  MEMORY_LIMIT_OPTIONS,
+} from "../components/DiscoveredFoldersPanel";
+import DirectoryDbSelector from "../components/DirectoryDbSelector";
 import InstallWordPressModal from "../components/InstallWordPressModal";
 import LiveSyncModal from "../components/LiveSyncModal";
 import PortConflictModal, {
@@ -17,7 +29,7 @@ import PortConflictModal, {
   buildSiteExternalUrl,
 } from "../components/PortConflictModal";
 import { isDesktopApp, formatDesktopDomain } from "../utils/desktop";
-import { showGlobalNotification } from "../context/NotificationContext";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
 import { useAuth } from "../context/AuthContext";
 
 interface SiteMetrics {
@@ -59,7 +71,13 @@ export default function Sites() {
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState("");
-  const [provisioningSiteId, setProvisioningSiteId] = useState<string | null>(null);
+  const [provisionJob, setProvisionJob] = useState<{
+    siteId?: string;
+    sseUrl?: string;
+    title?: string;
+    defaultShowLogs?: boolean;
+    externalSteps?: ProvisionStep[];
+  } | null>(null);
   const [search, setSearch] = useState("");
   const [displayCount, setDisplayCount] = useState(25);
   const [viewMode, setViewMode] = useState<"table" | "grid">("table");
@@ -101,6 +119,55 @@ export default function Sites() {
   const [wpDbEngine, setWpDbEngine] = useState<"sqlite" | "mariadb">("sqlite");
   const [customRootPath, setCustomRootPath] = useState("");
   const [defaultSitesDir, setDefaultSitesDir] = useState("");
+  const [browsingFolder, setBrowsingFolder] = useState(false);
+  const [inspectingFolder, setInspectingFolder] = useState(false);
+  const [folderInspection, setFolderInspection] = useState<{
+    path: string;
+    exists: boolean;
+    is_dir: boolean;
+    is_empty: boolean;
+    file_count: number;
+    detected_type: string;
+    is_wordpress: boolean;
+    has_wp_config: boolean;
+    wp_version?: string | null;
+    wp_table_prefix?: string | null;
+    wp_db_name?: string | null;
+    wp_siteurl?: string | null;
+    detected_db_files?: DetectedDbFile[];
+    other_directory_db_files?: DetectedDbFile[];
+  } | null>(null);
+  const [wpDbFile, setWpDbFile] = useState<File | null>(null);
+  const [wpLocalDb, setWpLocalDb] = useState<DetectedDbFile | null>(null);
+  const [wpSourceUrl, setWpSourceUrl] = useState("");
+  const [wpMemoryLimitMb, setWpMemoryLimitMb] = useState<number>(1024);
+  const [skipWpDbUpload, setSkipWpDbUpload] = useState(false);
+  const [discoveredFolders, setDiscoveredFolders] = useState<DiscoveredFolder[]>([]);
+  const [discoveredRootDbFiles, setDiscoveredRootDbFiles] = useState<DetectedDbFile[]>([]);
+  const [scanningFolders, setScanningFolders] = useState(false);
+  const [hasScannedFolders, setHasScannedFolders] = useState(false);
+  const [failedFolderImports, setFailedFolderImports] = useState<Record<string, FailedFolderImportState>>({});
+  const [compatPrompt, setCompatPrompt] = useState<{
+    error: string;
+    fixes: string[];
+    targetVersion?: string;
+    retry: () => Promise<void>;
+  } | null>(null);
+  const activeImportRef = useRef<{
+    siteId: string;
+    domain: string;
+    runtime: string;
+    isWordPress: boolean;
+    appCommand?: string;
+    isConnectExisting: boolean;
+    folderPath?: string;
+    dbFile: File | null;
+    localDbPath: string;
+    localDbObj: DetectedDbFile | null;
+    sourceUrl: string;
+    dbName: string;
+    memoryLimitMb: number;
+  } | null>(null);
   const [sslPort, setSslPort] = useState<number | null>(null);
   const [enableBackup, setEnableBackup] = useState(false);
   const [backupFrequency, setBackupFrequency] = useState("daily");
@@ -170,6 +237,25 @@ export default function Sites() {
 
   useEffect(fetchSites, [allSites]);
 
+  const discoverFolders = () => {
+    if (!isDesktopApp()) return;
+    setScanningFolders(true);
+    setHasScannedFolders(true);
+    api
+      .get<{
+        sites_dir?: string;
+        folders?: DiscoveredFolder[];
+        root_db_files?: DetectedDbFile[];
+      }>("/desktop/discover-folders")
+      .then((res) => {
+        if (res?.sites_dir) setDefaultSitesDir(res.sites_dir);
+        setDiscoveredFolders(Array.isArray(res?.folders) ? res.folders : []);
+        setDiscoveredRootDbFiles(Array.isArray(res?.root_db_files) ? res.root_db_files : []);
+      })
+      .catch(() => {})
+      .finally(() => setScanningFolders(false));
+  };
+
   useEffect(() => {
     if (!isDesktopApp()) return;
     api.get<PortConflictInfo>("/system/ports/conflict").then(setConflictInfo).catch(() => {});
@@ -184,6 +270,99 @@ export default function Sites() {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    const trimmed = customRootPath.trim();
+    if (!trimmed) {
+      setInspectingFolder(false);
+      setFolderInspection(null);
+      setWpDbFile(null);
+      setWpLocalDb(null);
+      setWpSourceUrl("");
+      setSkipWpDbUpload(false);
+      return;
+    }
+    setInspectingFolder(true);
+    const timer = setTimeout(() => {
+      api
+        .post<NonNullable<typeof folderInspection>>("/desktop/inspect-folder", { path: trimmed })
+        .then((insp) => applyFolderInspection(insp))
+        .catch(() => {})
+        .finally(() => setInspectingFolder(false));
+    }, 300);
+    return () => {
+      clearTimeout(timer);
+      setInspectingFolder(false);
+    };
+  }, [customRootPath]);
+
+  const applyFolderInspection = (insp: NonNullable<typeof folderInspection>) => {
+    setFolderInspection(insp);
+    const detectedList = Array.isArray(insp.detected_db_files) ? insp.detected_db_files : [];
+    const suggestedDb =
+      detectedList.find((d) => d.matches_site === true) ||
+      detectedList.find((d) => d.matches_site !== false) ||
+      null;
+    if (!wpDbFile && !wpLocalDb && suggestedDb) {
+      setWpLocalDb(suggestedDb);
+    }
+    if (insp.is_wordpress) {
+      setCms("");
+      setRuntime("php");
+      setPhpPreset("wordpress");
+      if ((insp.wp_siteurl || suggestedDb?.detected_site_url) && !wpSourceUrl) {
+        setWpSourceUrl(insp.wp_siteurl || suggestedDb?.detected_site_url || "");
+      }
+    } else if (!insp.is_empty && insp.exists && insp.is_dir) {
+      setCms("");
+      if (insp.detected_type === "node") setRuntime("node");
+      else if (insp.detected_type === "php") setRuntime("php");
+      else if (insp.detected_type === "static") setRuntime("static");
+    }
+  };
+
+  const handleBrowseFolder = async () => {
+    setError("");
+    setBrowsingFolder(true);
+    try {
+      const res = await api.post<{
+        cancelled: boolean;
+        path?: string;
+        inspection?: NonNullable<typeof folderInspection>;
+      }>("/desktop/pick-folder", {
+        initial_dir: customRootPath.trim() || defaultSitesDir || undefined,
+      });
+      if (!res.cancelled && res.path) {
+        setCustomRootPath(res.path);
+        if (res.inspection) {
+          applyFolderInspection(res.inspection);
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed opening folder picker");
+    } finally {
+      setBrowsingFolder(false);
+    }
+  };
+
+  const fileToBase64 = (file: File, onReadProgress?: (pct: number) => void): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onprogress = (ev) => {
+        if (ev.lengthComputable && onReadProgress) {
+          onReadProgress(Math.round((ev.loaded / ev.total) * 100));
+        }
+      };
+      reader.onload = () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        const commaIdx = result.indexOf(",");
+        onReadProgress?.(100);
+        resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+      };
+      reader.onerror = () => reject(new Error("Failed reading selected database file"));
+      reader.readAsDataURL(file);
+    });
+
   // The transfer recipient is picked, not typed. A free-text email could only
   // ever fail late — `transfer` answers 404 "No account with that email" — and
   // an operator does not carry their clients' addresses in their head.
@@ -195,10 +374,17 @@ export default function Sites() {
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+
+    const isExistingWpDir = isDesktopApp() && !!folderInspection?.is_wordpress;
+    if (isExistingWpDir && !skipWpDbUpload && !wpDbFile && !wpLocalDb) {
+      setError("Existing WordPress directory detected — please select or upload a database dump (.sql, .sql.gz, .zip, or .sqlite) or check 'Skip database upload for now'.");
+      return;
+    }
+
     setSubmitting(true);
     try {
-      const effectiveRuntime = cms ? "php" : runtime;
-      const effectivePreset = cms || phpPreset;
+      const effectiveRuntime = isExistingWpDir ? "php" : (cms ? "php" : runtime);
+      const effectivePreset = isExistingWpDir ? "wordpress" : (cms || phpPreset);
       const effectiveDomainToCreate = isDesktopApp() ? formatDesktopDomain(domain, domainSuffix) : domain;
       const body: Record<string, unknown> = {
         domain: effectiveDomainToCreate,
@@ -215,8 +401,11 @@ export default function Sites() {
       }
       if (isDesktopApp() && customRootPath.trim()) {
         body.document_root = customRootPath.trim();
+        if (folderInspection && !folderInspection.is_empty) {
+          body.connect_existing = true;
+        }
       }
-      if (cms) {
+      if (cms && !isExistingWpDir) {
         body.cms = cms;
         if (cms === "wordpress" && isDesktopApp()) body.db_engine = wpDbEngine;
         if (siteTitle) body.site_title = siteTitle;
@@ -233,9 +422,14 @@ export default function Sites() {
       }
 
       const created = await api.post<Site>("/sites", body);
+      const isConnectExisting = !!body.connect_existing;
+      const canAttachDb = isDesktopApp() && !!folderInspection && !folderInspection.is_empty && folderInspection.is_dir;
+      const selectedDbFile = canAttachDb && wpDbFile && !skipWpDbUpload ? wpDbFile : null;
+      const selectedLocalDb = canAttachDb && !wpDbFile && !skipWpDbUpload ? wpLocalDb : null;
+      const selectedFolderPath = customRootPath.trim();
+      const selectedSourceUrl = wpSourceUrl.trim();
+
       setShowForm(false);
-      setProvisioningSiteId(created.id);
-      showGlobalNotification("info", `Creating local site ${created.domain}...`);
       setDomain("");
       setDomainSuffix(".test");
       setRuntime("static");
@@ -247,10 +441,28 @@ export default function Sites() {
       setAdminPassword("");
       setWpDbEngine("sqlite");
       setCustomRootPath("");
+      setFolderInspection(null);
+      setWpDbFile(null);
+      setWpLocalDb(null);
+      setWpSourceUrl("");
+      setSkipWpDbUpload(false);
       setEnableBackup(false);
       setBackupFrequency("daily");
       setBackupRetention(7);
       fetchSites();
+      if (hasScannedFolders) discoverFolders();
+
+      await runAfterCreateFlow(created, {
+        isConnectExisting,
+        isWordPress: isExistingWpDir,
+        runtime: effectiveRuntime,
+        appCommand: effectiveRuntime === "node" ? appCommand : undefined,
+        folderPath: selectedFolderPath,
+        dbFile: selectedDbFile,
+        localDbFile: selectedLocalDb,
+        sourceUrl: selectedSourceUrl,
+        memoryLimitMb: wpMemoryLimitMb,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create site");
     } finally {
@@ -258,10 +470,508 @@ export default function Sites() {
     }
   };
 
-  const handleProvisionComplete = () => {
-    setProvisioningSiteId(null);
-    showGlobalNotification("success", "Site provisioning complete");
+  const suggestWorkableMemoryMb = (errMsg: string, curMb: number): { nextMb: number; suggestion?: string } => {
+    const lower = errMsg.toLowerCase();
+    const isMemory =
+      lower.includes("allowed memory size") ||
+      lower.includes("out of memory") ||
+      lower.includes("memory_limit") ||
+      lower.includes("max_allowed_packet") ||
+      lower.includes("packet bigger") ||
+      lower.includes("413") ||
+      lower.includes("exhausted");
+    if (!isMemory) {
+      return { nextMb: curMb };
+    }
+    const nextMb = curMb < 0 ? -1 : curMb < 2048 ? 2048 : curMb < 4096 ? 4096 : -1;
+    const label = nextMb <= 0 ? "Unlimited (-1)" : `${nextMb} MB`;
+    return {
+      nextMb,
+      suggestion: `Workable Fix: Memory limit (${curMb <= 0 ? "Unlimited" : `${curMb} MB`}) was exhausted. Try bumping Import Memory to ${label} and click Retry.`,
+    };
+  };
+
+  const rollbackFailedImport = async (errMsg: string) => {
+    const ctx = activeImportRef.current;
+    activeImportRef.current = null;
+    if (!ctx) return;
+
+    if (ctx.isConnectExisting) {
+      await api.delete(`/sites/${ctx.siteId}?keep_files=true`).catch(() => {});
+      if (ctx.folderPath) {
+        const memAdvice = suggestWorkableMemoryMb(errMsg, ctx.memoryLimitMb);
+        setFailedFolderImports((prev) => ({
+          ...prev,
+          [ctx.folderPath!]: {
+            domain: ctx.domain,
+            runtime: ctx.runtime,
+            appCommand: ctx.appCommand || "",
+            dbFile: ctx.dbFile,
+            localDbPath: ctx.localDbPath,
+            localDb: ctx.localDbObj,
+            sourceUrl: ctx.sourceUrl,
+            dbName: ctx.dbName,
+            memoryLimitMb: memAdvice.nextMb,
+            error: errMsg,
+            memorySuggestion: memAdvice.suggestion,
+          },
+        }));
+      }
+    }
     fetchSites();
+    discoverFolders();
+  };
+
+  const runAfterCreateFlow = async (
+    created: Site,
+    opts: {
+      isConnectExisting: boolean;
+      isWordPress: boolean;
+      runtime?: string;
+      appCommand?: string;
+      folderPath?: string;
+      dbFile: File | null;
+      localDbFile: DetectedDbFile | null;
+      sourceUrl?: string;
+      dbName?: string;
+      memoryLimitMb?: number;
+      applyCompatFixes?: boolean;
+    }
+  ) => {
+    const memLimitMb = opts.memoryLimitMb ?? 1024;
+    // Fetch and cache site thumbnail once on site initialization
+    warmSiteThumbnailCache(created.domain, false);
+    activeImportRef.current = opts.isConnectExisting
+      ? {
+          siteId: created.id,
+          domain: created.domain,
+          runtime: opts.runtime || created.runtime || "php",
+          isWordPress: opts.isWordPress,
+          appCommand: opts.appCommand,
+          isConnectExisting: true,
+          folderPath: opts.folderPath,
+          dbFile: opts.dbFile,
+          localDbPath: opts.localDbFile?.path || "",
+          localDbObj: opts.localDbFile,
+          sourceUrl: opts.sourceUrl || "",
+          dbName: opts.dbName || "",
+          memoryLimitMb: memLimitMb,
+        }
+      : null;
+
+    const targetUrl =
+      sslPort && created.ssl_enabled
+        ? buildSiteExternalUrl(created.domain, sslPort, true)
+        : buildSiteExternalUrl(created.domain, conflictInfo?.active_port, false);
+    const hasDbToImport = !!(opts.dbFile || opts.localDbFile);
+    const importEndpoint = opts.isWordPress
+      ? `/sites/${created.id}/wordpress/import-database`
+      : `/sites/${created.id}/database/import`;
+
+    if (hasDbToImport) {
+      const ts = () => new Date().toTimeString().slice(0, 8);
+      const fmtSize = (bytes: number) =>
+        bytes < 1024 * 1024
+          ? `${Math.max(1, Math.round(bytes / 1024))} KB`
+          : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      const dbFilename = opts.dbFile ? opts.dbFile.name : opts.localDbFile!.name;
+      const dbBytes = opts.dbFile ? opts.dbFile.size : opts.localDbFile!.size_bytes;
+      const fileSizeLabel = fmtSize(dbBytes);
+      const connectMsg = `[${ts()}] Folder: ${opts.folderPath || created.domain}\n[${ts()}] Registered ${created.domain} -> ${targetUrl}`;
+      const initialUploadMsg = `[${ts()}] ${opts.dbFile ? `Reading ${dbFilename}` : `Using local file ${dbFilename}`} (${fileSizeLabel})...`;
+
+      const updateUploadStep = (uploadStep: ProvisionStep, extraStep?: ProvisionStep) => {
+        setProvisionJob((prev) => {
+          const base = (prev?.externalSteps || [
+            {
+              step: "site_connect",
+              label: `Connected existing folder for ${created.domain}`,
+              status: "done",
+              progress: 100,
+              message: connectMsg,
+            },
+          ]).filter((s) => s.step !== "upload" && (!extraStep || s.step !== extraStep.step));
+          const nextSteps = [...base, uploadStep];
+          if (extraStep) nextSteps.push(extraStep);
+          return {
+            sseUrl: prev?.sseUrl,
+            title: `Importing ${created.domain} & Database...`,
+            defaultShowLogs: true,
+            externalSteps: nextSteps,
+          };
+        });
+      };
+
+      setProvisionJob({
+        title: `Importing ${created.domain} & Database...`,
+        defaultShowLogs: true,
+        externalSteps: [
+          {
+            step: "site_connect",
+            label: `Connected existing folder for ${created.domain}`,
+            status: "done",
+            progress: 100,
+            message: connectMsg,
+          },
+          {
+            step: "upload",
+            label: opts.dbFile
+              ? `Reading ${dbFilename} (${fileSizeLabel})...`
+              : `Preparing local ${dbFilename} (${fileSizeLabel})...`,
+            status: "in_progress",
+            progress: 5,
+            message: initialUploadMsg,
+          },
+        ],
+      });
+      showGlobalNotification(
+        "info",
+        `Uploading & importing database for ${created.domain}...`,
+        "Database Import Started",
+        `Site: ${created.domain}\nDump: ${dbFilename} (${fileSizeLabel})\nMemory Limit: ${memLimitMb <= 0 ? "Unlimited" : `${memLimitMb} MB`}`,
+        { category: "database", target: created.domain, dedupeKey: `site-op:${created.domain}` }
+      );
+
+      let uploadLog = initialUploadMsg;
+      let lastLoggedBucket = -1;
+      void (async () => {
+        try {
+          let payload: Record<string, unknown>;
+          if (opts.dbFile) {
+            const contentBase64 = await fileToBase64(opts.dbFile, (readPct) => {
+              const overallPct = Math.max(5, Math.min(25, Math.round(readPct * 0.25)));
+              updateUploadStep({
+                step: "upload",
+                label: `Preparing ${dbFilename} (${readPct}%)...`,
+                status: "in_progress",
+                progress: overallPct,
+                message: uploadLog,
+              });
+            });
+            uploadLog += `\n[${ts()}] Uploading ${dbFilename} (${fileSizeLabel}) to local server...`;
+            updateUploadStep({
+              step: "upload",
+              label: `Uploading ${dbFilename} (0%)...`,
+              status: "in_progress",
+              progress: 25,
+              message: uploadLog,
+            });
+            payload = {
+              filename: dbFilename,
+              content_base64: contentBase64,
+              source_url: opts.sourceUrl || undefined,
+              target_url: targetUrl,
+              db_name: opts.dbName || undefined,
+              memory_limit_mb: memLimitMb,
+              rollback_on_failure: opts.isConnectExisting,
+              apply_compat_fixes: !!opts.applyCompatFixes,
+              stream: true,
+            };
+          } else {
+            payload = {
+              filename: dbFilename,
+              local_path: opts.localDbFile!.path,
+              source_url: opts.sourceUrl || undefined,
+              target_url: targetUrl,
+              db_name: opts.dbName || undefined,
+              memory_limit_mb: memLimitMb,
+              rollback_on_failure: opts.isConnectExisting,
+              apply_compat_fixes: !!opts.applyCompatFixes,
+              stream: true,
+            };
+          }
+
+          const imp = await api.upload<{
+            ok?: boolean;
+            streaming?: boolean;
+            job_id?: string;
+            sse_url?: string;
+            db_name?: string;
+          }>(
+            importEndpoint,
+            payload,
+            (loaded, total) => {
+              const upPct = total > 0 ? Math.round((loaded / total) * 100) : 50;
+              const combinedPct = Math.min(98, 25 + Math.round(upPct * 0.73));
+              const bucket = Math.floor(upPct / 25);
+              if (bucket > lastLoggedBucket && upPct < 100) {
+                lastLoggedBucket = bucket;
+                uploadLog += `\n[${ts()}] Uploaded ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`;
+              }
+              updateUploadStep({
+                step: "upload",
+                label: `Uploading ${dbFilename}: ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`,
+                status: "in_progress",
+                progress: combinedPct,
+                message: uploadLog,
+              });
+            }
+          );
+
+          uploadLog += `\n[${ts()}] Upload complete — starting server-side import pipeline...`;
+          if (imp.sse_url) {
+            setProvisionJob((prev) => ({
+              sseUrl: imp.sse_url,
+              title: `Importing ${created.domain} & Database...`,
+              defaultShowLogs: true,
+              externalSteps: [
+                ...(prev?.externalSteps || []).filter((s) => s.step !== "upload"),
+                {
+                  step: "upload",
+                  label: `Uploaded ${dbFilename} (${fileSizeLabel})`,
+                  status: "done",
+                  progress: 100,
+                  message: uploadLog,
+                },
+              ],
+            }));
+          } else {
+            activeImportRef.current = null;
+            updateUploadStep(
+              {
+                step: "upload",
+                label: `Uploaded ${dbFilename} (${fileSizeLabel})`,
+                status: "done",
+                progress: 100,
+                message: uploadLog,
+              },
+              {
+                step: "complete",
+                label: `Connected ${created.domain}${imp.db_name ? ` (${imp.db_name})` : ""}`,
+                status: "done",
+                progress: 100,
+                message: `${uploadLog}\n[${ts()}] Database imported cleanly.`,
+              }
+            );
+            if (opts.folderPath) {
+              setFailedFolderImports((prev) => {
+                const copy = { ...prev };
+                delete copy[opts.folderPath!];
+                return copy;
+              });
+            }
+            fetchSites();
+            if (hasScannedFolders) discoverFolders();
+          }
+        } catch (impErr) {
+          const snapshot = activeImportRef.current;
+          const errBody = impErr instanceof ApiError ? (impErr.body as any) : null;
+          const errMsg = (errBody?.error as string) || (impErr instanceof Error ? impErr.message : "Database import failed");
+          await rollbackFailedImport(errMsg);
+          if (errBody?.requires_compat_confirm && snapshot) {
+            setCompatPrompt({
+              error: errMsg,
+              fixes: Array.isArray(errBody.compat_fixes) ? errBody.compat_fixes : [],
+              targetVersion: errBody.target_version,
+              retry: () => retryImportWithCompat(snapshot),
+            });
+          }
+          uploadLog += `\n[${ts()}] ERROR: ${errMsg}`;
+          if (opts.isConnectExisting) {
+            uploadLog += `\n[${ts()}] Unregistered temporary site registration (website files kept on disk) so you can retry from "Unregistered Folders Ready to Import".`;
+          }
+          updateUploadStep(
+            {
+              step: "upload",
+              label: `Failed uploading/importing ${dbFilename}`,
+              status: "error",
+              message: uploadLog,
+            },
+            {
+              step: "complete",
+              label: `Database import failed for ${created.domain}`,
+              status: "error",
+              message: errMsg,
+            }
+          );
+          setError(errMsg);
+          const info = buildAlertDetails(impErr, {
+            context: `Import ${dbFilename} for ${created.domain}`,
+            fallback: errMsg,
+            category: "database",
+            target: created.domain,
+            dedupeKey: `site-op:${created.domain}`,
+          });
+          showGlobalNotification(
+            "error",
+            errMsg,
+            "Database Import Failed",
+            uploadLog ? `${info.details ? `${info.details}\n\n` : ""}── Upload Log ──\n${uploadLog}` : info.details,
+            info.meta
+          );
+        }
+      })();
+    } else {
+      activeImportRef.current = null;
+      setProvisionJob({
+        siteId: created.id,
+        title: opts.isConnectExisting
+          ? `Connecting Existing Site (${created.domain})...`
+          : `Provisioning ${created.domain}...`,
+        defaultShowLogs: opts.isConnectExisting,
+      });
+      showGlobalNotification(
+        "info",
+        opts.isConnectExisting
+          ? `Connecting existing site ${created.domain}...`
+          : `Creating local site ${created.domain}...`,
+        opts.isConnectExisting ? "Importing Site" : "Provisioning Site",
+        opts.folderPath ? `Domain: ${created.domain}\nFolder: ${opts.folderPath}` : `Domain: ${created.domain}`,
+        { category: "site", target: created.domain, dedupeKey: `site-op:${created.domain}` }
+      );
+    }
+  };
+
+  const handleImportDiscoveredFolder = async (req: FolderImportRequest) => {
+    setError("");
+    const effectiveRuntime = req.folder.inspection.is_wordpress ? "php" : req.runtime || "php";
+    const body: Record<string, unknown> = {
+      domain: req.domain,
+      runtime: effectiveRuntime,
+      document_root: req.folder.path,
+      connect_existing: true,
+      stream: true,
+    };
+    if (effectiveRuntime === "php") {
+      body.php_version = phpVersion;
+      if (req.folder.inspection.is_wordpress) body.php_preset = "wordpress";
+    } else if (effectiveRuntime === "node" && req.appCommand) {
+      body.app_command = req.appCommand;
+    }
+
+    try {
+      const created = await api.post<Site>("/sites", body);
+      setFailedFolderImports((prev) => {
+        const copy = { ...prev };
+        delete copy[req.folder.path];
+        return copy;
+      });
+      fetchSites();
+      if (hasScannedFolders) discoverFolders();
+      await runAfterCreateFlow(created, {
+        isConnectExisting: true,
+        isWordPress: req.folder.inspection.is_wordpress,
+        runtime: effectiveRuntime,
+        appCommand: req.appCommand,
+        folderPath: req.folder.path,
+        dbFile: req.dbFile,
+        localDbFile: req.localDbFile,
+        sourceUrl: req.sourceUrl,
+        dbName: req.dbName,
+        memoryLimitMb: req.memoryLimitMb,
+      });
+    } catch (err) {
+      const info = buildAlertDetails(err, {
+        context: `Import folder ${req.folder.name} as ${req.domain}`,
+        fallback: "Failed to import folder",
+        category: "site",
+        target: req.domain,
+      });
+      setError(info.message);
+      showGlobalNotification("error", info.message, "Folder Import Failed", info.details, info.meta);
+    }
+  };
+
+  const handleOpenFolderInFullForm = (
+    folder: DiscoveredFolder,
+    customDomain: string,
+    dbFile: File | null,
+    memoryLimitMb?: number,
+    localDb?: DetectedDbFile | null
+  ) => {
+    setShowForm(true);
+    setCms("");
+    setCustomRootPath(folder.path);
+    setFolderInspection({
+      ...folder.inspection,
+      detected_db_files: folder.detected_db_files,
+      other_directory_db_files: discoveredRootDbFiles,
+    });
+    const suffix = customDomain.endsWith(".local") ? ".local" : ".test";
+    setDomainSuffix(suffix);
+    setDomain(customDomain);
+    setRuntime(folder.suggested_runtime || "php");
+    setPhpPreset(folder.inspection.is_wordpress ? "wordpress" : "generic");
+    if (folder.inspection.wp_siteurl || localDb?.detected_site_url) {
+      setWpSourceUrl(folder.inspection.wp_siteurl || localDb?.detected_site_url || "");
+    }
+    if (memoryLimitMb !== undefined) setWpMemoryLimitMb(memoryLimitMb);
+    setWpLocalDb(dbFile ? null : localDb || null);
+    if (dbFile) {
+      setWpDbFile(dbFile);
+      setSkipWpDbUpload(false);
+    } else if (localDb) {
+      setWpDbFile(null);
+      setSkipWpDbUpload(false);
+    }
+  };
+
+  const retryImportWithCompat = async (snapshot: NonNullable<typeof activeImportRef.current>) => {
+    setError("");
+    const body: Record<string, unknown> = {
+      domain: snapshot.domain,
+      runtime: snapshot.isWordPress ? "php" : snapshot.runtime || "php",
+      document_root: snapshot.folderPath,
+      connect_existing: snapshot.isConnectExisting,
+      stream: true,
+    };
+    if (body.runtime === "php") {
+      body.php_version = phpVersion;
+      if (snapshot.isWordPress) body.php_preset = "wordpress";
+    } else if (body.runtime === "node" && snapshot.appCommand) {
+      body.app_command = snapshot.appCommand;
+    }
+    try {
+      const recreated = await api.post<Site>("/sites", body);
+      fetchSites();
+      if (hasScannedFolders) discoverFolders();
+      await runAfterCreateFlow(recreated, {
+        isConnectExisting: snapshot.isConnectExisting,
+        isWordPress: snapshot.isWordPress,
+        runtime: snapshot.runtime,
+        appCommand: snapshot.appCommand,
+        folderPath: snapshot.folderPath,
+        dbFile: snapshot.dbFile,
+        localDbFile: snapshot.localDbObj,
+        sourceUrl: snapshot.sourceUrl || undefined,
+        dbName: snapshot.dbName || undefined,
+        memoryLimitMb: snapshot.memoryLimitMb,
+        applyCompatFixes: true,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed retrying import with compatibility fixes");
+    }
+  };
+
+  const handleProvisionComplete = async (
+    ok?: boolean,
+    errorDetail?: string,
+    compatMeta?: ProvisionCompatMeta
+  ) => {
+    if (ok === false) {
+      const snapshot = activeImportRef.current;
+      await rollbackFailedImport(errorDetail || "Site import failed");
+      if (compatMeta?.requiresCompatConfirm && snapshot) {
+        setCompatPrompt({
+          error: compatMeta.errorDetail || errorDetail || "Database compatibility fixes required",
+          fixes: compatMeta.compatFixes || [],
+          targetVersion: compatMeta.targetVersion,
+          retry: () => retryImportWithCompat(snapshot),
+        });
+      }
+      return;
+    }
+    const ctx = activeImportRef.current;
+    activeImportRef.current = null;
+    if (ctx?.folderPath) {
+      setFailedFolderImports((prev) => {
+        const copy = { ...prev };
+        delete copy[ctx.folderPath!];
+        return copy;
+      });
+    }
+    fetchSites();
+    discoverFolders();
   };
 
   return (
@@ -330,6 +1040,20 @@ export default function Sites() {
               </svg>
             </button>
           </div>
+          {!isClient && isDesktopApp() && (
+            <button
+              type="button"
+              onClick={discoverFolders}
+              disabled={scanningFolders}
+              className="inline-flex items-center gap-1.5 px-3 py-2 bg-dark-800 border border-dark-600 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-700 disabled:opacity-50 transition-colors"
+              title={defaultSitesDir ? `Scan ${defaultSitesDir} for existing site folders` : "Scan local sites directory"}
+            >
+              <svg className={`w-4 h-4 ${scanningFolders ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 0 0-1.883 2.542l.857 6a2.25 2.25 0 0 0 2.227 1.932H19.05a2.25 2.25 0 0 0 2.227-1.932l.857-6a2.25 2.25 0 0 0-1.883-2.542m-16.5 0V6A2.25 2.25 0 0 1 6 3.75h3.879a1.5 1.5 0 0 1 1.06.44l2.122 2.12a1.5 1.5 0 0 0 1.06.44H18A2.25 2.25 0 0 1 20.25 9v.776" />
+              </svg>
+              {scanningFolders ? "Scanning..." : "Scan Local Folders"}
+            </button>
+          )}
           {!isClient && (
             <button
               onClick={() => setShowForm(!showForm)}
@@ -373,9 +1097,76 @@ export default function Sites() {
         </div>
       )}
 
-      {/* Provisioning log */}
-      {provisioningSiteId && (
-        <ProvisionLog siteId={provisioningSiteId} onComplete={handleProvisionComplete} />
+      {/* Provisioning & database import progress log */}
+      {provisionJob && (
+        <ProvisionLog
+          siteId={provisionJob.siteId}
+          sseUrl={provisionJob.sseUrl}
+          title={provisionJob.title}
+          defaultShowLogs={provisionJob.defaultShowLogs}
+          externalSteps={provisionJob.externalSteps}
+          onComplete={handleProvisionComplete}
+          onDismiss={() => setProvisionJob(null)}
+        />
+      )}
+
+      {/* Manual local folder scan trigger + Discovered folders in Default Websites Directory */}
+      {isDesktopApp() && !isClient && !hasScannedFolders && discoveredFolders.length === 0 && !scanningFolders && (
+        <div className="mb-6 rounded-xl border border-dark-600/80 bg-dark-800/70 px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-dark-100">
+              Scan Default Websites Directory
+            </div>
+            <div className="text-xs font-mono text-dark-400 truncate mt-0.5" title={defaultSitesDir}>
+              {defaultSitesDir || "Configured local sites directory"} — Scan manually to discover and import existing folders &amp; SQL dumps.
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={discoverFolders}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-accent-600 hover:bg-accent-500 text-white text-xs font-semibold transition-colors shrink-0"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+            </svg>
+            Scan Local Folder
+          </button>
+        </div>
+      )}
+
+      {isDesktopApp() && !isClient && hasScannedFolders && discoveredFolders.length === 0 && !scanningFolders && (
+        <div className="mb-6 rounded-xl border border-dark-700 bg-dark-800/50 px-4 py-2.5 flex items-center justify-between gap-3 flex-wrap text-xs text-dark-300">
+          <span className="truncate font-mono" title={defaultSitesDir}>
+            No unregistered folders found in {defaultSitesDir || "websites directory"}.
+          </span>
+          <button
+            type="button"
+            onClick={discoverFolders}
+            className="px-2.5 py-1 rounded border border-dark-600 bg-dark-800 hover:bg-dark-700 text-dark-200 transition-colors shrink-0"
+          >
+            Scan Again
+          </button>
+        </div>
+      )}
+
+      {isDesktopApp() && !isClient && (
+        <DiscoveredFoldersPanel
+          sitesDir={defaultSitesDir}
+          folders={discoveredFolders}
+          rootDbFiles={discoveredRootDbFiles}
+          scanning={scanningFolders}
+          failedImports={failedFolderImports}
+          onDismissFailure={(fp) =>
+            setFailedFolderImports((prev) => {
+              const copy = { ...prev };
+              delete copy[fp];
+              return copy;
+            })
+          }
+          onRescan={discoverFolders}
+          onImport={handleImportDiscoveredFolder}
+          onOpenFullForm={handleOpenFolderInFullForm}
+        />
       )}
 
       {/* Create form */}
@@ -560,25 +1351,230 @@ export default function Sites() {
           )}
 
           {isDesktopApp() && (
-            <div>
-              <label htmlFor="site-custom-root" className="block text-sm font-medium text-dark-100 mb-1">
-                Website Folder Path <span className="text-xs text-dark-400 font-normal">(optional custom location)</span>
-              </label>
-              <input
-                id="site-custom-root"
-                type="text"
-                value={customRootPath}
-                onChange={(e) => setCustomRootPath(e.target.value)}
-                placeholder={
-                  defaultSitesDir
-                    ? `${defaultSitesDir}\\${effectiveDomain || "mysite.test"}`
-                    : `C:\\Users\\...\\DockPanel\\sites\\${effectiveDomain || "mysite.test"}`
-                }
-                className="w-full px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm font-mono"
-              />
-              <p className="text-xs text-dark-400 mt-1">
-                Leave empty to use your default websites directory.
-              </p>
+            <div className="space-y-3">
+              <div>
+                <label htmlFor="site-custom-root" className="block text-sm font-medium text-dark-100 mb-1">
+                  Website Folder Path <span className="text-xs text-dark-400 font-normal">(empty or existing site directory)</span>
+                </label>
+                <div className="flex items-stretch gap-2">
+                  <input
+                    id="site-custom-root"
+                    type="text"
+                    value={customRootPath}
+                    onChange={(e) => setCustomRootPath(e.target.value)}
+                    placeholder={
+                      defaultSitesDir
+                        ? `${defaultSitesDir}\\${effectiveDomain || "mysite.test"}`
+                        : `C:\\Users\\...\\DockPanel\\sites\\${effectiveDomain || "mysite.test"}`
+                    }
+                    className="flex-1 px-3 py-2.5 border border-dark-500 rounded-lg focus:ring-2 focus:ring-accent-500 outline-none text-sm font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleBrowseFolder}
+                    disabled={browsingFolder}
+                    className="px-4 py-2.5 bg-dark-700 hover:bg-dark-600 text-dark-100 border border-dark-500 rounded-lg text-sm font-medium transition-colors whitespace-nowrap disabled:opacity-50"
+                  >
+                    {browsingFolder ? "Opening..." : "Browse..."}
+                  </button>
+                  {customRootPath && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCustomRootPath("");
+                        setFolderInspection(null);
+                        setWpDbFile(null);
+                        setWpLocalDb(null);
+                      }}
+                      className="px-3 py-2.5 bg-dark-800 hover:bg-dark-700 text-dark-300 border border-dark-600 rounded-lg text-xs"
+                      title="Reset to default folder"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-dark-400 mt-1">
+                  Browse for an empty folder or an existing website folder to connect it locally. Leave empty to use the default directory.
+                </p>
+
+                {inspectingFolder && customRootPath.trim() && (
+                  <div className="mt-2 px-3 py-2 rounded-lg border border-dark-600 bg-dark-800/80 text-xs text-dark-300 flex items-center gap-2 font-mono">
+                    <span className="w-2 h-2 rounded-full bg-accent-400 animate-pulse" />
+                    Scanning folder contents &amp; WordPress configuration...
+                  </div>
+                )}
+
+                {!inspectingFolder && folderInspection && customRootPath.trim() && (
+                  <div
+                    className={`mt-2 px-3 py-2 rounded-lg border text-xs flex items-center justify-between gap-2 ${
+                      folderInspection.is_wordpress
+                        ? "bg-accent-950/30 border-accent-700/50 text-accent-200"
+                        : folderInspection.is_empty
+                        ? "bg-dark-800 border-dark-600 text-dark-200"
+                        : folderInspection.detected_type === "invalid"
+                        ? "bg-red-950/40 border-red-800/50 text-red-300"
+                        : "bg-emerald-950/30 border-emerald-800/40 text-emerald-300"
+                    }`}
+                  >
+                    <span>
+                      {folderInspection.detected_type === "invalid"
+                        ? "Selected path is a file, not a folder."
+                        : !folderInspection.exists
+                        ? "New folder — will be created empty."
+                        : folderInspection.is_empty
+                        ? "Empty directory — ready for a new website."
+                        : folderInspection.is_wordpress
+                        ? `Existing WordPress directory detected${folderInspection.wp_version ? ` (v${folderInspection.wp_version})` : ""} — files will be connected without overwriting.`
+                        : `Existing ${folderInspection.detected_type.toUpperCase()} website detected (${folderInspection.file_count} items) — files will be connected without overwriting.`}
+                    </span>
+                    <div className="flex items-center gap-2 font-mono text-[11px] text-dark-300 shrink-0">
+                      {folderInspection.wp_db_name && (
+                        <span>DB: {folderInspection.wp_db_name}</span>
+                      )}
+                      {folderInspection.wp_table_prefix && (
+                        <span>Prefix: {folderInspection.wp_table_prefix}</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {folderInspection && !folderInspection.is_empty && folderInspection.exists && folderInspection.is_dir && (
+                <div className="p-4 rounded-lg bg-dark-850 border border-accent-700/50 space-y-3">
+                  <div>
+                    <h4 className="text-sm font-medium text-dark-50">
+                      {folderInspection.is_wordpress
+                        ? "Upload WordPress Database Dump"
+                        : "Upload Website Database Dump (Optional)"}
+                    </h4>
+                    <p className="text-xs text-dark-300 mt-0.5">
+                      {folderInspection.is_wordpress ? (
+                        <>
+                          Upload your <code className="text-dark-100">.sql</code>,{" "}
+                          <code className="text-dark-100">.sql.gz</code>, <code className="text-dark-100">.zip</code>, or{" "}
+                          <code className="text-dark-100">.sqlite</code> export. DockPanel will rewrite URLs for{" "}
+                          <span className="font-mono text-accent-300">{effectiveDomain || "this site"}</span>, import it into local MariaDB, and update{" "}
+                          <code className="text-dark-100">wp-config.php</code> credentials automatically.
+                        </>
+                      ) : (
+                        <>
+                          Upload a <code className="text-dark-100">.sql</code>,{" "}
+                          <code className="text-dark-100">.sql.gz</code>, <code className="text-dark-100">.zip</code>, or{" "}
+                          <code className="text-dark-100">.sqlite</code> dump to provision a local database and wire{" "}
+                          <code className="text-dark-100">.env</code> credentials automatically.
+                        </>
+                      )}
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="md:col-span-2">
+                      <label htmlFor="wp-db-upload" className="block text-xs font-medium text-dark-200 mb-1">
+                        Database File
+                      </label>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <input
+                          id="wp-db-upload"
+                          type="file"
+                          accept=".sql,.gz,.sql.gz,.zip,.sqlite,.db"
+                          disabled={skipWpDbUpload}
+                          onChange={(e) => {
+                            const f = e.target.files?.[0] || null;
+                            setWpDbFile(f);
+                            if (f) setWpLocalDb(null);
+                          }}
+                          className="text-xs text-dark-200 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-accent-600 file:text-white hover:file:bg-accent-500 disabled:opacity-40"
+                        />
+                        {wpDbFile && (
+                          <span className="text-[11px] text-emerald-300 font-mono">
+                            Selected: {wpDbFile.name} ({Math.max(1, Math.round(wpDbFile.size / 1024))} KB)
+                          </span>
+                        )}
+                        {(wpDbFile || wpLocalDb) && !skipWpDbUpload && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWpDbFile(null);
+                              setWpLocalDb(null);
+                            }}
+                            className="text-[11px] text-dark-400 hover:text-dark-100 underline"
+                          >
+                            Clear DB
+                          </button>
+                        )}
+                      </div>
+                      {!skipWpDbUpload && (
+                        <DirectoryDbSelector
+                          detectedDbFiles={folderInspection.detected_db_files || []}
+                          otherDirectoryDbFiles={
+                            folderInspection.other_directory_db_files || discoveredRootDbFiles
+                          }
+                          selectedLocalDb={wpLocalDb}
+                          uploadedFile={wpDbFile}
+                          siteDir={folderInspection.path}
+                          sitesRootDir={defaultSitesDir}
+                          onSelectLocalDb={(dbItem) => {
+                            setWpLocalDb(dbItem);
+                            if (dbItem) {
+                              setWpDbFile(null);
+                              if (!wpSourceUrl && dbItem.detected_site_url) {
+                                setWpSourceUrl(dbItem.detected_site_url);
+                              }
+                            }
+                          }}
+                        />
+                      )}
+                    </div>
+
+                    {folderInspection.is_wordpress && (
+                      <div>
+                        <label htmlFor="wp-source-url" className="block text-xs font-medium text-dark-200 mb-1">
+                          Source Site URL <span className="text-dark-400 font-normal">(auto-detected if blank)</span>
+                        </label>
+                        <input
+                          id="wp-source-url"
+                          type="url"
+                          disabled={skipWpDbUpload}
+                          value={wpSourceUrl}
+                          onChange={(e) => setWpSourceUrl(e.target.value)}
+                          placeholder="https://old-website.com"
+                          className="w-full px-3 py-1.5 bg-dark-900 border border-dark-600 rounded-lg text-xs text-dark-100 font-mono focus:outline-none focus:border-accent-500 disabled:opacity-40"
+                        />
+                      </div>
+                    )}
+                    <div>
+                      <label htmlFor="wp-memory-limit" className="block text-xs font-medium text-dark-200 mb-1">
+                        Import PHP Memory Limit <span className="text-dark-400 font-normal">(for large SQL dumps)</span>
+                      </label>
+                      <select
+                        id="wp-memory-limit"
+                        disabled={skipWpDbUpload}
+                        value={wpMemoryLimitMb}
+                        onChange={(e) => setWpMemoryLimitMb(parseInt(e.target.value, 10))}
+                        className="w-full px-3 py-1.5 bg-dark-900 border border-dark-600 rounded-lg text-xs text-dark-100 font-mono focus:outline-none focus:border-accent-500 disabled:opacity-40"
+                      >
+                        {MEMORY_LIMIT_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {folderInspection.is_wordpress && (
+                    <label className="inline-flex items-center gap-2 text-xs text-dark-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={skipWpDbUpload}
+                        onChange={(e) => setSkipWpDbUpload(e.target.checked)}
+                        className="rounded border-dark-600 bg-dark-800 text-accent-500 focus:ring-0"
+                      />
+                      Skip database upload for now (connect existing WordPress files only)
+                    </label>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -860,7 +1856,7 @@ export default function Sites() {
                             </div>
 
                             <div className="mb-3">
-                              <SiteThumbnail domain={site.domain} className="w-full h-28 rounded border border-dark-600 object-cover" />
+                              <SiteThumbnail domain={site.domain} showRefresh className="w-full h-28 rounded border border-dark-600 object-cover" />
                             </div>
 
                             <div className="space-y-1.5 text-xs text-dark-200 mb-4">
@@ -904,17 +1900,15 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                                 </svg>
                               </Link>
-                              {!isDesktopApp() && (
                               <Link
                                 to={`/mail?domain=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
-                                title={m?.has_mail ? "Mail configured" : "Mail"}
+                                title={isDesktopApp() ? "Local Mail Catcher" : (m?.has_mail ? "Mail configured" : "Mail")}
                               >
                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                                 </svg>
                               </Link>
-                              )}
                               <Link
                                 to={`/databases?search=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}
@@ -1100,17 +2094,15 @@ export default function Sites() {
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                                 </svg>
                               </Link>
-                              {!isDesktopApp() && (
                               <Link
                                 to={`/mail?domain=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_mail ? "text-rust-400" : "text-dark-300 hover:text-dark-100"}`}
-                                title={m?.has_mail ? "Mail configured" : "Mail"}
+                                title={isDesktopApp() ? "Local Mail Catcher" : (m?.has_mail ? "Mail configured" : "Mail")}
                               >
                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
                                 </svg>
                               </Link>
-                              )}
                               <Link
                                 to={`/databases?search=${site.domain}`}
                                 className={`p-1.5 rounded hover:bg-dark-700 transition-colors ${m?.has_database ? "text-accent-400" : "text-dark-300 hover:text-dark-100"}`}
@@ -1288,9 +2280,33 @@ export default function Sites() {
                 }
               : null
           );
-          showGlobalNotification("success", `Local site router switched to port ${newPort}`);
+          showGlobalNotification(
+            "success",
+            `Local site router switched to port ${newPort}`,
+            "Router Port Updated",
+            `Active HTTP Router: http://127.0.0.1:${newPort}`,
+            { category: "router", target: `port ${newPort}` }
+          );
         }}
       />
+      {compatPrompt && (
+        <ConfirmDialog
+          tone="warn"
+          title="Database Compatibility Confirmation Required"
+          label={`Error on target server${compatPrompt.targetVersion ? ` (${compatPrompt.targetVersion})` : ""}: ${compatPrompt.error}`}
+          consequences={[
+            ...compatPrompt.fixes,
+            "Your original local .sql dump file is never modified — fixes only apply during import into local MariaDB.",
+          ]}
+          confirmLabel="Apply Compatibility Fixes & Retry"
+          onConfirm={() => {
+            const runRetry = compatPrompt.retry;
+            setCompatPrompt(null);
+            void runRetry();
+          }}
+          onCancel={() => setCompatPrompt(null)}
+        />
+      )}
       </div>
     </div>
   );

@@ -405,11 +405,11 @@ function ThemesTab({ sites }: { sites: WPSite[] }) {
     if (siteId) fetchThemes(siteId);
   }, [siteId, fetchThemes]);
 
-  const themeAction = async (action: "activate" | "update" | "delete", slug: string) => {
+  const themeAction = async (action: "activate" | "deactivate" | "update" | "delete", slug: string) => {
     setActionLoading(`${action}:${slug}`);
     try {
-      await api.post(`/sites/${siteId}/wordpress/theme/${action}`, { name: slug });
-      showGlobalNotification("success", `Theme ${action}d successfully`);
+      const res = await api.post<{ message?: string }>(`/sites/${siteId}/wordpress/theme/${action}`, { name: slug });
+      showGlobalNotification("success", res?.message || `Theme ${action}d successfully`);
       await fetchThemes(siteId);
     } catch (e) {
       showGlobalNotification("error", e instanceof ApiError ? e.message : `Failed to ${action} theme`);
@@ -519,7 +519,7 @@ function ThemesTab({ sites }: { sites: WPSite[] }) {
                     <td className="px-4 py-3 hidden lg:table-cell text-xs text-dark-300 font-mono">{theme.author ?? "—"}</td>
                     <td className="px-4 py-3">
                       <div className="flex items-center justify-end gap-1.5">
-                        {!isActive && (
+                        {!isActive ? (
                           <button
                             onClick={() => themeAction("activate", theme.slug)}
                             disabled={!!isActing}
@@ -527,7 +527,16 @@ function ThemesTab({ sites }: { sites: WPSite[] }) {
                           >
                             {actionLoading === `activate:${theme.slug}` ? <Spinner className="w-3 h-3" /> : "Activate"}
                           </button>
-                        )}
+                        ) : themes.length > 1 ? (
+                          <button
+                            onClick={() => themeAction("deactivate", theme.slug)}
+                            disabled={!!isActing}
+                            title="Switch away from active theme directly in the database"
+                            className="px-2.5 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors"
+                          >
+                            {actionLoading === `deactivate:${theme.slug}` ? <Spinner className="w-3 h-3" /> : "Disable"}
+                          </button>
+                        ) : null}
                         {theme.update_available && (
                           <button
                             onClick={() => themeAction("update", theme.slug)}

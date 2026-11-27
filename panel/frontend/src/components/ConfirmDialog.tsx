@@ -51,6 +51,7 @@ export default function ConfirmDialog({
   title,
   label,
   consequences,
+  checkbox,
   confirmLabel = "Confirm",
   tone = "danger",
   onConfirm,
@@ -59,6 +60,12 @@ export default function ConfirmDialog({
   title?: string;
   label: string;
   consequences?: string[];
+  checkbox?: {
+    label: string;
+    description?: string;
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+  };
   confirmLabel?: string;
   tone?: "danger" | "warn";
   onConfirm: () => void;
@@ -75,7 +82,7 @@ export default function ConfirmDialog({
     return () => document.removeEventListener("keydown", onKey);
   }, [onCancel]);
 
-  return createPortal(
+  const dialogContent = (
     <div
       className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 dp-modal-overlay animate-fade-in"
       onMouseDown={(e) => {
@@ -107,7 +114,7 @@ export default function ConfirmDialog({
         </div>
 
         {consequences && consequences.length > 0 && (
-          <div className="mb-5 bg-dark-900/90 border border-dark-700/80 rounded-lg p-4">
+          <div className="mb-4 bg-dark-900/90 border border-dark-700/80 rounded-lg p-4">
             <h4 className="text-[11px] font-bold text-dark-300 uppercase tracking-wider mb-2.5 flex items-center gap-1.5 font-mono">
               <span className="w-1.5 h-1.5 rounded-full bg-danger-400 animate-pulse"></span>
               Consequences & System Impact:
@@ -121,6 +128,25 @@ export default function ConfirmDialog({
               ))}
             </ul>
           </div>
+        )}
+
+        {checkbox && (
+          <label className="mb-5 flex items-start gap-2.5 p-3 rounded-lg bg-dark-900/70 border border-dark-700/80 cursor-pointer select-none hover:border-dark-600 transition-colors">
+            <input
+              type="checkbox"
+              checked={checkbox.checked}
+              onChange={(e) => checkbox.onChange(e.target.checked)}
+              className="mt-0.5 rounded border-dark-500 bg-dark-800 text-rust-500 focus:ring-rust-500"
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block text-xs font-semibold text-dark-100">{checkbox.label}</span>
+              {checkbox.description && (
+                <span className="block text-[11px] text-dark-400 mt-0.5 leading-snug">
+                  {checkbox.description}
+                </span>
+              )}
+            </span>
+          </label>
         )}
 
         <div className="flex justify-end gap-2.5 pt-2 border-t border-dark-700/50">
@@ -143,7 +169,8 @@ export default function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </div>
   );
+
+  return typeof document !== "undefined" ? createPortal(dialogContent, document.body) : dialogContent;
 }

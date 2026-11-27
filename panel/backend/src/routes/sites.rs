@@ -2096,12 +2096,23 @@ pub async fn bandwidth_usage(
 }
 
 /// DELETE /api/sites/{id} — Delete a site and all associated resources.
+/// Supports `?keep_files=true` or `?delete_files=false` to unregister from DockPanel
+/// while preserving files on disk in `/var/www/{domain}`.
 pub async fn remove(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let keep_files = params
+        .get("keep_files")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+        || params
+            .get("delete_files")
+            .map(|v| v == "false" || v == "0")
+            .unwrap_or(false);
     let site: Site = sqlx::query_as(
         SITE_FOR_CALLER_ALL.as_str(),
     )
@@ -2231,8 +2242,12 @@ pub async fn remove(
         }
     }
 
-    // Remove nginx config + SSL + PHP pool + site files + logs
-    let agent_path = format!("/nginx/sites/{}", site.domain);
+    // Remove nginx config + SSL + PHP pool (+ site files unless keep_files=true) + logs
+    let agent_path = if keep_files {
+        format!("/nginx/sites/{}?keep_files=true", site.domain)
+    } else {
+        format!("/nginx/sites/{}", site.domain)
+    };
     agent.delete(&agent_path).await
         .map_err(|e| agent_error("Site removal", e))?;
 
@@ -2323,10 +2338,24 @@ pub async fn remove(
     // catch-all route sends an unresolvable path to the Dashboard without
     // saying why, so a link here would be a control that silently lies about
     // where it is taking you. A notification with no link renders as plain text.
-    notifications::notify_panel(&state.db, Some(claims.sub), &format!("Site deleted: {}", site.domain), "Site and all associated resources have been removed", "info", "site", None).await;
+    notifications::notify_panel(
+        &state.db,
+        Some(claims.sub),
+        &format!("{}: {}", if keep_files { "Site removed (files kept)" } else { "Site deleted" }, site.domain),
+        if keep_files {
+            "Site removed from DockPanel while preserving website files on disk"
+        } else {
+            "Site and all associated resources have been removed"
+        },
+        "info",
+        "site",
+        None,
+    )
+    .await;
 
     fire_event(&state.db, "site.deleted", serde_json::json!({
         "domain": &site.domain,
+        "kept_files": keep_files,
     }));
 
     // Auto-cleanup DNS record (best-effort, don't fail the delete)
@@ -3285,6 +3314,122 @@ pub async fn set_env_vars(
     agent.put(&format!("/nginx/env/{domain}"), body).await
         .map_err(|e| agent_error("Env vars", e))?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /api/sites/thumbnail?domain=...&refresh=0|1 — Fetch once & persistently cache a website thumbnail.
+pub async fn thumbnail(
+    AuthUser(_claims): AuthUser,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let raw_domain = params.get("domain").map(String::as_str).unwrap_or("").trim();
+    if raw_domain.is_empty() || raw_domain.contains("..") {
+        return (StatusCode::BAD_REQUEST, "Invalid domain").into_response();
+    }
+    let clean_key: String = raw_domain
+        .to_ascii_lowercase()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("site")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    let force_refresh = params
+        .get("refresh")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let thumb_dir = std::env::temp_dir().join("dockpanel_thumbnails");
+    let _ = std::fs::create_dir_all(&thumb_dir);
+    let bin_path = thumb_dir.join(format!("{clean_key}.bin"));
+    let ct_path = thumb_dir.join(format!("{clean_key}.ct"));
+
+    if !force_refresh && bin_path.is_file() {
+        if let Ok(bytes) = std::fs::read(&bin_path) {
+            if !bytes.is_empty() {
+                let ct = std::fs::read_to_string(&ct_path)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "image/png".to_string());
+                return (
+                    [
+                        (axum::http::header::CONTENT_TYPE, ct),
+                        (axum::http::header::CACHE_CONTROL, "public, max-age=604800".to_string()),
+                    ],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .danger_accept_invalid_certs(true)
+        .user_agent("DockPanel-ThumbnailFetcher/1.0")
+        .build()
+        .ok();
+
+    let mut fetched: Option<(Vec<u8>, String)> = None;
+    if let Some(ref c) = client {
+        let candidates = [
+            format!("https://api.microlink.io?url=https%3A%2F%2F{clean_key}&screenshot=true&meta=false&embed=screenshot.url"),
+            format!("https://image.thum.io/get/width/600/crop/400/noanimate/https://{clean_key}"),
+            format!("https://unavatar.io/{clean_key}?fallback=false"),
+            format!("https://www.google.com/s2/favicons?domain={clean_key}&sz=128"),
+        ];
+        for url in candidates {
+            if let Ok(resp) = c.get(&url).send().await {
+                if resp.status().is_success() {
+                    let ct = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    if ct.starts_with("image/") {
+                        if let Ok(b) = resp.bytes().await {
+                            if b.len() > 256 {
+                                fetched = Some((b.to_vec(), ct));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let (bytes, ct) = fetched.unwrap_or_else(|| {
+        let esc = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+        };
+        let initial = esc(raw_domain.chars().next().map(|c| c.to_ascii_uppercase().to_string()).as_deref().unwrap_or("W"));
+        let dom_esc = esc(raw_domain);
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="600" height="320" viewBox="0 0 600 320"><rect width="600" height="320" fill="#0f172a"/><rect x="34" y="64" width="62" height="62" rx="14" fill="#ea580c"/><text x="65" y="106" text-anchor="middle" font-family="sans-serif" font-size="30" font-weight="700" fill="#ffffff">{initial}</text><text x="114" y="102" font-family="sans-serif" font-size="22" font-weight="700" fill="#f8fafc">{dom_esc}</text></svg>"##
+        );
+        (svg.into_bytes(), "image/svg+xml".to_string())
+    });
+
+    let _ = std::fs::write(&bin_path, &bytes);
+    let _ = std::fs::write(&ct_path, &ct);
+
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=604800".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// PUT /api/sites/{id}/domain — Rename a site's domain.

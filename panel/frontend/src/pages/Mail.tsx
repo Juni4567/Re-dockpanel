@@ -6,6 +6,8 @@ import ProvisionLog from "../components/ProvisionLog";
 import { PrereqCallout, type PrereqResult } from "../components/Prerequisite";
 import { InfoTip } from "../components/FieldHelp";
 import ConfirmDialog from "../components/ConfirmDialog";
+import DesktopMailCatcher from "../components/DesktopMailCatcher";
+import { isDesktopApp } from "../utils/desktop";
 
 interface MailServiceState {
   installed: boolean;
@@ -136,6 +138,13 @@ interface TlsStatus {
 }
 
 export default function Mail() {
+  if (isDesktopApp()) {
+    return <DesktopMailCatcher />;
+  }
+  return <ServerMailAdmin />;
+}
+
+function ServerMailAdmin() {
   const { user } = useAuth();
   /**
    * Every role may open this page now; what it shows is decided per caller.

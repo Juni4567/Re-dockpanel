@@ -7,6 +7,17 @@ pub const DEFAULT_HOSTS_PATH: &str = r"C:\Windows\System32\drivers\etc\hosts";
 pub const DEFAULT_IP: &str = "127.0.0.1";
 pub const HOST_HELPER_PIPE: &str = r"\\.\pipe\dockpanel-host-helper";
 
+pub fn is_host_helper_pipe_present() -> bool {
+    #[cfg(windows)]
+    {
+        Path::new(HOST_HELPER_PIPE).exists()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 pub fn validate_ip(ip: &str) -> Result<IpAddr, String> {
     let trimmed = ip.trim();
     if trimmed.is_empty() {

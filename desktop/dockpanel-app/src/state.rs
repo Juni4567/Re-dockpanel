@@ -25,6 +25,18 @@ fn default_php_workers() -> i32 {
     4
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SiteRedirect {
+    pub source: String,
+    pub target: String,
+    #[serde(rename = "type", default = "default_redirect_type")]
+    pub redirect_type: String,
+}
+
+fn default_redirect_type() -> String {
+    "301".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalSite {
     pub id: String,
@@ -50,6 +62,10 @@ pub struct LocalSite {
     pub app_command: Option<String>,
     #[serde(default)]
     pub proxy_port: Option<u16>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub redirects: Vec<SiteRedirect>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -61,6 +77,14 @@ pub struct AppData {
 pub struct PhpInstallJob {
     pub steps: Vec<serde_json::Value>,
     pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StartupReadiness {
+    pub mariadb: String,
+    pub mariadb_error: Option<String>,
+    pub php_workers: String,
+    pub mail_catcher: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,20 +205,36 @@ fn assign_child_to_job(job: &Option<Arc<WorkerJobGuard>>, child: &std::process::
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SiteTrafficStats {
+    pub requests: u64,
+    pub bytes_sent: u64,
+    pub status_codes: HashMap<String, u64>,
+    pub top_paths: HashMap<String, u64>,
+    pub unique_ips: std::collections::HashSet<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub data: Arc<Mutex<AppData>>,
     pub router_config: Arc<Mutex<RouterConfig>>,
-    pub worker_ports: Arc<Mutex<HashMap<String, u16>>>,
-    pub worker_processes: Arc<Mutex<HashMap<String, std::process::Child>>>,
+    pub worker_ports: Arc<Mutex<HashMap<String, Vec<u16>>>>,
+    pub worker_processes: Arc<Mutex<HashMap<String, Vec<std::process::Child>>>>,
+    pub worker_rr_cursor: Arc<std::sync::atomic::AtomicUsize>,
     pub router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub ssl_router_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub ssl_port: Arc<Mutex<Option<u16>>>,
     pub cert_resolver: Arc<crate::ssl::DynamicCertResolver>,
+    pub mail_catcher: Arc<crate::mail_catcher::MailCatcherStore>,
     pub mariadb_process: Arc<Mutex<Option<(std::process::Child, u16)>>>,
     pub php_installs: Arc<Mutex<HashMap<String, PhpInstallJob>>>,
     pub notifications: Arc<Mutex<Vec<LocalNotification>>>,
     pub activity_log: Arc<Mutex<Vec<LocalActivity>>>,
+    pub site_stats: Arc<Mutex<HashMap<String, SiteTrafficStats>>>,
+    pub metrics_history: Arc<Mutex<Vec<serde_json::Value>>>,
+    pub update_cache: Arc<Mutex<Option<(std::time::Instant, serde_json::Value)>>>,
+    pub approved_db_scan_dirs: Arc<Mutex<Vec<PathBuf>>>,
+    pub startup_readiness: Arc<Mutex<StartupReadiness>>,
     pub notif_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     #[cfg(windows)]
     pub worker_job: Option<Arc<WorkerJobGuard>>,
@@ -204,6 +244,22 @@ pub struct AppState {
 }
 
 /// Finds an available loopback TCP port.
+fn open_log_file_append(path: &Path, max_bytes: u64) -> Option<fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > max_bytes {
+            let _ = fs::write(path, "");
+        }
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 pub fn find_available_loopback_port() -> Option<u16> {
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
@@ -536,19 +592,46 @@ impl AppState {
         let (notif_tx, _) = tokio::sync::broadcast::channel(64);
         let cert_resolver = Arc::new(crate::ssl::DynamicCertResolver::new());
         cert_resolver.load_existing_certs(&config_dir.join("certs"));
+        let mail_catcher = crate::mail_catcher::MailCatcherStore::new(&config_dir);
+        let initial_mariadb = if cfg!(not(test)) && crate::mariadb::find_mariadbd_binary().is_some() {
+            "starting"
+        } else if crate::mariadb::find_mariadbd_binary().is_some() {
+            "stopped"
+        } else {
+            "not_installed"
+        };
+        let initial_workers = if cfg!(not(test))
+            && data.sites.iter().any(|s| s.status.eq_ignore_ascii_case("active"))
+        {
+            "starting"
+        } else {
+            "ready"
+        };
         Self {
             data: Arc::new(Mutex::new(data)),
             router_config: Arc::new(Mutex::new(router_config)),
             worker_ports: Arc::new(Mutex::new(HashMap::new())),
             worker_processes: Arc::new(Mutex::new(HashMap::new())),
+            worker_rr_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             router_handle: Arc::new(tokio::sync::Mutex::new(None)),
             ssl_router_handle: Arc::new(tokio::sync::Mutex::new(None)),
             ssl_port: Arc::new(Mutex::new(None)),
             cert_resolver,
+            mail_catcher,
             mariadb_process: Arc::new(Mutex::new(None)),
             php_installs: Arc::new(Mutex::new(HashMap::new())),
             notifications: Arc::new(Mutex::new(Vec::new())),
             activity_log: Arc::new(Mutex::new(Vec::new())),
+            site_stats: Arc::new(Mutex::new(HashMap::new())),
+            metrics_history: Arc::new(Mutex::new(Vec::new())),
+            update_cache: Arc::new(Mutex::new(None)),
+            approved_db_scan_dirs: Arc::new(Mutex::new(Vec::new())),
+            startup_readiness: Arc::new(Mutex::new(StartupReadiness {
+                mariadb: initial_mariadb.to_string(),
+                mariadb_error: None,
+                php_workers: initial_workers.to_string(),
+                mail_catcher: "starting".to_string(),
+            })),
             notif_tx,
             #[cfg(windows)]
             worker_job: create_kill_on_close_job(),
@@ -624,6 +707,152 @@ impl AppState {
             .cloned()
     }
 
+    pub fn resolve_site_by_host(&self, host: &str) -> Option<LocalSite> {
+        let clean = host.trim().to_lowercase();
+        self.data
+            .lock()
+            .unwrap()
+            .sites
+            .iter()
+            .find(|s| {
+                s.domain.to_lowercase() == clean
+                    || s.aliases.iter().any(|a| a.to_lowercase() == clean)
+            })
+            .cloned()
+    }
+
+    pub fn add_site_alias(&self, id_or_domain: &str, alias: &str) -> Result<Vec<String>, String> {
+        let validated = crate::hosts_manager::validate_domain(alias)?;
+        let clean_alias = validated.to_lowercase();
+        let clean_id = id_or_domain.trim().to_lowercase();
+
+        let (site_domain, updated_aliases) = {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            if data.sites.iter().any(|s| {
+                s.domain.to_lowercase() == clean_alias
+                    || (s.id != id_or_domain
+                        && s.domain.to_lowercase() != clean_id
+                        && s.aliases.iter().any(|a| a.to_lowercase() == clean_alias))
+            }) {
+                return Err(format!("Domain '{}' is already assigned to a site", clean_alias));
+            }
+            let Some(site) = data
+                .sites
+                .iter_mut()
+                .find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean_id)
+            else {
+                return Err("Site not found".to_string());
+            };
+            if !site.aliases.iter().any(|a| a.to_lowercase() == clean_alias) {
+                site.aliases.push(clean_alias.clone());
+            }
+            (site.domain.clone(), site.aliases.clone())
+        };
+
+        self.save_data();
+        let _ = crate::hosts_manager::sync_domain_to_hosts(&clean_alias);
+        #[cfg(not(test))]
+        {
+            let _ = self.refresh_site_ssl_with_aliases(&site_domain, &updated_aliases);
+        }
+        let _ = site_domain;
+        Ok(updated_aliases)
+    }
+
+    pub fn remove_site_alias(&self, id_or_domain: &str, alias: &str) -> Result<Vec<String>, String> {
+        let clean_alias = alias.trim().to_lowercase();
+        let clean_id = id_or_domain.trim().to_lowercase();
+
+        let (site_domain, updated_aliases) = {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            let Some(site) = data
+                .sites
+                .iter_mut()
+                .find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean_id)
+            else {
+                return Err("Site not found".to_string());
+            };
+            site.aliases.retain(|a| a.to_lowercase() != clean_alias);
+            (site.domain.clone(), site.aliases.clone())
+        };
+
+        self.save_data();
+        let _ = crate::hosts_manager::remove_domain_from_hosts(&clean_alias);
+        #[cfg(not(test))]
+        {
+            let _ = self.refresh_site_ssl_with_aliases(&site_domain, &updated_aliases);
+        }
+        let _ = site_domain;
+        Ok(updated_aliases)
+    }
+
+    pub fn add_site_redirect(
+        &self,
+        id_or_domain: &str,
+        source: &str,
+        target: &str,
+        redirect_type: &str,
+    ) -> Result<Vec<SiteRedirect>, String> {
+        let clean_id = id_or_domain.trim().to_lowercase();
+        let clean_source = source.trim();
+        let clean_target = target.trim();
+        if clean_source.is_empty() || !clean_source.starts_with('/') {
+            return Err("Redirect source path must start with '/'".to_string());
+        }
+        if clean_target.is_empty() {
+            return Err("Redirect target URL is required".to_string());
+        }
+        let rtype = if redirect_type.trim() == "302" { "302" } else { "301" };
+
+        let updated = {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            let Some(site) = data
+                .sites
+                .iter_mut()
+                .find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean_id)
+            else {
+                return Err("Site not found".to_string());
+            };
+            let entry = SiteRedirect {
+                source: clean_source.to_string(),
+                target: clean_target.to_string(),
+                redirect_type: rtype.to_string(),
+            };
+            if let Some(existing) = site.redirects.iter_mut().find(|r| r.source == clean_source) {
+                *existing = entry;
+            } else {
+                site.redirects.push(entry);
+            }
+            site.redirects.clone()
+        };
+
+        self.save_data();
+        Ok(updated)
+    }
+
+    pub fn remove_site_redirect(
+        &self,
+        id_or_domain: &str,
+        source: &str,
+    ) -> Result<Vec<SiteRedirect>, String> {
+        let clean_id = id_or_domain.trim().to_lowercase();
+        let clean_source = source.trim();
+        let updated = {
+            let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
+            let Some(site) = data
+                .sites
+                .iter_mut()
+                .find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean_id)
+            else {
+                return Err("Site not found".to_string());
+            };
+            site.redirects.retain(|r| r.source != clean_source);
+            site.redirects.clone()
+        };
+        self.save_data();
+        Ok(updated)
+    }
+
     pub fn update_site_status(&self, id_or_domain: &str, status: &str) -> bool {
         let clean = id_or_domain.trim().to_lowercase();
         let mut data = self.data.lock().unwrap();
@@ -667,8 +896,9 @@ impl AppState {
             }
         };
         self.save_data();
+        self.stop_domain_workers(&site.domain);
         if site.status == "active" {
-            self.spawn_php_worker(&site.domain, &site.document_root, Some(&site.php_version));
+            self.spawn_site_worker(&site);
         }
         Ok(site)
     }
@@ -693,15 +923,7 @@ impl AppState {
             }
         };
         self.save_data();
-        // Stop any existing worker first so switching to static or between runtimes is clean
-        {
-            let mut procs = self.worker_processes.lock().unwrap();
-            if let Some(mut child) = procs.remove(&site.domain.to_lowercase()) {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        self.remove_site_worker_port(&site.domain);
+        self.stop_domain_workers(&site.domain);
         if site.status == "active" {
             self.spawn_site_worker(&site);
         }
@@ -762,6 +984,29 @@ impl AppState {
         message: Option<&str>,
         done: bool,
     ) {
+        self.push_install_progress_with_meta(
+            install_id,
+            step,
+            label,
+            status,
+            progress,
+            message,
+            None,
+            done,
+        );
+    }
+
+    pub fn push_install_progress_with_meta(
+        &self,
+        install_id: &str,
+        step: &str,
+        label: &str,
+        status: &str,
+        progress: Option<u8>,
+        message: Option<&str>,
+        extra: Option<serde_json::Value>,
+        done: bool,
+    ) {
         let mut obj = serde_json::json!({
             "step": step,
             "label": label,
@@ -773,7 +1018,58 @@ impl AppState {
         if let Some(m) = message {
             obj["message"] = serde_json::json!(m);
         }
+        if let Some(serde_json::Value::Object(map)) = extra {
+            if let Some(dst) = obj.as_object_mut() {
+                for (k, v) in map {
+                    dst.insert(k, v);
+                }
+            }
+        }
         self.push_php_install_step(install_id, obj, done);
+    }
+
+    /// Updates a progress step in-place while preserving and appending timestamped log lines.
+    pub fn append_install_progress(
+        &self,
+        install_id: &str,
+        step: &str,
+        label: &str,
+        status: &str,
+        progress: Option<u8>,
+        log_line: Option<&str>,
+        done: bool,
+    ) {
+        let mut merged_msg = String::new();
+        if let Ok(jobs) = self.php_installs.lock() {
+            if let Some(job) = jobs.get(install_id) {
+                if let Some(existing) = job.steps.iter().find(|s| {
+                    s.get("step").and_then(|v| v.as_str()) == Some(step)
+                }) {
+                    if let Some(prev) = existing.get("message").and_then(|v| v.as_str()) {
+                        merged_msg = prev.to_string();
+                    }
+                }
+            }
+        }
+        if let Some(line) = log_line.map(str::trim).filter(|s| !s.is_empty()) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            let stamped = format!("[{}] {}", ts, line);
+            if !merged_msg.lines().last().map(|l| l.ends_with(line)).unwrap_or(false) {
+                if !merged_msg.is_empty() {
+                    merged_msg.push('\n');
+                }
+                merged_msg.push_str(&stamped);
+            }
+        }
+        self.push_install_progress(
+            install_id,
+            step,
+            label,
+            status,
+            progress,
+            if merged_msg.is_empty() { None } else { Some(merged_msg.as_str()) },
+            done,
+        );
     }
 
     pub fn certs_dir(&self) -> PathBuf {
@@ -806,9 +1102,29 @@ impl AppState {
 
     pub fn ensure_site_ssl(&self, domain: &str) -> Result<(), String> {
         let clean = domain.trim().to_lowercase();
-        let (cert, key) = crate::ssl::ensure_site_certificate(&self.certs_dir(), &clean)?;
+        let aliases = self
+            .get_site(&clean)
+            .map(|s| s.aliases)
+            .unwrap_or_default();
+        let (cert, key) =
+            crate::ssl::ensure_site_certificate_with_aliases(&self.certs_dir(), &clean, &aliases, false)?;
         let ck = crate::ssl::load_certified_key(&cert, &key)?;
-        self.cert_resolver.insert_key(&clean, ck);
+        self.cert_resolver.insert_key(&clean, ck.clone());
+        for alias in aliases {
+            self.cert_resolver.insert_key(&alias, ck.clone());
+        }
+        Ok(())
+    }
+
+    pub fn refresh_site_ssl_with_aliases(&self, domain: &str, aliases: &[String]) -> Result<(), String> {
+        let clean = domain.trim().to_lowercase();
+        let (cert, key) =
+            crate::ssl::ensure_site_certificate_with_aliases(&self.certs_dir(), &clean, aliases, true)?;
+        let ck = crate::ssl::load_certified_key(&cert, &key)?;
+        self.cert_resolver.insert_key(&clean, ck.clone());
+        for alias in aliases {
+            self.cert_resolver.insert_key(alias, ck.clone());
+        }
         Ok(())
     }
 
@@ -969,13 +1285,13 @@ impl AppState {
             let mut data = self.data.lock().map_err(|_| "State lock failed".to_string())?;
             if let Some(s) = data.sites.iter_mut().find(|s| s.id == id_or_domain || s.domain.to_lowercase() == clean) {
                 if let Some(v) = max_upload_mb {
-                    s.max_upload_mb = v;
+                    s.max_upload_mb = v.clamp(1, 10240);
                 }
                 if let Some(v) = php_memory_mb {
-                    s.php_memory_mb = v;
+                    s.php_memory_mb = v.clamp(32, 4096);
                 }
                 if let Some(v) = php_max_workers {
-                    s.php_max_workers = v;
+                    s.php_max_workers = v.clamp(1, 8);
                 }
                 s.clone()
             } else {
@@ -983,6 +1299,10 @@ impl AppState {
             }
         };
         self.save_data();
+        if site.status.eq_ignore_ascii_case("active") && site.runtime == "php" {
+            self.stop_domain_workers(&site.domain);
+            self.spawn_site_worker(&site);
+        }
         Ok(site)
     }
 
@@ -1004,17 +1324,76 @@ impl AppState {
 
     pub fn get_site_worker_port(&self, domain: &str) -> Option<u16> {
         let clean = domain.trim().to_lowercase();
-        self.worker_ports.lock().unwrap().get(&clean).copied()
+        let ports = self.worker_ports.lock().unwrap();
+        let list = ports.get(&clean)?;
+        if list.is_empty() {
+            None
+        } else if list.len() == 1 {
+            Some(list[0])
+        } else {
+            let idx = self
+                .worker_rr_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(list[idx % list.len()])
+        }
+    }
+
+    pub fn get_site_worker_ports(&self, domain: &str) -> Vec<u16> {
+        let clean = domain.trim().to_lowercase();
+        self.worker_ports
+            .lock()
+            .unwrap()
+            .get(&clean)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_site_worker_port(&self, domain: &str, port: u16) {
+        self.set_site_worker_ports(domain, vec![port]);
+    }
+
+    pub fn set_site_worker_ports(&self, domain: &str, ports: Vec<u16>) {
         let clean = domain.trim().to_lowercase();
-        self.worker_ports.lock().unwrap().insert(clean, port);
+        if ports.is_empty() {
+            self.worker_ports.lock().unwrap().remove(&clean);
+        } else {
+            self.worker_ports.lock().unwrap().insert(clean, ports);
+        }
     }
 
     pub fn remove_site_worker_port(&self, domain: &str) {
         let clean = domain.trim().to_lowercase();
         self.worker_ports.lock().unwrap().remove(&clean);
+    }
+
+    pub fn stop_domain_workers(&self, domain: &str) {
+        let clean = domain.trim().to_lowercase();
+        if let Ok(mut procs) = self.worker_processes.lock() {
+            if let Some(children) = procs.remove(&clean) {
+                for mut child in children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        self.remove_site_worker_port(&clean);
+    }
+
+    pub fn restart_sites_for_php_version(&self, version: &str) {
+        let target = version.trim();
+        let matching: Vec<LocalSite> = self
+            .list_sites()
+            .into_iter()
+            .filter(|s| {
+                s.runtime == "php"
+                    && s.status.eq_ignore_ascii_case("active")
+                    && s.php_version.trim() == target
+            })
+            .collect();
+        for site in matching {
+            self.stop_domain_workers(&site.domain);
+            self.spawn_site_worker(&site);
+        }
     }
 
     pub fn create_site(&self, domain: &str, php_version: Option<&str>) -> Result<LocalSite, String> {
@@ -1182,6 +1561,8 @@ server.listen(port, '127.0.0.1', () => {{
             php_max_workers: 4,
             app_command: effective_app_cmd,
             proxy_port,
+            aliases: Vec::new(),
+            redirects: Vec::new(),
         };
 
         {
@@ -1211,15 +1592,12 @@ server.listen(port, '127.0.0.1', () => {{
         if let Some(site) = removed {
             let clean = site.domain.trim().to_lowercase();
             let doc_root = self.site_dir(&site);
-            if let Ok(mut procs) = self.worker_processes.lock() {
-                if let Some(mut child) = procs.remove(&clean) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-            self.remove_site_worker_port(&clean);
+            self.stop_domain_workers(&clean);
             self.save_data();
             let _ = crate::hosts_manager::remove_domain_from_hosts(&site.domain);
+            for alias in &site.aliases {
+                let _ = crate::hosts_manager::remove_domain_from_hosts(alias);
+            }
 
             // Clean up any per-site MariaDB database if present in wp-config.php
             if let Some(wp_db) = crate::wordpress::read_wp_mysql_db_name(&doc_root) {
@@ -1258,6 +1636,106 @@ server.listen(port, '127.0.0.1', () => {{
         }
     }
 
+    /// Unregisters a site from DockPanel (stops workers, removes hosts entry & certs)
+    /// WITHOUT removing any website files or directories from disk. Used when rolling
+    /// back a failed existing-folder import so it returns to discoverable folders cleanly.
+    pub fn unregister_site_keep_files(&self, id: &str) -> bool {
+        let removed = {
+            let mut data = self.data.lock().unwrap();
+            let pos = data.sites.iter().position(|s| s.id == id || s.domain == id);
+            pos.map(|idx| data.sites.remove(idx))
+        };
+
+        if let Some(site) = removed {
+            let clean = site.domain.trim().to_lowercase();
+            self.stop_domain_workers(&clean);
+            self.save_data();
+            let _ = crate::hosts_manager::remove_domain_from_hosts(&site.domain);
+            for alias in &site.aliases {
+                let _ = crate::hosts_manager::remove_domain_from_hosts(alias);
+            }
+            let cert_dir = self.certs_dir().join(&clean);
+            if cert_dir.is_dir() {
+                let _ = fs::remove_dir_all(cert_dir);
+            }
+            let sec_file = self.site_security_path(&clean);
+            if sec_file.is_file() {
+                let _ = fs::remove_file(sec_file);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Registers a directory that was explicitly scanned or picked by the user in the UI
+    /// so database dumps selected from that directory can be imported cleanly without re-upload.
+    pub fn approve_db_scan_dir(&self, dir: &Path) {
+        if !dir.is_dir() {
+            return;
+        }
+        let canon = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if let Ok(mut guard) = self.approved_db_scan_dirs.lock() {
+            if !guard.iter().any(|existing| existing == &canon) {
+                if guard.len() >= 32 {
+                    guard.remove(0);
+                }
+                guard.push(canon);
+            }
+        }
+    }
+
+    /// Checks whether a canonicalized local database file path resides inside the site directory,
+    /// the Default Websites Directory, or an explicitly approved scanned directory.
+    pub fn is_approved_db_path(&self, site: &LocalSite, canonical_file: &Path) -> bool {
+        if let Ok(site_canon) = fs::canonicalize(self.site_dir(site)) {
+            if canonical_file.starts_with(&site_canon) {
+                return true;
+            }
+        }
+        if let Ok(root_canon) = fs::canonicalize(self.get_default_sites_dir()) {
+            if canonical_file.starts_with(&root_canon) {
+                return true;
+            }
+        }
+        if let Ok(guard) = self.approved_db_scan_dirs.lock() {
+            if guard.iter().any(|dir| canonical_file.starts_with(dir)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn load_site_env_vars(doc_root: &Path) -> Vec<(String, String)> {
+        let env_path = doc_root.join(".env");
+        let Ok(content) = fs::read_to_string(env_path) else {
+            return Vec::new();
+        };
+        let mut vars = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let stripped = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+            if let Some((k, v)) = stripped.split_once('=') {
+                let key = k.trim();
+                if key.is_empty() {
+                    continue;
+                }
+                let mut val = v.trim();
+                if val.len() >= 2
+                    && ((val.starts_with('"') && val.ends_with('"'))
+                        || (val.starts_with('\'') && val.ends_with('\'')))
+                {
+                    val = &val[1..val.len() - 1];
+                }
+                vars.push((key.to_string(), val.to_string()));
+            }
+        }
+        vars
+    }
+
     pub fn spawn_php_worker(
         &self,
         domain: &str,
@@ -1265,87 +1743,266 @@ server.listen(port, '127.0.0.1', () => {{
         php_version: Option<&str>,
     ) -> Option<u16> {
         let clean = domain.trim().to_lowercase();
+        let (memory_mb, upload_mb, worker_count) = self
+            .get_site(&clean)
+            .map(|s| {
+                (
+                    s.php_memory_mb.clamp(32, 4096),
+                    s.max_upload_mb.clamp(1, 10240),
+                    s.php_max_workers.clamp(1, 8) as usize,
+                )
+            })
+            .unwrap_or((256, 64, 4));
 
-        // Check if existing worker is still alive
+        // Reuse existing pool if all expected workers are still alive.
         {
             let mut procs = self.worker_processes.lock().unwrap();
-            if let Some(child) = procs.get_mut(&clean) {
-                match child.try_wait() {
-                    Ok(None) => {
-                        // Still running
-                        if let Some(port) = self.get_site_worker_port(&clean) {
-                            return Some(port);
-                        } else {
-                            // Inconsistent state: child running without worker port, kill it
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            procs.remove(&clean);
-                        }
-                    }
-                    _ => {
-                        procs.remove(&clean);
+            if let Some(children) = procs.get_mut(&clean) {
+                let all_alive = !children.is_empty()
+                    && children.len() == worker_count
+                    && children
+                        .iter_mut()
+                        .all(|child| matches!(child.try_wait(), Ok(None)));
+                if all_alive {
+                    if let Some(port) = self.get_site_worker_port(&clean) {
+                        return Some(port);
                     }
                 }
             }
         }
 
-        // If an entry still exists in worker_processes for the domain, kill and wait on it before spawning
-        {
-            let mut procs = self.worker_processes.lock().unwrap();
-            if let Some(mut old_child) = procs.remove(&clean) {
-                let _ = old_child.kill();
-                let _ = old_child.wait();
-            }
-        }
+        self.stop_domain_workers(&clean);
 
         let php_exe = find_php_binary(php_version)?;
-        let worker_port = find_available_loopback_port()?;
 
         #[cfg(windows)]
         use std::os::windows::process::CommandExt;
         #[cfg(windows)]
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        let php_error_log = self.config_dir.join("php_errors.log");
+        let logs_dir = self.config_dir.join("logs");
+        let _ = fs::create_dir_all(&logs_dir);
+
+        let php_error_log = self.php_error_log_path(&clean);
         let error_log_arg = format!("error_log={}", php_error_log.to_string_lossy());
-        let mut cmd = std::process::Command::new(&php_exe);
-        cmd.args([
-            "-d",
-            &error_log_arg,
-            "-S",
-            &format!("127.0.0.1:{}", worker_port),
-            "-t",
-            doc_root,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        let memory_arg = format!("memory_limit={}M", memory_mb);
+        let upload_arg = format!("upload_max_filesize={}M", upload_mb);
+        let post_max_arg = format!("post_max_size={}M", upload_mb.saturating_add(2));
+        let shim_path = self.ensure_php_proxy_shim();
+        let smtp_port = self.mail_catcher.smtp_port();
+        let worker_log_path = self.php_worker_log_path(&clean);
+        let env_vars = Self::load_site_env_vars(Path::new(doc_root));
 
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        let mut spawned_children = Vec::with_capacity(worker_count);
+        let mut spawned_ports = Vec::with_capacity(worker_count);
 
-        match cmd.spawn() {
-            Ok(child) => {
-                #[cfg(windows)]
-                assign_child_to_job(&self.worker_job, &child);
-
-                let mut procs = self.worker_processes.lock().unwrap();
-                if let Some(mut old_child) = procs.insert(clean.clone(), child) {
-                    let _ = old_child.kill();
-                    let _ = old_child.wait();
-                }
-                self.set_site_worker_port(&clean, worker_port);
-                Some(worker_port)
+        for _ in 0..worker_count {
+            let Some(worker_port) = find_available_loopback_port() else {
+                continue;
+            };
+            let mut cmd = std::process::Command::new(&php_exe);
+            cmd.args([
+                "-d",
+                "log_errors=On",
+                "-d",
+                &error_log_arg,
+                "-d",
+                &memory_arg,
+                "-d",
+                &upload_arg,
+                "-d",
+                &post_max_arg,
+                "-d",
+                "max_execution_time=120",
+            ]);
+            if let Some(ref sp) = shim_path {
+                cmd.args([
+                    "-d",
+                    &format!("auto_prepend_file={}", sp.to_string_lossy()),
+                ]);
             }
-            Err(e) => {
-                eprintln!("Failed to spawn PHP worker for {}: {}", clean, e);
-                None
+            if let Some(port) = smtp_port {
+                let from_addr = format!("wordpress@{}", clean);
+                cmd.args([
+                    "-d",
+                    "SMTP=127.0.0.1",
+                    "-d",
+                    &format!("smtp_port={}", port),
+                    "-d",
+                    &format!("sendmail_from={}", from_addr),
+                    "-d",
+                    "sendmail_path=",
+                ]);
+            }
+            for (k, v) in &env_vars {
+                cmd.env(k, v);
+            }
+            let (stdout_cfg, stderr_cfg) =
+                match open_log_file_append(&worker_log_path, 2 * 1024 * 1024) {
+                    Some(f) => {
+                        let err_f = f.try_clone().ok();
+                        (
+                            std::process::Stdio::from(f),
+                            err_f
+                                .map(std::process::Stdio::from)
+                                .unwrap_or_else(std::process::Stdio::null),
+                        )
+                    }
+                    None => (std::process::Stdio::null(), std::process::Stdio::null()),
+                };
+            cmd.args([
+                "-S",
+                &format!("127.0.0.1:{}", worker_port),
+                "-t",
+                doc_root,
+            ])
+            .stdout(stdout_cfg)
+            .stderr(stderr_cfg);
+
+            #[cfg(windows)]
+            cmd.creation_flags(CREATE_NO_WINDOW);
+
+            match cmd.spawn() {
+                Ok(child) => {
+                    #[cfg(windows)]
+                    assign_child_to_job(&self.worker_job, &child);
+                    spawned_children.push(child);
+                    spawned_ports.push(worker_port);
+                }
+                Err(e) => {
+                    eprintln!("Failed to spawn PHP worker for {}: {}", clean, e);
+                }
             }
         }
+
+        if spawned_ports.is_empty() {
+            return None;
+        }
+        let first_port = spawned_ports[0];
+        self.worker_processes
+            .lock()
+            .unwrap()
+            .insert(clean.clone(), spawned_children);
+        self.set_site_worker_ports(&clean, spawned_ports);
+        Some(first_port)
     }
 
     pub fn app_log_path(&self, domain: &str) -> PathBuf {
         let clean = domain.trim().to_lowercase();
         self.config_dir.join("logs").join(format!("{}.app.log", clean))
+    }
+
+    pub fn php_error_log_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("logs").join(format!("{}.php_errors.log", clean))
+    }
+
+    pub fn php_worker_log_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("logs").join(format!("{}.php_worker.log", clean))
+    }
+
+    pub fn access_log_path(&self, domain: &str) -> PathBuf {
+        let clean = domain.trim().to_lowercase();
+        self.config_dir.join("logs").join(format!("{}.access.log", clean))
+    }
+
+    pub fn append_site_access_log(&self, domain: &str, entry: &str) {
+        use std::io::Write;
+        let path = self.access_log_path(domain);
+        if let Some(mut f) = open_log_file_append(&path, 5 * 1024 * 1024) {
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(f, "[{}] {}", ts, entry);
+        }
+    }
+
+    pub fn record_site_traffic(
+        &self,
+        domain: &str,
+        path: &str,
+        status: u16,
+        bytes: u64,
+        client_ip: &str,
+    ) {
+        let clean = domain.trim().to_lowercase();
+        let mut guard = self.site_stats.lock().unwrap();
+        let entry = guard.entry(clean).or_default();
+        entry.requests = entry.requests.saturating_add(1);
+        entry.bytes_sent = entry.bytes_sent.saturating_add(bytes);
+        *entry.status_codes.entry(status.to_string()).or_insert(0) += 1;
+        let norm_path = if path.trim().is_empty() { "/" } else { path.trim() };
+        if entry.top_paths.len() < 200 || entry.top_paths.contains_key(norm_path) {
+            *entry.top_paths.entry(norm_path.to_string()).or_insert(0) += 1;
+        }
+        if entry.unique_ips.len() < 1000 {
+            entry.unique_ips.insert(client_ip.to_string());
+        }
+    }
+
+    pub fn get_site_traffic_stats(&self, domain: &str) -> serde_json::Value {
+        let clean = domain.trim().to_lowercase();
+        let guard = self.site_stats.lock().unwrap();
+        let Some(entry) = guard.get(&clean) else {
+            return serde_json::json!({
+                "requests": 0,
+                "unique_ips": 0,
+                "bandwidth_mb": "0.00",
+                "bytes_sent": 0,
+                "top_pages": [],
+                "status_codes": {},
+            });
+        };
+        let mut pages: Vec<(&String, &u64)> = entry.top_paths.iter().collect();
+        pages.sort_by(|a, b| b.1.cmp(a.1));
+        let top_pages: Vec<serde_json::Value> = pages
+            .into_iter()
+            .take(10)
+            .map(|(p, c)| serde_json::json!({ "path": p, "count": c }))
+            .collect();
+        let bw_mb = format!("{:.2}", entry.bytes_sent as f64 / (1024.0 * 1024.0));
+        serde_json::json!({
+            "requests": entry.requests,
+            "unique_ips": entry.unique_ips.len(),
+            "bandwidth_mb": bw_mb,
+            "bytes_sent": entry.bytes_sent,
+            "top_pages": top_pages,
+            "status_codes": entry.status_codes,
+        })
+    }
+
+    pub fn push_metrics_point(&self, point: serde_json::Value) {
+        let mut hist = self.metrics_history.lock().unwrap();
+        hist.push(point);
+        if hist.len() > 120 {
+            let excess = hist.len() - 120;
+            hist.drain(0..excess);
+        }
+    }
+
+    pub fn get_metrics_history(&self) -> Vec<serde_json::Value> {
+        self.metrics_history.lock().unwrap().clone()
+    }
+
+    /// Writes the shared PHP prepend shim so built-in `php -S` workers behind DockPanel's
+    /// TLS-terminating router populate `$_SERVER['HTTPS'] = 'on'` and `SERVER_PORT = 443`
+    /// whenever `X-Forwarded-Proto: https` is present (prevents WordPress HTTPS redirect loops).
+    pub fn ensure_php_proxy_shim(&self) -> Option<PathBuf> {
+        let _ = fs::create_dir_all(&self.config_dir);
+        let shim_path = self.config_dir.join("dockpanel_proxy_env.php");
+        const SHIM_CODE: &str = r#"<?php
+if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string)$_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
+    $_SERVER['HTTPS'] = 'on';
+    $_SERVER['REQUEST_SCHEME'] = 'https';
+    $_SERVER['SERVER_PORT'] = '443';
+}
+"#;
+        let needs_write = fs::read_to_string(&shim_path)
+            .map(|c| c != SHIM_CODE)
+            .unwrap_or(true);
+        if needs_write && fs::write(&shim_path, SHIM_CODE).is_err() {
+            return None;
+        }
+        Some(shim_path)
     }
 
     pub fn spawn_site_worker(&self, site: &LocalSite) {
@@ -1376,16 +2033,18 @@ server.listen(port, '127.0.0.1', () => {{
         // Check if existing worker is still alive
         {
             let mut procs = self.worker_processes.lock().unwrap();
-            if let Some(child) = procs.get_mut(&clean) {
-                if let Ok(None) = child.try_wait() {
+            if let Some(children) = procs.get_mut(&clean) {
+                if children
+                    .iter_mut()
+                    .any(|child| matches!(child.try_wait(), Ok(None)))
+                {
                     if let Some(port) = self.get_site_worker_port(&clean) {
                         return Some(port);
                     }
-                } else {
-                    procs.remove(&clean);
                 }
             }
         }
+        self.stop_domain_workers(&clean);
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let worker_port = listener.local_addr().ok()?.port();
@@ -1429,10 +2088,17 @@ server.listen(port, '127.0.0.1', () => {{
             c
         };
 
-        cmd.current_dir(doc_root)
-            .env("PORT", worker_port.to_string())
+        cmd.current_dir(doc_root);
+        for (k, v) in Self::load_site_env_vars(Path::new(doc_root)) {
+            cmd.env(k, v);
+        }
+        cmd.env("PORT", worker_port.to_string())
             .env("HOST", "127.0.0.1")
             .env("SITE_DOMAIN", &clean);
+        if let Some(smtp_port) = self.mail_catcher.smtp_port() {
+            cmd.env("SMTP_HOST", "127.0.0.1")
+                .env("SMTP_PORT", smtp_port.to_string());
+        }
 
         if let Some(out) = stdout_file {
             cmd.stdout(std::process::Stdio::from(out));
@@ -1450,13 +2116,10 @@ server.listen(port, '127.0.0.1', () => {{
                 #[cfg(windows)]
                 assign_child_to_job(&self.worker_job, &child);
 
-                {
-                    let mut procs = self.worker_processes.lock().unwrap();
-                    if let Some(mut old_child) = procs.insert(clean.clone(), child) {
-                        let _ = old_child.kill();
-                        let _ = old_child.wait();
-                    }
-                }
+                self.worker_processes
+                    .lock()
+                    .unwrap()
+                    .insert(clean.clone(), vec![child]);
                 self.set_site_worker_port(&clean, worker_port);
 
                 // Briefly wait up to 1.5s for Node.js to bind its port so immediate requests succeed
@@ -1524,15 +2187,8 @@ server.listen(port, '127.0.0.1', () => {{
             None => return Err(format!("Site '{}' not found", id_or_domain)),
         };
 
-        // Terminate child worker process if exists
-        {
-            let mut procs = self.worker_processes.lock().unwrap();
-            if let Some(mut child) = procs.remove(&site.domain.to_lowercase()) {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        self.remove_site_worker_port(&site.domain);
+        // Terminate child worker processes if exist
+        self.stop_domain_workers(&site.domain);
 
         // Update status to stopped
         {
@@ -1560,6 +2216,9 @@ server.listen(port, '127.0.0.1', () => {{
         for site in active_sites {
             self.spawn_site_worker(&site);
             let _ = crate::hosts_manager::sync_domain_to_hosts(&site.domain);
+            for alias in &site.aliases {
+                let _ = crate::hosts_manager::sync_domain_to_hosts(alias);
+            }
             #[cfg(not(test))]
             {
                 let _ = self.ensure_site_ssl(&site.domain);
@@ -1623,6 +2282,7 @@ server.listen(port, '127.0.0.1', () => {{
                 if let Ok(mut guard) = self.mariadb_process.lock() {
                     *guard = Some((child, port));
                 }
+                self.set_startup_phase(Some("ready"), None, None, None);
                 return Ok(port);
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -1633,7 +2293,37 @@ server.listen(port, '127.0.0.1', () => {{
             let _ = c.kill();
             let _ = c.wait();
         };
-        Err(format!("MariaDB daemon started but port {} did not become ready in time", port))
+        let err_msg = format!("MariaDB daemon started but port {} did not become ready in time", port);
+        self.set_startup_phase(Some("error"), Some(err_msg.clone()), None, None);
+        Err(err_msg)
+    }
+
+    pub fn get_startup_readiness(&self) -> StartupReadiness {
+        self.startup_readiness
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_startup_phase(
+        &self,
+        mariadb: Option<&str>,
+        mariadb_error: Option<String>,
+        php_workers: Option<&str>,
+        mail_catcher: Option<&str>,
+    ) {
+        if let Ok(mut guard) = self.startup_readiness.lock() {
+            if let Some(m) = mariadb {
+                guard.mariadb = m.to_string();
+                guard.mariadb_error = mariadb_error;
+            }
+            if let Some(p) = php_workers {
+                guard.php_workers = p.to_string();
+            }
+            if let Some(mc) = mail_catcher {
+                guard.mail_catcher = mc.to_string();
+            }
+        }
     }
 
     pub fn stop_mariadb(&self) {
@@ -1643,13 +2333,21 @@ server.listen(port, '127.0.0.1', () => {{
                 let _ = child.wait();
             }
         }
+        let mdb_state = if crate::mariadb::find_mariadbd_binary().is_some() {
+            "stopped"
+        } else {
+            "not_installed"
+        };
+        self.set_startup_phase(Some(mdb_state), None, None, None);
     }
 
     pub fn stop_all_workers(&self) {
         if let Ok(mut procs) = self.worker_processes.lock() {
-            for (_dom, mut child) in procs.drain() {
-                let _ = child.kill();
-                let _ = child.wait();
+            for (_dom, children) in procs.drain() {
+                for mut child in children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
         }
         if let Ok(mut ports) = self.worker_ports.lock() {
@@ -1695,7 +2393,11 @@ server.listen(port, '127.0.0.1', () => {{
             "title": notif.title,
             "message": notif.message,
             "severity": notif.severity,
-            "category": "desktop",
+            "category": target_type,
+            "action": action,
+            "target_type": target_type,
+            "target_name": target_name,
+            "details": format!("Event: {} | Target: {} ({})\n{}", action, target_type, target_name, notif.message),
             "link": serde_json::Value::Null,
             "read": false,
             "read_at": serde_json::Value::Null,
@@ -1727,6 +2429,16 @@ server.listen(port, '127.0.0.1', () => {{
             "default_sites_dir".to_string(),
             self.sites_dir.to_string_lossy().to_string(),
         );
+        defaults.insert("minimize_to_tray".to_string(), "true".to_string());
+        #[cfg(not(test))]
+        let startup_default = if crate::tray::is_launch_at_startup_enabled() {
+            "true"
+        } else {
+            "false"
+        };
+        #[cfg(test)]
+        let startup_default = "false";
+        defaults.insert("launch_at_startup".to_string(), startup_default.to_string());
 
         let path = self.config_dir.join("desktop_settings.json");
         if let Ok(content) = fs::read_to_string(path) {
@@ -1897,13 +2609,7 @@ mod tests {
         assert_eq!(site.status, "active");
 
         // Stop worker manually without changing status
-        if let Ok(mut procs) = state.worker_processes.lock() {
-            if let Some(mut child) = procs.remove("reconcile-test.local") {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        state.remove_site_worker_port("reconcile-test.local");
+        state.stop_domain_workers("reconcile-test.local");
         assert_eq!(state.get_site_worker_port("reconcile-test.local"), None);
 
         // Reconcile should restart the worker if PHP is present
@@ -2025,6 +2731,110 @@ mod tests {
         assert!(site_dir.join("package.json").is_file());
         assert!(site_dir.join("server.js").is_file());
         assert!(!site_dir.join("index.html").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_php_proxy_shim_and_per_site_log_paths() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_shim_{}", uuid::Uuid::new_v4()));
+        let config_dir = temp_dir.join("config");
+        let sites_dir = temp_dir.join("sites");
+        let state = AppState::new_with_dirs(config_dir.clone(), sites_dir);
+
+        let shim = state.ensure_php_proxy_shim().expect("shim should be created");
+        assert!(shim.is_file());
+        let content = std::fs::read_to_string(&shim).unwrap();
+        assert!(content.contains("HTTP_X_FORWARDED_PROTO"));
+        assert!(content.contains("$_SERVER['HTTPS'] = 'on'"));
+        assert!(content.contains("$_SERVER['SERVER_PORT'] = '443'"));
+
+        assert_eq!(
+            state.php_error_log_path("Example.Local"),
+            config_dir.join("logs").join("example.local.php_errors.log")
+        );
+        assert_eq!(
+            state.access_log_path("Example.Local"),
+            config_dir.join("logs").join("example.local.access.log")
+        );
+        state.append_site_access_log("Example.Local", "HTTPS GET / -> 200 [3ms]");
+        let access_txt = std::fs::read_to_string(state.access_log_path("Example.Local")).unwrap();
+        assert!(access_txt.contains("HTTPS GET / -> 200 [3ms]"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_round_robin_worker_ports_and_limits_clamping() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_rr_{}", uuid::Uuid::new_v4()));
+        let state = AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites"));
+
+        state.set_site_worker_ports("pool.test", vec![9001, 9002, 9003]);
+        assert_eq!(state.get_site_worker_ports("pool.test"), vec![9001, 9002, 9003]);
+
+        let picks: Vec<u16> = (0..6)
+            .filter_map(|_| state.get_site_worker_port("pool.test"))
+            .collect();
+        assert_eq!(picks, vec![9001, 9002, 9003, 9001, 9002, 9003]);
+
+        let site = state.create_site("limits.test", Some("8.3")).unwrap();
+        let updated = state
+            .update_site_limits(&site.id, Some(99999), Some(8), Some(99))
+            .unwrap();
+        assert_eq!(updated.max_upload_mb, 10240);
+        assert_eq!(updated.php_memory_mb, 32);
+        assert_eq!(updated.php_max_workers, 8);
+
+        let _ = state.stop_site(&site.id);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_site_env_vars_parses_comments_and_quotes() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_env_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join(".env"),
+            "# Comment line\nAPP_ENV=local\nexport DB_PASS=\"s3cr3t=val\"\nSINGLE='quoted'\n\nEMPTY=\n",
+        )
+        .unwrap();
+
+        let vars = AppState::load_site_env_vars(&temp_dir);
+        assert_eq!(
+            vars,
+            vec![
+                ("APP_ENV".to_string(), "local".to_string()),
+                ("DB_PASS".to_string(), "s3cr3t=val".to_string()),
+                ("SINGLE".to_string(), "quoted".to_string()),
+                ("EMPTY".to_string(), "".to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_site_traffic_stats_and_metrics_history() {
+        let temp_dir = std::env::temp_dir().join(format!("dockpanel_stats_{}", uuid::Uuid::new_v4()));
+        let state = AppState::new_with_dirs(temp_dir.join("config"), temp_dir.join("sites"));
+
+        state.record_site_traffic("stats.test", "/", 200, 1024 * 512, "127.0.0.1");
+        state.record_site_traffic("stats.test", "/about", 404, 1024 * 512, "127.0.0.2");
+        state.record_site_traffic("stats.test", "/", 200, 1024, "127.0.0.1");
+
+        let stats = state.get_site_traffic_stats("stats.test");
+        assert_eq!(stats["requests"], 3);
+        assert_eq!(stats["unique_ips"], 2);
+        assert_eq!(stats["status_codes"]["200"], 2);
+        assert_eq!(stats["status_codes"]["404"], 1);
+        assert_eq!(stats["top_pages"][0]["path"], "/");
+        assert_eq!(stats["top_pages"][0]["count"], 2);
+
+        for i in 0..130 {
+            state.push_metrics_point(serde_json::json!({ "cpu": i, "mem": 50, "disk": 40, "time": "12:00:00" }));
+        }
+        let hist = state.get_metrics_history();
+        assert_eq!(hist.len(), 120);
+        assert_eq!(hist[0]["cpu"], 10);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

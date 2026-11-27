@@ -1312,6 +1312,21 @@ select:focus-visible {
   to { opacity: 1; transform: translateY(0); }
 }
 
+.animate-alert-in {
+  animation: alertSlideIn 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes alertSlideIn {
+  from {
+    opacity: 0;
+    transform: translate3d(16px, 8px, 0) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
 /* Stagger children — add to parent, children get delayed */
 .stagger-children > * {
   animation: fadeUp 0.3s ease-out both;

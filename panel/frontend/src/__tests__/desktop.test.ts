@@ -56,7 +56,6 @@ describe("Desktop Mode Utils", () => {
       "/resellers",
       "/apps",
       "/git-deploys",
-      "/mail",
       "/terminal",
       "/users",
     ];
@@ -73,7 +72,7 @@ describe("Desktop Mode Utils", () => {
     (window as any).__TAURI__ = {};
     expect(isDesktopApp()).toBe(true);
 
-    const devPaths = ["/", "/sites", "/databases", "/wordpress-toolkit", "/account"];
+    const devPaths = ["/", "/sites", "/databases", "/wordpress-toolkit", "/mail", "/account"];
     for (const group of navGroups) {
       for (const item of group.items) {
         if (devPaths.includes(item.to)) {

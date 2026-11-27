@@ -153,18 +153,416 @@ pub async fn info(domain: &str) -> Result<serde_json::Value, String> {
     }))
 }
 
-/// List plugins with status and update info.
-/// Note: plugin list requires loading plugins to get accurate status.
-pub async fn plugins(domain: &str) -> Result<serde_json::Value, String> {
-    let out = wp_with_plugins(domain, &["plugin", "list", "--fields=name,title,status,update,version,auto_update", "--format=json"]).await?;
-    serde_json::from_str(&out).map_err(|e| format!("Parse error: {e}"))
+/// Parse a PHP constant value `define('KEY', 'VALUE')` or `$table_prefix = '...'` without executing wp-config.php.
+fn parse_wp_config_define(cfg: &str, key: &str) -> Option<String> {
+    let sq = format!("'{}'", key);
+    let dq = format!("\"{}\"", key);
+    for line in cfg.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+            continue;
+        }
+        let pos = trimmed
+            .find(&sq)
+            .map(|i| i + sq.len())
+            .or_else(|| trimmed.find(&dq).map(|i| i + dq.len()));
+        if let Some(after_key) = pos {
+            if !trimmed.contains("define") {
+                continue;
+            }
+            if let Some((_, rest)) = trimmed[after_key..].split_once(',') {
+                let val_part = rest.trim();
+                let q = val_part.chars().next()?;
+                if q == '\'' || q == '"' {
+                    if let Some(end) = val_part[1..].find(q) {
+                        return Some(val_part[1..1 + end].to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
-/// List themes with status and update info.
-/// Note: theme list requires loading themes to get accurate status.
+fn parse_wp_config_prefix(cfg: &str) -> String {
+    for line in cfg.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+            continue;
+        }
+        if let Some(idx) = trimmed.find("$table_prefix") {
+            if let Some((_, rhs)) = trimmed[idx..].split_once('=') {
+                let rhs = rhs.trim();
+                if let Some(q) = rhs.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                    if let Some(end) = rhs[1..].find(q) {
+                        let p = rhs[1..1 + end].trim();
+                        if !p.is_empty() {
+                            return p.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    "wp_".to_string()
+}
+
+/// Standalone Direct-DB PHP PDO fallback that executes WordPress toolkit operations directly
+/// against the database + plugin/theme file headers WITHOUT loading `wp-config.php` or `wp-load.php`.
+async fn wp_direct_db_fallback(
+    domain: &str,
+    action: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let path = site_path(domain)?;
+    let cfg = tokio::fs::read_to_string(format!("{path}/wp-config.php"))
+        .await
+        .map_err(|e| format!("Failed reading wp-config.php: {e}"))?;
+    let db_name = parse_wp_config_define(&cfg, "DB_NAME")
+        .ok_or_else(|| "DB_NAME not found in wp-config.php".to_string())?;
+    let db_user = parse_wp_config_define(&cfg, "DB_USER").unwrap_or_else(|| "root".to_string());
+    let db_pass = parse_wp_config_define(&cfg, "DB_PASSWORD").unwrap_or_default();
+    let raw_host = parse_wp_config_define(&cfg, "DB_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+    let (db_host, db_port) = match raw_host.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), p.to_string())
+        }
+        _ => (raw_host, "3306".to_string()),
+    };
+    let prefix = parse_wp_config_prefix(&cfg);
+
+    let php_script = r#"
+error_reporting(E_ERROR | E_PARSE);
+$siteDir = getenv('DP_SITE_DIR');
+$dbName  = getenv('DP_DB_NAME');
+$dbUser  = getenv('DP_DB_USER');
+$dbPass  = getenv('DP_DB_PASS');
+$dbHost  = getenv('DP_DB_HOST') ?: '127.0.0.1';
+$dbPort  = (int)(getenv('DP_DB_PORT') ?: 3306);
+$prefPfx = getenv('DP_DB_PREFIX') ?: 'wp_';
+$action  = getenv('DP_WP_ACTION');
+$params  = json_decode(getenv('DP_WP_PARAMS') ?: '{}', true) ?: [];
+
+$pdo = new PDO("mysql:host={$dbHost};port={$dbPort};dbname={$dbName};charset=utf8mb4", $dbUser, $dbPass, [
+    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+]);
+
+$clean = preg_replace('/[^A-Za-z0-9_]/', '', $prefPfx) ?: 'wp_';
+$rows = $pdo->query("SHOW TABLES LIKE '%options'")->fetchAll(PDO::FETCH_COLUMN);
+$prefix = '';
+foreach ($rows as $t) {
+    if ($t === $clean . 'options') { $prefix = $clean; break; }
+}
+if ($prefix === '' && !empty($rows)) {
+    $prefix = substr((string)$rows[0], 0, -strlen('options'));
+}
+if ($prefix === '') {
+    echo json_encode(['ok' => false, 'error' => 'WordPress options table not found']);
+    exit;
+}
+
+$optTbl = '`' . preg_replace('/[^A-Za-z0-9_]/', '', $prefix . 'options') . '`';
+$getOpt = function($name, $default = null) use ($pdo, $optTbl) {
+    $st = $pdo->prepare("SELECT option_value FROM {$optTbl} WHERE option_name = ? LIMIT 1");
+    $st->execute([$name]);
+    $r = $st->fetch(PDO::FETCH_ASSOC);
+    return $r ? $r['option_value'] : $default;
+};
+$setOpt = function($name, $val) use ($pdo, $optTbl) {
+    $stored = (is_array($val) || is_object($val)) ? serialize($val) : (string)$val;
+    $st = $pdo->prepare("SELECT option_id FROM {$optTbl} WHERE option_name = ? LIMIT 1");
+    $st->execute([$name]);
+    $r = $st->fetch(PDO::FETCH_ASSOC);
+    if ($r) {
+        $pdo->prepare("UPDATE {$optTbl} SET option_value = ? WHERE option_id = ?")->execute([$stored, $r['option_id']]);
+    } else {
+        $pdo->prepare("INSERT INTO {$optTbl} (option_name, option_value, autoload) VALUES (?, ?, 'yes')")->execute([$name, $stored]);
+    }
+};
+$unser = function($raw) {
+    if (!is_string($raw)) return $raw;
+    $t = trim($raw);
+    if ($t !== '' && (preg_match('/^(a|O|s|i|d|b|N):/', $t) || $t === 'b:0;')) {
+        $u = @unserialize($raw, ['allowed_classes' => false]);
+        if ($u !== false || $t === 'b:0;') return $u;
+    }
+    return $raw;
+};
+$headers = function($file, $map) {
+    $fh = @fopen($file, 'rb');
+    if (!$fh) return [];
+    $d = str_replace("\r", "\n", (string)fread($fh, 8192));
+    fclose($fh);
+    $out = [];
+    foreach ($map as $k => $h) {
+        if (preg_match('/^(?:[ \t]*<\?php)?[ \t\/*#@]*' . preg_quote($h, '/') . ':(.*)$/mi', $d, $m)) {
+            $v = trim(preg_replace('/\s*(?:\*\/|\?>).*/', '', $m[1]));
+            if ($v !== '') $out[$k] = $v;
+        }
+    }
+    return $out;
+};
+$scanPlugins = function() use ($siteDir, $headers) {
+    $dir = $siteDir . '/wp-content/plugins';
+    $out = [];
+    foreach ((@scandir($dir) ?: []) as $e) {
+        if ($e === '.' || $e === '..' || $e === 'index.php') continue;
+        $p = $dir . '/' . $e;
+        if (is_file($p) && str_ends_with(strtolower($e), '.php')) {
+            $h = $headers($p, ['Name' => 'Plugin Name', 'Version' => 'Version']);
+            if (!empty($h['Name'])) $out[$e] = $h;
+        } elseif (is_dir($p)) {
+            foreach ((@scandir($p) ?: []) as $s) {
+                if (!str_ends_with(strtolower($s), '.php')) continue;
+                $sp = $p . '/' . $s;
+                if (!is_file($sp)) continue;
+                $h = $headers($sp, ['Name' => 'Plugin Name', 'Version' => 'Version']);
+                if (!empty($h['Name'])) { $out[$e . '/' . $s] = $h; break; }
+            }
+        }
+    }
+    ksort($out, SORT_NATURAL | SORT_FLAG_CASE);
+    return $out;
+};
+$scanThemes = function() use ($siteDir, $headers) {
+    $dir = $siteDir . '/wp-content/themes';
+    $out = [];
+    foreach ((@scandir($dir) ?: []) as $e) {
+        if ($e === '.' || $e === '..') continue;
+        $p = $dir . '/' . $e;
+        $css = $p . '/style.css';
+        if (is_dir($p)) {
+            $out[$e] = is_file($css) ? $headers($css, ['Name' => 'Theme Name', 'Version' => 'Version', 'Template' => 'Template']) : ['Name' => $e, 'Version' => '1.0'];
+        }
+    }
+    ksort($out, SORT_NATURAL | SORT_FLAG_CASE);
+    return $out;
+};
+
+if ($action === 'plugins') {
+    $all = $scanPlugins();
+    $active = array_values(array_map('strval', (array)$unser($getOpt('active_plugins', 'a:0:{}'))));
+    $auto = array_values(array_map('strval', (array)$unser($getOpt('auto_update_plugins', 'a:0:{}'))));
+    $items = [];
+    foreach ($all as $file => $h) {
+        $items[] = [
+            'name' => $file,
+            'title' => $h['Name'] ?? $file,
+            'version' => $h['Version'] ?? '1.0.0',
+            'status' => in_array($file, $active, true) ? 'active' : 'inactive',
+            'update' => 'none',
+            'auto_update' => in_array($file, $auto, true) ? 'on' : 'off',
+        ];
+    }
+    echo json_encode(['ok' => true, 'items' => $items]);
+    exit;
+}
+if ($action === 'themes') {
+    $all = $scanThemes();
+    $sheet = trim((string)$getOpt('stylesheet', ''));
+    $auto = array_values(array_map('strval', (array)$unser($getOpt('auto_update_themes', 'a:0:{}'))));
+    $items = [];
+    foreach ($all as $slug => $h) {
+        $items[] = [
+            'name' => $slug,
+            'title' => $h['Name'] ?? $slug,
+            'version' => $h['Version'] ?? '1.0',
+            'status' => ($slug === $sheet) ? 'active' : 'inactive',
+            'update' => 'none',
+            'auto_update' => in_array($slug, $auto, true) ? 'on' : 'off',
+        ];
+    }
+    echo json_encode(['ok' => true, 'items' => $items]);
+    exit;
+}
+if ($action === 'plugin_action') {
+    $act = (string)($params['action'] ?? '');
+    $name = (string)($params['name'] ?? '');
+    $all = $scanPlugins();
+    $resolved = $name;
+    if (!isset($all[$resolved])) {
+        $slug = preg_replace('/\.php$/i', '', explode('/', $name)[0]);
+        foreach ($all as $f => $_) {
+            if ($f === $slug . '.php' || str_starts_with($f, $slug . '/')) { $resolved = $f; break; }
+        }
+    }
+    $active = array_values(array_map('strval', (array)$unser($getOpt('active_plugins', 'a:0:{}'))));
+    $auto = array_values(array_map('strval', (array)$unser($getOpt('auto_update_plugins', 'a:0:{}'))));
+    if ($act === 'activate' || $act === 'enable') {
+        if (!isset($all[$resolved])) { echo json_encode(['ok' => false, 'error' => "Plugin not found: {$name}"]); exit; }
+        if (!in_array($resolved, $active, true)) { $active[] = $resolved; sort($active); }
+        $setOpt('active_plugins', $active);
+        echo json_encode(['ok' => true, 'output' => "Activated plugin '{$resolved}' directly in database"]);
+    } elseif ($act === 'deactivate' || $act === 'disable') {
+        $slug = explode('/', $resolved)[0];
+        $active = array_values(array_filter($active, fn($x) => $x !== $resolved && $x !== $name && !str_starts_with($x, $slug . '/')));
+        $setOpt('active_plugins', $active);
+        echo json_encode(['ok' => true, 'output' => "Disabled plugin '{$resolved}' directly in database"]);
+    } elseif ($act === 'enable-autoupdate') {
+        if (!in_array($resolved, $auto, true)) $auto[] = $resolved;
+        $setOpt('auto_update_plugins', $auto);
+        echo json_encode(['ok' => true, 'output' => "Enabled auto-update for '{$resolved}' directly in database"]);
+    } elseif ($act === 'disable-autoupdate') {
+        $auto = array_values(array_diff($auto, [$resolved]));
+        $setOpt('auto_update_plugins', $auto);
+        echo json_encode(['ok' => true, 'output' => "Disabled auto-update for '{$resolved}' directly in database"]);
+    } elseif ($act === 'enable-all-autoupdate') {
+        $setOpt('auto_update_plugins', array_keys($all));
+        echo json_encode(['ok' => true, 'output' => "Enabled all plugin auto-updates directly in database"]);
+    } elseif ($act === 'disable-all-autoupdate') {
+        $setOpt('auto_update_plugins', []);
+        echo json_encode(['ok' => true, 'output' => "Disabled all plugin auto-updates directly in database"]);
+    } else {
+        echo json_encode(['ok' => false, 'error' => "Unsupported plugin DB fallback action: {$act}"]);
+    }
+    exit;
+}
+if ($action === 'theme_action') {
+    $act = (string)($params['action'] ?? '');
+    $name = (string)($params['name'] ?? '');
+    $all = $scanThemes();
+    $auto = array_values(array_map('strval', (array)$unser($getOpt('auto_update_themes', 'a:0:{}'))));
+    $applyTheme = function($slug) use ($all, $setOpt) {
+        $meta = $all[$slug] ?? ['Name' => $slug];
+        $tpl = trim((string)($meta['Template'] ?? ''));
+        $template = ($tpl !== '' && isset($all[$tpl])) ? $tpl : $slug;
+        $setOpt('stylesheet', $slug);
+        $setOpt('template', $template);
+        $setOpt('current_theme', trim((string)($meta['Name'] ?? $slug)) ?: $slug);
+        return $slug;
+    };
+    if ($act === 'activate' || $act === 'enable') {
+        if (!isset($all[$name])) { echo json_encode(['ok' => false, 'error' => "Theme not found: {$name}"]); exit; }
+        $applyTheme($name);
+        echo json_encode(['ok' => true, 'output' => "Activated theme '{$name}' directly in database"]);
+    } elseif ($act === 'deactivate' || $act === 'disable') {
+        $fb = null;
+        foreach (['twentytwentyfive','twentytwentyfour','twentytwentythree','twentytwentytwo','twentytwentyone'] as $c) {
+            if (isset($all[$c]) && $c !== $name) { $fb = $c; break; }
+        }
+        if ($fb === null) {
+            foreach ($all as $slug => $_) { if ($slug !== $name) { $fb = $slug; break; } }
+        }
+        if ($fb === null) { echo json_encode(['ok' => false, 'error' => "No fallback theme installed to replace '{$name}'"]); exit; }
+        $applyTheme($fb);
+        echo json_encode(['ok' => true, 'output' => "Disabled theme '{$name}' and switched to '{$fb}' directly in database"]);
+    } elseif ($act === 'enable-autoupdate') {
+        if (!in_array($name, $auto, true)) $auto[] = $name;
+        $setOpt('auto_update_themes', $auto);
+        echo json_encode(['ok' => true, 'output' => "Enabled auto-update for theme '{$name}' directly in database"]);
+    } elseif ($act === 'disable-autoupdate') {
+        $auto = array_values(array_diff($auto, [$name]));
+        $setOpt('auto_update_themes', $auto);
+        echo json_encode(['ok' => true, 'output' => "Disabled auto-update for theme '{$name}' directly in database"]);
+    } elseif ($act === 'enable-all-autoupdate') {
+        $setOpt('auto_update_themes', array_keys($all));
+        echo json_encode(['ok' => true, 'output' => "Enabled all theme auto-updates directly in database"]);
+    } elseif ($act === 'disable-all-autoupdate') {
+        $setOpt('auto_update_themes', []);
+        echo json_encode(['ok' => true, 'output' => "Disabled all theme auto-updates directly in database"]);
+    } else {
+        echo json_encode(['ok' => false, 'error' => "Unsupported theme DB fallback action: {$act}"]);
+    }
+    exit;
+}
+if ($action === 'set_blog_public') {
+    $val = !empty($params['enabled']) ? '1' : '0';
+    $setOpt('blog_public', $val);
+    echo json_encode(['ok' => true, 'blog_public' => $val]);
+    exit;
+}
+if ($action === 'setup_admin') {
+    $title = trim((string)($params['site_title'] ?? ''));
+    $user  = trim((string)($params['admin_user'] ?? ''));
+    $email = trim((string)($params['admin_email'] ?? ''));
+    $pass  = (string)($params['admin_pass'] ?? '');
+    if ($title !== '') $setOpt('blogname', $title);
+    if ($email !== '') $setOpt('admin_email', $email);
+    $usersTbl = '`' . preg_replace('/[^A-Za-z0-9_]/', '', $prefix . 'users') . '`';
+    $metaTbl  = '`' . preg_replace('/[^A-Za-z0-9_]/', '', $prefix . 'usermeta') . '`';
+    $uid = null;
+    if ($user !== '') {
+        $st = $pdo->prepare("SELECT ID FROM {$usersTbl} WHERE user_login = ? LIMIT 1");
+        $st->execute([$user]);
+        $uid = $st->fetchColumn();
+    }
+    if (!$uid) {
+        $st = $pdo->prepare("SELECT u.ID FROM {$usersTbl} u INNER JOIN {$metaTbl} m ON m.user_id = u.ID WHERE m.meta_key = ? AND m.meta_value LIKE '%administrator%' ORDER BY u.ID ASC LIMIT 1");
+        $st->execute([$prefix . 'capabilities']);
+        $uid = $st->fetchColumn();
+    }
+    if ($uid) {
+        if ($email !== '') $pdo->prepare("UPDATE {$usersTbl} SET user_email = ? WHERE ID = ?")->execute([$email, $uid]);
+        if ($pass !== '') {
+            $hash = password_hash($pass, PASSWORD_BCRYPT);
+            $phpass = $siteDir . '/wp-includes/class-phpass.php';
+            if (is_file($phpass)) {
+                require_once $phpass;
+                if (class_exists('PasswordHash')) {
+                    $hash = (new PasswordHash(8, true))->HashPassword($pass);
+                }
+            }
+            $pdo->prepare("UPDATE {$usersTbl} SET user_pass = ? WHERE ID = ?")->execute([$hash, $uid]);
+        }
+    }
+    echo json_encode(['ok' => true, 'output' => 'Updated setup credentials directly in database']);
+    exit;
+}
+"#;
+
+    let mut cmd = safe_command("php");
+    cmd.args(["-r", php_script])
+        .env("DP_SITE_DIR", &path)
+        .env("DP_DB_NAME", &db_name)
+        .env("DP_DB_USER", &db_user)
+        .env("DP_DB_PASS", &db_pass)
+        .env("DP_DB_HOST", &db_host)
+        .env("DP_DB_PORT", &db_port)
+        .env("DP_DB_PREFIX", &prefix)
+        .env("DP_WP_ACTION", action)
+        .env("DP_WP_PARAMS", serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()));
+
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).output(),
+    )
+    .await
+    .map_err(|_| "Direct-DB helper timed out".to_string())?
+    .map_err(|e| format!("Failed invoking Direct-DB helper: {e}"))?;
+
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let val: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() { format!("Unexpected Direct-DB output: {raw}") } else { stderr }
+    })?;
+    if val.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(val["error"].as_str().unwrap_or("Direct-DB error").to_string());
+    }
+    Ok(val)
+}
+
+/// List plugins with status and update info (using --skip-plugins --skip-themes, with Direct-DB fallback
+/// so fatal errors in active themes/plugins never break the toolkit).
+pub async fn plugins(domain: &str) -> Result<serde_json::Value, String> {
+    if let Ok(out) = wp(domain, &["plugin", "list", "--fields=name,title,status,update,version,auto_update", "--format=json"]).await {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out) {
+            return Ok(parsed);
+        }
+    }
+    let fb = wp_direct_db_fallback(domain, "plugins", serde_json::json!({})).await?;
+    Ok(fb["items"].clone())
+}
+
+/// List themes with status and update info (using --skip-plugins --skip-themes, with Direct-DB fallback
+/// so fatal errors in broken themes/plugins never break the toolkit).
 pub async fn themes(domain: &str) -> Result<serde_json::Value, String> {
-    let out = wp_with_plugins(domain, &["theme", "list", "--fields=name,title,status,update,version,auto_update", "--format=json"]).await?;
-    serde_json::from_str(&out).map_err(|e| format!("Parse error: {e}"))
+    if let Ok(out) = wp(domain, &["theme", "list", "--fields=name,title,status,update,version,auto_update", "--format=json"]).await {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out) {
+            return Ok(parsed);
+        }
+    }
+    let fb = wp_direct_db_fallback(domain, "themes", serde_json::json!({})).await?;
+    Ok(fb["items"].clone())
 }
 
 /// Update WordPress core.
@@ -211,27 +609,46 @@ fn is_valid_wp_slug(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Plugin action: activate, deactivate, update, delete, install.
+/// Plugin action: activate, deactivate, enable, disable, update, delete, install.
 pub async fn plugin_action(domain: &str, name: &str, action: &str) -> Result<String, String> {
     if action == "enable-all-autoupdate" {
-        return wp(domain, &["plugin", "auto-updates", "enable", "--all"]).await;
+        return match wp(domain, &["plugin", "auto-updates", "enable", "--all"]).await {
+            Ok(s) => Ok(s),
+            Err(_) => Ok(wp_direct_db_fallback(domain, "plugin_action", serde_json::json!({ "action": action, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string()),
+        };
     }
     if action == "disable-all-autoupdate" {
-        return wp(domain, &["plugin", "auto-updates", "disable", "--all"]).await;
+        return match wp(domain, &["plugin", "auto-updates", "disable", "--all"]).await {
+            Ok(s) => Ok(s),
+            Err(_) => Ok(wp_direct_db_fallback(domain, "plugin_action", serde_json::json!({ "action": action, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string()),
+        };
     }
     if !is_valid_wp_slug(name) {
         return Err("Invalid plugin name. Only alphanumeric, hyphens, and underscores allowed.".into());
     }
-    let result = match action {
-        "activate" | "deactivate" | "update" | "delete" => {
-            wp(domain, &["plugin", action, name]).await?
-        }
+    let normalized = match action {
+        "enable" => "activate",
+        "disable" => "deactivate",
+        other => other,
+    };
+    let result = match normalized {
+        "activate" | "deactivate" => match wp(domain, &["plugin", normalized, name]).await {
+            Ok(s) => s,
+            Err(_) => wp_direct_db_fallback(domain, "plugin_action", serde_json::json!({ "action": normalized, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string(),
+        },
+        "update" | "delete" => wp(domain, &["plugin", normalized, name]).await?,
         "install" => wp(domain, &["plugin", "install", name]).await?,
-        "enable-autoupdate" => wp(domain, &["plugin", "auto-updates", "enable", name]).await?,
-        "disable-autoupdate" => wp(domain, &["plugin", "auto-updates", "disable", name]).await?,
+        "enable-autoupdate" => match wp(domain, &["plugin", "auto-updates", "enable", name]).await {
+            Ok(s) => s,
+            Err(_) => wp_direct_db_fallback(domain, "plugin_action", serde_json::json!({ "action": normalized, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string(),
+        },
+        "disable-autoupdate" => match wp(domain, &["plugin", "auto-updates", "disable", name]).await {
+            Ok(s) => s,
+            Err(_) => wp_direct_db_fallback(domain, "plugin_action", serde_json::json!({ "action": normalized, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string(),
+        },
         _ => return Err(format!("Unknown action: {action}")),
     };
-    if matches!(action, "install" | "update") {
+    if matches!(normalized, "install" | "update") {
         safe_command("chown")
             .args(["-R", "www-data:www-data", &site_path(domain)?])
             .output()
@@ -241,25 +658,52 @@ pub async fn plugin_action(domain: &str, name: &str, action: &str) -> Result<Str
     Ok(result)
 }
 
-/// Theme action: activate, update, delete, install, autoupdates.
+/// Theme action: activate, deactivate, enable, disable, update, delete, install, autoupdates.
 pub async fn theme_action(domain: &str, name: &str, action: &str) -> Result<String, String> {
     if action == "enable-all-autoupdate" {
-        return wp(domain, &["theme", "auto-updates", "enable", "--all"]).await;
+        return match wp(domain, &["theme", "auto-updates", "enable", "--all"]).await {
+            Ok(s) => Ok(s),
+            Err(_) => Ok(wp_direct_db_fallback(domain, "theme_action", serde_json::json!({ "action": action, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string()),
+        };
     }
     if action == "disable-all-autoupdate" {
-        return wp(domain, &["theme", "auto-updates", "disable", "--all"]).await;
+        return match wp(domain, &["theme", "auto-updates", "disable", "--all"]).await {
+            Ok(s) => Ok(s),
+            Err(_) => Ok(wp_direct_db_fallback(domain, "theme_action", serde_json::json!({ "action": action, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string()),
+        };
     }
     if !is_valid_wp_slug(name) {
         return Err("Invalid theme name. Only alphanumeric, hyphens, and underscores allowed.".into());
     }
-    let result = match action {
-        "activate" | "update" | "delete" => wp(domain, &["theme", action, name]).await?,
+    let normalized = match action {
+        "enable" => "activate",
+        "disable" => "deactivate",
+        other => other,
+    };
+    let result = match normalized {
+        "activate" => match wp(domain, &["theme", "activate", name]).await {
+            Ok(s) => s,
+            Err(_) => wp_direct_db_fallback(domain, "theme_action", serde_json::json!({ "action": "activate", "name": name })).await?["output"].as_str().unwrap_or("OK").to_string(),
+        },
+        "deactivate" => {
+            wp_direct_db_fallback(domain, "theme_action", serde_json::json!({ "action": "deactivate", "name": name })).await?["output"]
+                .as_str()
+                .unwrap_or("Theme disabled directly in database")
+                .to_string()
+        }
+        "update" | "delete" => wp(domain, &["theme", normalized, name]).await?,
         "install" => wp(domain, &["theme", "install", name]).await?,
-        "enable-autoupdate" => wp(domain, &["theme", "auto-updates", "enable", name]).await?,
-        "disable-autoupdate" => wp(domain, &["theme", "auto-updates", "disable", name]).await?,
+        "enable-autoupdate" => match wp(domain, &["theme", "auto-updates", "enable", name]).await {
+            Ok(s) => s,
+            Err(_) => wp_direct_db_fallback(domain, "theme_action", serde_json::json!({ "action": normalized, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string(),
+        },
+        "disable-autoupdate" => match wp(domain, &["theme", "auto-updates", "disable", name]).await {
+            Ok(s) => s,
+            Err(_) => wp_direct_db_fallback(domain, "theme_action", serde_json::json!({ "action": normalized, "name": name })).await?["output"].as_str().unwrap_or("OK").to_string(),
+        },
         _ => return Err(format!("Unknown action: {action}")),
     };
-    if matches!(action, "install" | "update") {
+    if matches!(normalized, "install" | "update") {
         safe_command("chown")
             .args(["-R", "www-data:www-data", &site_path(domain)?])
             .output()
@@ -919,7 +1363,9 @@ pub async fn toggle_feature(domain: &str, feature: &str, enabled: bool, params: 
         }
         "search_indexing" => {
             let val = if enabled { "1" } else { "0" };
-            wp(domain, &["option", "update", "blog_public", val]).await?;
+            if wp(domain, &["option", "update", "blog_public", val]).await.is_err() {
+                wp_direct_db_fallback(domain, "set_blog_public", serde_json::json!({ "enabled": enabled })).await?;
+            }
         }
         "takeover_cron" => {
             let val = if enabled { "true" } else { "false" };
@@ -1173,7 +1619,21 @@ pub async fn setup_admin(
         }
     }
 
-    wp(domain, &args).await
+    if wp(domain, &args).await.is_err() {
+        let fb = wp_direct_db_fallback(
+            domain,
+            "setup_admin",
+            serde_json::json!({
+                "site_title": title.unwrap_or(""),
+                "admin_user": &resolved_user,
+                "admin_email": email.trim(),
+                "admin_pass": pass.unwrap_or(""),
+            }),
+        )
+        .await?;
+        return Ok(fb["output"].as_str().unwrap_or("Updated in database").to_string());
+    }
+    Ok("WordPress setup credentials updated".into())
 }
 
 /// Copy WordPress data (files, database) to a target site.

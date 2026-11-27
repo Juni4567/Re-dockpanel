@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Navigate, Outlet, NavLink, Link, useLocation } from "react-router-dom";
 import { GlobalNotificationBanner } from "../context/NotificationContext";
+import ServiceReadinessBanner from "./ServiceReadinessBanner";
 import { useLayoutState, badgeCount } from "../hooks/useLayoutState";
 import { useServer } from "../context/ServerContext";
 import { Icon } from "../data/icons";
@@ -357,6 +358,7 @@ export default function AtlasLayout() {
 
       {/* ── Main Content ───────────────────────────────────────────────── */}
       <main id="main-content" className="flex-1 overflow-auto">
+        <ServiceReadinessBanner />
         <GlobalNotificationBanner />
         <Outlet />
       </main>

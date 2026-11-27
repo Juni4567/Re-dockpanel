@@ -22,7 +22,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "dockpanel-host-helper"
-version = "2.250.0"
+version = "2.257.0"
 dependencies = [
  "serde",
  "serde_json",

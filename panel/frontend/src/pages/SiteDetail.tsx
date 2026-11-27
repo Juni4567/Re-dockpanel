@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useParams, useNavigate, Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
@@ -12,7 +12,7 @@ import DesktopSiteActions from "../components/DesktopSiteActions";
 import { buildSiteExternalUrl } from "../components/PortConflictModal";
 import { isDesktopApp } from "../utils/desktop";
 import { useAuth } from "../context/AuthContext";
-import { showGlobalNotification } from "../context/NotificationContext";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
 
 interface Site {
   id: string;
@@ -86,6 +86,7 @@ export default function SiteDetail() {
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteFilesOnDisk, setDeleteFilesOnDisk] = useState(true);
   const [showInstallWpModal, setShowInstallWpModal] = useState(false);
 
   // App Process management
@@ -185,7 +186,9 @@ export default function SiteDetail() {
   const [phpErrors, setPhpErrors] = useState("");
   const [logsLoading, setLogsLoading] = useState(false);
   const [showAccessLogs, setShowAccessLogs] = useState(false);
-  const [logType, setLogType] = useState<"access" | "error" | "php">("access");
+  const [logType, setLogType] = useState<"access" | "error" | "php">(isDesktopApp() ? "php" : "access");
+  const [liveLogs, setLiveLogs] = useState<boolean>(isDesktopApp());
+  const logPreRef = useRef<HTMLPreElement | null>(null);
 
   // Traffic Stats
   interface TrafficStats {
@@ -408,6 +411,51 @@ export default function SiteDetail() {
     }
   };
 
+  useEffect(() => {
+    if (!showAccessLogs || !liveLogs || !id) return;
+
+    if (isDesktopApp()) {
+      const es = new EventSource(`/api/sites/${id}/logs/stream?type=${logType}&lines=200`);
+      const applyLines = (text: string) => {
+        if (logType === "access") setAccessLogs(text);
+        else if (logType === "error") setErrorLogs(text);
+        else setPhpErrors(text);
+      };
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data) as { mode?: string; lines?: string[] };
+          const incoming = Array.isArray(payload.lines) ? payload.lines : [];
+          if (payload.mode === "append") {
+            const appendText = incoming.join("\n");
+            if (!appendText) return;
+            const updater = (prev: string) => (prev ? `${prev}\n${appendText}` : appendText);
+            if (logType === "access") setAccessLogs(updater);
+            else if (logType === "error") setErrorLogs(updater);
+            else setPhpErrors(updater);
+          } else {
+            applyLines(incoming.join("\n"));
+          }
+          setLogsLoading(false);
+        } catch {
+          // ignore malformed event
+        }
+      };
+      return () => es.close();
+    }
+
+    const timer = setInterval(() => {
+      if (logType === "php") void loadPhpErrors();
+      else void loadLogs(logType);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [showAccessLogs, liveLogs, logType, id]);
+
+  useEffect(() => {
+    if (showAccessLogs && liveLogs && logPreRef.current) {
+      logPreRef.current.scrollTop = logPreRef.current.scrollHeight;
+    }
+  }, [accessLogs, errorLogs, phpErrors, showAccessLogs, liveLogs]);
+
   const loadAppStatus = useCallback(async () => {
     try {
       const data = await api.get<AppStatus>(`/sites/${id}/app/status`);
@@ -430,15 +478,35 @@ export default function SiteDetail() {
   }, [id]);
 
   const handleAppAction = async (action: "start" | "stop" | "restart") => {
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
     setAppActionLoading(action);
     try {
       const updated = await api.post<AppStatus>(`/sites/${id}/app/action`, { action });
+      const durationMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt));
       setAppStatus(updated);
-      showGlobalNotification("success", `App ${action}ed successfully`, "App Process");
+      showGlobalNotification(
+        "success",
+        `App ${action}ed successfully for ${site?.domain || id}`,
+        "App Process",
+        `Site:    ${site?.domain || id}\nAction:  ${action}\nElapsed: ${durationMs}ms`,
+        {
+          category: "site",
+          target: site?.domain,
+          endpoint: `/sites/${id}/app/action`,
+          method: "POST",
+          statusCode: 200,
+          durationMs,
+        }
+      );
       if (showAppLogs) loadAppLogs();
     } catch (e) {
-      const err = e instanceof Error ? e.message : `Failed to ${action} app`;
-      showGlobalNotification("error", err, "App Process");
+      const info = buildAlertDetails(e, {
+        context: `App ${action} for ${site?.domain || id}`,
+        fallback: `Failed to ${action} app`,
+        category: "site",
+        target: site?.domain,
+      });
+      showGlobalNotification("error", info.message, "App Process Failed", info.details, info.meta);
     } finally {
       setAppActionLoading(null);
     }
@@ -589,8 +657,20 @@ export default function SiteDetail() {
   const handleDelete = async () => {
     setDeleting(true);
     try {
-      await api.delete(`/sites/${id}`);
-      showGlobalNotification("info", `Site ${site?.domain || id} has been permanently deleted`, "Site Deleted");
+      await api.delete(deleteFilesOnDisk ? `/sites/${id}` : `/sites/${id}?keep_files=true`);
+      showGlobalNotification(
+        "info",
+        deleteFilesOnDisk
+          ? `Site ${site?.domain || id} and its files have been deleted`
+          : `Removed ${site?.domain || id} from DockPanel (website folder & files kept on disk)`,
+        deleteFilesOnDisk ? "Site Deleted" : "Site Unregistered",
+        `Domain: ${site?.domain || id}\nFiles on disk: ${deleteFilesOnDisk ? "Deleted" : "Preserved"}`,
+        {
+          category: "site",
+          target: site?.domain || id,
+          dedupeKey: `site-delete:${site?.domain || id}`,
+        }
+      );
       navigate("/sites");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Delete failed");
@@ -648,10 +728,15 @@ export default function SiteDetail() {
       setSslMessageIsError(false);
       showGlobalNotification("success", successText, "SSL Certificate Renewed");
     } catch (err) {
-      const errorText = err instanceof Error ? err.message : "SSL renewal failed";
-      setSslMessage(errorText);
+      const info = buildAlertDetails(err, {
+        context: `Renew SSL certificate for ${site.domain}`,
+        fallback: "SSL renewal failed",
+        category: "ssl",
+        target: site.domain,
+      });
+      setSslMessage(info.message);
       setSslMessageIsError(true);
-      showGlobalNotification("error", errorText, "SSL Renewal Failed");
+      showGlobalNotification("error", info.message, "SSL Renewal Failed", info.details, info.meta);
     } finally {
       setRenewingSsl(false);
     }
@@ -727,7 +812,7 @@ export default function SiteDetail() {
       <div className="flex items-start justify-between mb-6">
         <div className="flex items-start gap-4">
           <div className="w-20 h-14 rounded-lg border border-dark-600 bg-dark-800 shrink-0 overflow-hidden relative shadow-md group/thumb">
-            <SiteThumbnail domain={site.domain} className="w-full h-full" w={400} />
+            <SiteThumbnail domain={site.domain} showRefresh className="w-full h-full" w={400} />
             <a
               href={
                 desktop
@@ -831,8 +916,18 @@ export default function SiteDetail() {
                   const nextEnabled = !site?.enabled;
                   await api.put(`/sites/${id}/toggle`, { enabled: nextEnabled });
                   setSite(s => s ? { ...s, enabled: nextEnabled } : s);
-                  showGlobalNotification("success", `Site ${nextEnabled ? "enabled" : "disabled"}`);
-                } catch (e) { setError(e instanceof Error ? e.message : "Toggle failed"); }
+                  showGlobalNotification(
+                    "success",
+                    `${site?.domain || "Site"} ${nextEnabled ? "enabled" : "disabled"}`,
+                    nextEnabled ? "Site Enabled" : "Site Disabled",
+                    `Domain: ${site?.domain || id}\nStatus: ${nextEnabled ? "Active" : "Disabled"}`,
+                    { category: "site", target: site?.domain, endpoint: `/sites/${id}/toggle`, method: "PUT", statusCode: 200 }
+                  );
+                } catch (e) {
+                  const info = buildAlertDetails(e, { context: `Toggle site ${site?.domain || id}`, fallback: "Toggle failed", category: "site", target: site?.domain });
+                  setError(info.message);
+                  showGlobalNotification("error", info.message, "Site Toggle Failed", info.details, info.meta);
+                }
                 finally { setToggling(false); }
               }} className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
                 site?.enabled !== false
@@ -977,7 +1072,10 @@ export default function SiteDetail() {
                 )
               )}
               <button
-                onClick={() => setConfirmDelete(true)}
+                onClick={() => {
+                  setDeleteFilesOnDisk(true);
+                  setConfirmDelete(true);
+                }}
                 className="px-4 py-2 bg-danger-500/10 text-danger-400 rounded-lg text-sm font-medium hover:bg-danger-500/20 transition-colors"
               >
                 Delete
@@ -986,24 +1084,48 @@ export default function SiteDetail() {
         </div>
         {confirmDelete && (
           <ConfirmDialog
-            title={`Permanently Delete "${site?.domain}"?`}
-            label={`You are about to permanently delete ${site?.domain}. This is an irreversible destructive action.`}
+            title={`Remove "${site?.domain}"?`}
+            label={
+              deleteFilesOnDisk
+                ? `You are about to permanently delete ${site?.domain} and its files on disk.`
+                : `You are about to unregister ${site?.domain} from DockPanel while keeping its folder and files on disk.`
+            }
             consequences={
               desktop
                 ? [
-                    `Local site files for ${site?.domain} will be permanently deleted.`,
+                    deleteFilesOnDisk
+                      ? `Local site files for ${site?.domain} will be permanently deleted.`
+                      : `Website folder & files for ${site?.domain} will be kept intact on disk (available under Discovered Folders if you scan again).`,
                     "The local hosts entry and router mapping for this domain will be removed.",
-                    "Any attached local database records for this site will be cleaned up.",
+                    deleteFilesOnDisk
+                      ? "Any attached local database records for this site will be cleaned up."
+                      : "Site registration will be removed from DockPanel.",
                   ]
                 : [
-                    `All web files and directories located in /var/www/${site?.domain} will be permanently wiped.`,
+                    deleteFilesOnDisk
+                      ? `All web files and directories located in /var/www/${site?.domain} will be permanently wiped.`
+                      : `Website files in /var/www/${site?.domain} will be kept intact on disk.`,
                     "Nginx reverse proxy virtual host configuration will be removed and Nginx reloaded.",
                     "Active background application services (Node.js, Python, or PHP-FPM pools) will be stopped and deleted.",
                     "All SSL/TLS certificates, environment variables (.env), and associated staging clones will be removed.",
                   ]
             }
-            confirmLabel={deleting ? "Deleting Site..." : "Permanently Delete Site"}
-            tone="danger"
+            checkbox={{
+              label: "Delete website folder and files from disk",
+              description: deleteFilesOnDisk
+                ? "Uncheck this box if you want to remove the site from DockPanel but keep all website files and folders."
+                : "Checked OFF — DockPanel will preserve your website folder and files on disk.",
+              checked: deleteFilesOnDisk,
+              onChange: setDeleteFilesOnDisk,
+            }}
+            confirmLabel={
+              deleting
+                ? "Deleting Site..."
+                : deleteFilesOnDisk
+                ? "Permanently Delete Site & Files"
+                : "Remove Site (Keep Files)"
+            }
+            tone={deleteFilesOnDisk ? "danger" : "warn"}
             onConfirm={handleDelete}
             onCancel={() => setConfirmDelete(false)}
           />
@@ -1234,15 +1356,37 @@ export default function SiteDetail() {
                       onChange={async (newVersion, ready) => {
                         setPhpChoice(newVersion);
                         if (!ready || newVersion === site.php_version) return;
+                        const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
                         setSwitchingPhp(true);
                         setPhpMessage("");
                         try {
                           const updated = await api.put<Site>(`/sites/${id}/php`, { version: newVersion });
+                          const durationMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt));
                           setSite(updated);
                           setPhpMessage(`Switched to PHP ${newVersion}`);
-                          showGlobalNotification("success", `Switched to PHP ${newVersion}`);
+                          showGlobalNotification(
+                            "success",
+                            `Switched ${site.domain} to PHP ${newVersion}`,
+                            "PHP Version Updated",
+                            `Site:     ${site.domain}\nRuntime:  PHP ${newVersion} (previous: PHP ${site.php_version})\nElapsed:  ${durationMs}ms`,
+                            {
+                              category: "php",
+                              target: site.domain,
+                              endpoint: `/sites/${id}/php`,
+                              method: "PUT",
+                              statusCode: 200,
+                              durationMs,
+                            }
+                          );
                         } catch (err) {
-                          setPhpMessage(err instanceof Error ? err.message : "Switch failed");
+                          const info = buildAlertDetails(err, {
+                            context: `Switch ${site.domain} to PHP ${newVersion}`,
+                            fallback: "Switch failed",
+                            category: "php",
+                            target: site.domain,
+                          });
+                          setPhpMessage(info.message);
+                          showGlobalNotification("error", info.message, "PHP Switch Failed", info.details, info.meta);
                           // Put the control back on what the site is actually
                           // running. Leaving it on the version that just failed
                           // states the switch happened, and — because the guard
@@ -1294,13 +1438,34 @@ export default function SiteDetail() {
                 type="button"
                 disabled={provisioningLocalSsl}
                 onClick={async () => {
+                  const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
                   setProvisioningLocalSsl(true);
                   try {
                     const res = await api.post<{ ssl_port?: number | null; message?: string }>(`/sites/${id}/ssl/provision`, {});
+                    const durationMs = Math.max(1, Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt));
                     if (typeof res?.ssl_port === "number") setSslPort(res.ssl_port);
-                    showGlobalNotification("success", res?.message || `Local SSL enabled for ${site.domain}`);
+                    showGlobalNotification(
+                      "success",
+                      res?.message || `Local SSL enabled for ${site.domain}`,
+                      "Local SSL Issued",
+                      `Domain:   ${site.domain}\nHTTPS:    ${res?.ssl_port ? `Port ${res.ssl_port}` : "Active"}\nElapsed:  ${durationMs}ms`,
+                      {
+                        category: "ssl",
+                        target: site.domain,
+                        endpoint: `/sites/${id}/ssl/provision`,
+                        method: "POST",
+                        statusCode: 200,
+                        durationMs,
+                      }
+                    );
                   } catch (err) {
-                    showGlobalNotification("error", err instanceof Error ? err.message : "Failed to enable local SSL");
+                    const info = buildAlertDetails(err, {
+                      context: `Provision Local SSL for ${site.domain}`,
+                      fallback: "Failed to enable local SSL",
+                      category: "ssl",
+                      target: site.domain,
+                    });
+                    showGlobalNotification("error", info.message, "Local SSL Failed", info.details, info.meta);
                   } finally {
                     setProvisioningLocalSsl(false);
                   }
@@ -1673,7 +1838,6 @@ export default function SiteDetail() {
           </div>
         </Link>
         )}
-        {!desktop && (
         <Link
           to={`/sites/${id}/deploy`}
           className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
@@ -1685,12 +1849,11 @@ export default function SiteDetail() {
               </svg>
             </div>
             <div>
-              <p className="text-sm font-medium text-dark-50">Git Deploy</p>
-              <p className="text-xs text-dark-200">Push to deploy</p>
+              <p className="text-sm font-medium text-dark-50">{desktop ? "Git Repository" : "Git & Deploy"}</p>
+              <p className="text-xs text-dark-200">{desktop ? "Init & connect repo" : "Init repo & deploy"}</p>
             </div>
           </div>
         </Link>
-        )}
         {(!site.runtime || site.runtime === "php" || site.runtime === "static" || site.php_preset === "wordpress") && (
           site.php_preset === "wordpress" ? (
             <Link
@@ -1886,13 +2049,14 @@ export default function SiteDetail() {
       )}
 
       {/* Resource Limits */}
-      {!desktop && site.status === "active" && (
+      {site.status === "active" && (
         <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
           <div className="px-5 py-4 border-b border-dark-600">
             <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Resource Limits</h2>
           </div>
           <div className="p-5 space-y-4">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              {!desktop && (
               <div>
                 <label className="block text-xs font-medium text-dark-200 mb-1">Rate Limit (req/s per IP)</label>
                 <input
@@ -1905,6 +2069,7 @@ export default function SiteDetail() {
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                 />
               </div>
+              )}
               <div>
                 <label className="block text-xs font-medium text-dark-200 mb-1">Max Upload (MB)</label>
                 <input
@@ -1916,6 +2081,7 @@ export default function SiteDetail() {
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                 />
               </div>
+              {!desktop && (
               <div>
                 <label className="block text-xs font-medium text-dark-200 mb-1">Bandwidth Quota (MB/mo)</label>
                 <input
@@ -1927,6 +2093,7 @@ export default function SiteDetail() {
                   className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                 />
               </div>
+              )}
               {site.runtime === "php" && (
                 <>
                   <div>
@@ -1947,7 +2114,7 @@ export default function SiteDetail() {
                       value={phpWorkers}
                       onChange={(e) => setPhpWorkers(e.target.value)}
                       min="1"
-                      max="100"
+                      max={desktop ? 8 : 100}
                       className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm focus:ring-2 focus:ring-accent-500 focus:border-accent-500 outline-none"
                     />
                   </div>
@@ -1955,6 +2122,7 @@ export default function SiteDetail() {
               )}
             </div>
             {/* Custom Nginx Directives */}
+            {!desktop && (
             <div>
               <label className="block text-xs font-medium text-dark-200 mb-1">
                 Custom Nginx Directives <span className="text-dark-300 font-normal">(injected into server block)</span>
@@ -1971,8 +2139,9 @@ export default function SiteDetail() {
                 Config is validated before applying. Invalid directives will be rejected.
               </p>
             </div>
+            )}
 
-            {bandwidthUsage && (
+            {!desktop && bandwidthUsage && (
               <div>
                 <div className="flex items-center justify-between text-xs text-dark-300 mb-1">
                   <span>
@@ -2005,9 +2174,10 @@ export default function SiteDetail() {
 
             <div className="flex items-center justify-between">
               <p className="text-xs text-dark-300">
-                {rateLimit ? `${rateLimit} req/s per IP` : "No rate limit"} · {maxUpload} MB uploads
+                {!desktop ? `${rateLimit ? `${rateLimit} req/s per IP` : "No rate limit"} · ` : ""}
+                {maxUpload} MB uploads
                 {site.runtime === "php" ? ` · ${phpMemory} MB memory · ${phpWorkers} workers` : ""}
-                {bandwidthQuota ? ` · ${bandwidthQuota} MB/mo bandwidth` : " · Unlimited bandwidth"}
+                {!desktop ? (bandwidthQuota ? ` · ${bandwidthQuota} MB/mo bandwidth` : " · Unlimited bandwidth") : ""}
               </p>
               <div className="flex items-center gap-3">
                 {limitsMessage && (
@@ -2025,7 +2195,7 @@ export default function SiteDetail() {
                         rate_limit: rateLimit ? parseInt(rateLimit) : null,
                         max_upload_mb: parseInt(maxUpload) || 64,
                         php_memory_mb: parseInt(phpMemory) || 256,
-                        php_max_workers: parseInt(phpWorkers) || 5,
+                        php_max_workers: parseInt(phpWorkers) || (desktop ? 4 : 5),
                         custom_nginx: customNginx || null,
                         bandwidth_quota_mb: bandwidthQuota ? parseInt(bandwidthQuota) : null,
                       });
@@ -3175,12 +3345,27 @@ export default function SiteDetail() {
         </div>
       )}
 
-      {/* Access Logs */}
+      {/* Access & PHP Logs */}
       {site.status === "active" && (
         <div id="logs-section" className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
-          <button onClick={() => { setShowAccessLogs(!showAccessLogs); if (!showAccessLogs) loadLogs(logType === "php" ? "access" : logType as "access" | "error"); }}
+          <button onClick={() => {
+            const next = !showAccessLogs;
+            setShowAccessLogs(next);
+            if (next) {
+              if (logType === "php") void loadPhpErrors();
+              else void loadLogs(logType);
+            }
+          }}
             className="w-full px-5 py-4 flex items-center justify-between hover:bg-dark-700/30 transition-colors">
-            <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Access Logs</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Site &amp; PHP Logs</h2>
+              {showAccessLogs && liveLogs && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px] font-mono">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  LIVE
+                </span>
+              )}
+            </div>
             <svg className={`w-4 h-4 text-dark-300 transition-transform ${showAccessLogs ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" />
             </svg>
@@ -3198,11 +3383,25 @@ export default function SiteDetail() {
                       className={`px-2 py-1 rounded text-xs font-medium ${logType === "php" ? "bg-warn-500/15 text-warn-400" : "text-dark-300 hover:text-dark-100"}`}>PHP Errors</button>
                   )}
                 </div>
-                <button onClick={() => logType === "php" ? loadPhpErrors() : loadLogs(logType as "access" | "error")} className="text-xs text-rust-400 hover:text-rust-300">
-                  {logsLoading ? "Loading..." : "Refresh"}
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setLiveLogs((v) => !v)}
+                    className={`inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-mono border transition-colors ${
+                      liveLogs
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                        : "border-dark-600 bg-dark-800 text-dark-300 hover:text-dark-100"
+                    }`}
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${liveLogs ? "bg-emerald-400 animate-pulse" : "bg-dark-500"}`} />
+                    {liveLogs ? "Live Tail On" : "Live Tail Off"}
+                  </button>
+                  <button onClick={() => logType === "php" ? loadPhpErrors() : loadLogs(logType as "access" | "error")} className="text-xs text-rust-400 hover:text-rust-300">
+                    {logsLoading ? "Loading..." : "Refresh"}
+                  </button>
+                </div>
               </div>
-              <pre className="p-4 text-[11px] font-mono text-dark-200 bg-dark-950 max-h-80 overflow-y-auto overflow-x-auto whitespace-pre-wrap">
+              <pre ref={logPreRef} className="p-4 text-[11px] font-mono text-dark-200 bg-dark-950 max-h-80 overflow-y-auto overflow-x-auto whitespace-pre-wrap">
                 {logsLoading ? "Loading logs..." : (logType === "access" ? accessLogs : logType === "error" ? errorLogs : phpErrors) || "No logs available"}
               </pre>
             </div>
@@ -3304,12 +3503,41 @@ export default function SiteDetail() {
               <div className="mb-4">
                 <h4 className="text-xs text-dark-300 uppercase font-mono mb-2">Installed ({phpExts.installed.length})</h4>
                 <div className="flex flex-wrap gap-1.5">
-                  {phpExts.installed.map(ext => (
-                    <span key={ext} className="px-2 py-0.5 bg-rust-500/10 text-rust-400 rounded text-xs font-mono">{ext}</span>
-                  ))}
+                  {phpExts.installed.map(ext => {
+                    const isCoreBuiltin = [
+                      "core", "standard", "pcre", "spl", "reflection", "date",
+                      "json", "hash", "filter", "ctype", "tokenizer", "session", "random",
+                    ].includes(ext.toLowerCase());
+                    return (
+                      <span key={ext} className="inline-flex items-center gap-1 px-2 py-0.5 bg-rust-500/10 text-rust-400 rounded text-xs font-mono">
+                        {ext}
+                        {desktop && !isCoreBuiltin && (
+                          <button
+                            type="button"
+                            title={`Disable ${ext}`}
+                            disabled={installingExt === ext}
+                            onClick={async () => {
+                              setInstallingExt(ext);
+                              setExtMessage("");
+                              try {
+                                await api.post("/php/extensions/disable", { version: site?.php_version, extension: ext });
+                                loadPhpExtensions();
+                              } catch (e) {
+                                setExtMessage(e instanceof Error ? e.message : `Could not disable ${ext}`);
+                              } finally {
+                                setInstallingExt(null);
+                              }
+                            }}
+                            className="text-rust-300/70 hover:text-danger-400 ml-0.5 disabled:opacity-50"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </span>
+                    );
+                  })}
                 </div>
               </div>
-              {!desktop && (
               <div>
                 <h4 className="text-xs text-dark-300 uppercase font-mono mb-2">Available to install</h4>
                 <div className="flex flex-wrap gap-1.5">
@@ -3334,7 +3562,6 @@ export default function SiteDetail() {
                 </div>
                 {extMessage && <p className="text-xs text-danger-400 mt-2">{extMessage}</p>}
               </div>
-              )}
             </div>
           )}
         </div>
@@ -3366,10 +3593,21 @@ export default function SiteDetail() {
                 setSavingEnv(true);
                 setEnvMsg("");
                 try {
-                  await api.put(`/sites/${id}/env`, { vars: envVars.filter(v => v.key) });
+                  const cleanVars = envVars.filter(v => v.key);
+                  await api.put(`/sites/${id}/env`, { vars: cleanVars });
                   setEnvMsg("Environment variables saved");
-                  showGlobalNotification("success", "Environment variables saved");
-                } catch (e) { setEnvMsg(e instanceof Error ? e.message : "Save failed"); }
+                  showGlobalNotification(
+                    "success",
+                    `Saved ${cleanVars.length} environment variable${cleanVars.length === 1 ? "" : "s"} for ${site?.domain || id}`,
+                    "Environment Updated",
+                    `File:      .env\nVariables: ${cleanVars.length}\nSite:      ${site?.domain || id}`,
+                    { category: "env", target: site?.domain, endpoint: `/sites/${id}/env`, method: "PUT", statusCode: 200 }
+                  );
+                } catch (e) {
+                  const info = buildAlertDetails(e, { context: `Save .env for ${site?.domain || id}`, fallback: "Save failed", category: "env", target: site?.domain });
+                  setEnvMsg(info.message);
+                  showGlobalNotification("error", info.message, "Environment Save Failed", info.details, info.meta);
+                }
                 finally { setSavingEnv(false); }
               }} className="px-3 py-1 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-50">
                 {savingEnv ? "Saving..." : "Save"}

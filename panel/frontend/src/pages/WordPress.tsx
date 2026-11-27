@@ -1,11 +1,14 @@
 import { useState, useEffect } from "react";
 import { useParams, Link } from "react-router-dom";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import SiteThumbnail from "../components/SiteThumbnail";
-import { showGlobalNotification } from "../context/NotificationContext";
-import ProvisionLog from "../components/ProvisionLog";
+import { showGlobalNotification, buildAlertDetails } from "../context/NotificationContext";
+import ProvisionLog, { type ProvisionCompatMeta } from "../components/ProvisionLog";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { buildSiteExternalUrl } from "../components/PortConflictModal";
 import { isDesktopApp } from "../utils/desktop";
+import DirectoryDbSelector, { type DetectedDbFile } from "../components/DirectoryDbSelector";
+import { MEMORY_LIMIT_OPTIONS } from "../components/DiscoveredFoldersPanel";
 
 interface Site {
   id: string;
@@ -284,6 +287,107 @@ export default function WordPress() {
   const [sslPort, setSslPort] = useState<number | null>(null);
   const desktop = isDesktopApp();
 
+  // Desktop: Directory SQL discovery & database switch/re-import state
+  const [switchDetectedDbs, setSwitchDetectedDbs] = useState<DetectedDbFile[]>([]);
+  const [switchRootDbs, setSwitchRootDbs] = useState<DetectedDbFile[]>([]);
+  const [switchSitesRootDir, setSwitchSitesRootDir] = useState("");
+  const [switchSiteDir, setSwitchSiteDir] = useState("");
+  const [switchLocalDb, setSwitchLocalDb] = useState<DetectedDbFile | null>(null);
+  const [switchUploadFile, setSwitchUploadFile] = useState<File | null>(null);
+  const [switchSourceUrl, setSwitchSourceUrl] = useState("");
+  const [switchMemoryLimitMb, setSwitchMemoryLimitMb] = useState<number>(1024);
+  const [switchingDb, setSwitchingDb] = useState(false);
+  const [switchSseUrl, setSwitchSseUrl] = useState<string | null>(null);
+  const [switchCompatPrompt, setSwitchCompatPrompt] = useState<{
+    error: string;
+    fixes: string[];
+    targetVersion?: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!desktop || tab !== "database" || !id) return;
+    api
+      .post<{
+        dir?: string;
+        sites_dir?: string;
+        files?: DetectedDbFile[];
+        sites_dir_files?: DetectedDbFile[];
+      }>("/desktop/scan-db-files", { site_id: id })
+      .then((res) => {
+        if (res?.dir) setSwitchSiteDir(res.dir);
+        if (res?.sites_dir) setSwitchSitesRootDir(res.sites_dir);
+        setSwitchDetectedDbs(Array.isArray(res?.files) ? res.files : []);
+        setSwitchRootDbs(Array.isArray(res?.sites_dir_files) ? res.sites_dir_files : []);
+      })
+      .catch(() => {});
+  }, [desktop, tab, id]);
+
+  const handleSwitchWordPressDatabase = async (applyCompatFixes = false) => {
+    if (!id || (!switchLocalDb && !switchUploadFile)) return;
+    setSwitchingDb(true);
+    setSwitchSseUrl(null);
+    try {
+      let payload: Record<string, unknown>;
+      if (switchUploadFile) {
+        const contentBase64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const raw = typeof reader.result === "string" ? reader.result : "";
+            const idx = raw.indexOf(",");
+            resolve(idx >= 0 ? raw.slice(idx + 1) : raw);
+          };
+          reader.onerror = () => reject(new Error("Failed reading SQL dump"));
+          reader.readAsDataURL(switchUploadFile);
+        });
+        payload = {
+          filename: switchUploadFile.name,
+          content_base64: contentBase64,
+          source_url: switchSourceUrl.trim() || undefined,
+          memory_limit_mb: switchMemoryLimitMb,
+          apply_compat_fixes: applyCompatFixes,
+          stream: true,
+        };
+      } else {
+        payload = {
+          filename: switchLocalDb!.name,
+          local_path: switchLocalDb!.path,
+          source_url: switchSourceUrl.trim() || undefined,
+          memory_limit_mb: switchMemoryLimitMb,
+          apply_compat_fixes: applyCompatFixes,
+          stream: true,
+        };
+      }
+      const res = await api.post<{ ok?: boolean; sse_url?: string }>(
+        `/sites/${id}/wordpress/import-database`,
+        payload
+      );
+      if (res?.sse_url) {
+        setSwitchSseUrl(res.sse_url);
+      } else {
+        showGlobalNotification("success", `Database imported cleanly for ${site?.domain || "site"}`);
+        await loadDbInfo();
+      }
+    } catch (e) {
+      const body = e instanceof ApiError ? (e.body as any) : null;
+      if (body?.requires_compat_confirm) {
+        setSwitchCompatPrompt({
+          error:
+            (body.error as string) ||
+            (e instanceof Error ? e.message : "Database compatibility confirmation required"),
+          fixes: Array.isArray(body.compat_fixes) ? body.compat_fixes : [],
+          targetVersion: body.target_version,
+        });
+      } else {
+        showGlobalNotification(
+          "error",
+          e instanceof Error ? e.message : "Failed importing database"
+        );
+      }
+    } finally {
+      setSwitchingDb(false);
+    }
+  };
+
   useEffect(() => {
     loadData();
     if (desktop) {
@@ -363,12 +467,25 @@ export default function WordPress() {
 
   const handlePluginAction = async (name: string, action: string) => {
     setBusy(`plugin-${action}-${name}`);
+    const siteDom = site?.domain || id || "";
     try {
-      await api.post(`/sites/${id}/wordpress/plugin/${action}`, { name });
-      showGlobalNotification("success", `Plugin ${action}d: ${name}`);
+      const res = await api.post<{ ok?: boolean; message?: string }>(`/sites/${id}/wordpress/plugin/${action}`, { name });
+      showGlobalNotification(
+        "success",
+        res?.message || `Plugin ${action}d: ${name}`,
+        "WordPress Plugin Action",
+        `Site: ${siteDom}\nPlugin: ${name}\nAction: ${action}`,
+        { category: "site", target: siteDom, dedupeKey: `wp-plugin:${siteDom}:${name}:${action}` }
+      );
       loadPlugins();
     } catch (e) {
-      showGlobalNotification("error", e instanceof Error ? e.message : `${action} failed`);
+      const info = buildAlertDetails(e, {
+        context: `Plugin ${action} (${name})`,
+        category: "site",
+        target: siteDom,
+        dedupeKey: `wp-plugin:${siteDom}:${name}:${action}`,
+      });
+      showGlobalNotification("error", info.message, "WordPress Plugin Error", info.details, info.meta);
     } finally {
       setBusy("");
     }
@@ -376,12 +493,25 @@ export default function WordPress() {
 
   const handleThemeAction = async (name: string, action: string) => {
     setBusy(`theme-${action}-${name}`);
+    const siteDom = site?.domain || id || "";
     try {
-      await api.post(`/sites/${id}/wordpress/theme/${action}`, { name });
-      showGlobalNotification("success", `Theme ${action}d: ${name}`);
+      const res = await api.post<{ ok?: boolean; message?: string }>(`/sites/${id}/wordpress/theme/${action}`, { name });
+      showGlobalNotification(
+        "success",
+        res?.message || `Theme ${action}d: ${name}`,
+        "WordPress Theme Action",
+        `Site: ${siteDom}\nTheme: ${name}\nAction: ${action}`,
+        { category: "site", target: siteDom, dedupeKey: `wp-theme:${siteDom}:${name}:${action}` }
+      );
       loadThemes();
     } catch (e) {
-      showGlobalNotification("error", e instanceof Error ? e.message : `${action} failed`);
+      const info = buildAlertDetails(e, {
+        context: `Theme ${action} (${name})`,
+        category: "site",
+        target: siteDom,
+        dedupeKey: `wp-theme:${siteDom}:${name}:${action}`,
+      });
+      showGlobalNotification("error", info.message, "WordPress Theme Error", info.details, info.meta);
     } finally {
       setBusy("");
     }
@@ -1679,13 +1809,23 @@ export default function WordPress() {
                               <td className="p-3">
                                 <button
                                   onClick={() => {
-                                    if (!isActive) handleThemeAction(t.name, "activate");
+                                    if (!isActive) {
+                                      handleThemeAction(t.name, "activate");
+                                    } else if (themes.length > 1) {
+                                      handleThemeAction(t.name, "deactivate");
+                                    }
                                   }}
-                                  disabled={busy.startsWith("theme-")}
+                                  disabled={busy.startsWith("theme-") || (isActive && themes.length <= 1)}
                                   className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
                                     isActive ? "bg-accent-600" : "bg-dark-600"
                                   }`}
-                                  title={isActive ? "Active theme" : "Click to activate theme"}
+                                  title={
+                                    isActive
+                                      ? themes.length > 1
+                                        ? "Active theme (click to disable & switch to a fallback theme)"
+                                        : "Active theme"
+                                      : "Click to activate theme"
+                                  }
                                 >
                                   <span className={`inline-block h-3 w-3 rounded-full bg-white transition-transform ${isActive ? "translate-x-3.5" : "translate-x-0.5"}`} />
                                 </button>
@@ -1795,6 +1935,111 @@ export default function WordPress() {
                       </div>
                     </div>
                   </div>
+
+                  {desktop && (
+                    <div className="pt-4 border-t border-dark-700/80 space-y-3">
+                      <div>
+                        <h3 className="text-sm font-semibold text-dark-100">
+                          Import or Switch Database from Directories
+                        </h3>
+                        <p className="text-xs text-dark-400 mt-0.5">
+                          Select a different <code className="text-dark-200">.sql</code> / <code className="text-dark-200">.sql.gz</code> / <code className="text-dark-200">.zip</code> / <code className="text-dark-200">.sqlite</code> file from subdirectories or another directory if the current database does not belong to this website.
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <input
+                          type="file"
+                          accept=".sql,.gz,.sql.gz,.zip,.sqlite,.db"
+                          disabled={switchingDb}
+                          onChange={(e) => {
+                            const f = e.target.files?.[0] || null;
+                            setSwitchUploadFile(f);
+                            if (f) setSwitchLocalDb(null);
+                          }}
+                          className="text-xs text-dark-300 file:mr-2.5 file:py-1 file:px-2.5 file:rounded-md file:border file:border-dark-600 file:text-xs file:font-medium file:bg-dark-700 file:text-dark-100 hover:file:bg-dark-600"
+                        />
+                        {switchUploadFile && (
+                          <span className="text-[11px] font-mono text-emerald-300">
+                            {switchUploadFile.name}
+                          </span>
+                        )}
+                      </div>
+
+                      <DirectoryDbSelector
+                        detectedDbFiles={switchDetectedDbs}
+                        otherDirectoryDbFiles={switchRootDbs}
+                        selectedLocalDb={switchLocalDb}
+                        uploadedFile={switchUploadFile}
+                        siteId={id}
+                        siteDir={switchSiteDir}
+                        sitesRootDir={switchSitesRootDir}
+                        disabled={switchingDb}
+                        onSelectLocalDb={(dbItem) => {
+                          setSwitchLocalDb(dbItem);
+                          if (dbItem) {
+                            setSwitchUploadFile(null);
+                            if (!switchSourceUrl && dbItem.detected_site_url) {
+                              setSwitchSourceUrl(dbItem.detected_site_url);
+                            }
+                          }
+                        }}
+                      />
+
+                      {(switchLocalDb || switchUploadFile) && (
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          <input
+                            type="url"
+                            value={switchSourceUrl}
+                            onChange={(e) => setSwitchSourceUrl(e.target.value)}
+                            placeholder="Source URL for rewrite (optional)"
+                            className="flex-1 min-w-[200px] px-2.5 py-1.5 bg-dark-900 border border-dark-600 rounded text-xs font-mono text-dark-100 focus:outline-none focus:border-accent-500"
+                          />
+                          <select
+                            value={switchMemoryLimitMb}
+                            onChange={(e) => setSwitchMemoryLimitMb(parseInt(e.target.value, 10))}
+                            className="px-2.5 py-1.5 bg-dark-900 border border-dark-600 rounded text-xs font-mono text-dark-100 focus:outline-none focus:border-accent-500"
+                          >
+                            {MEMORY_LIMIT_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {`Memory: ${opt.label}`}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            disabled={switchingDb}
+                            onClick={() => handleSwitchWordPressDatabase(false)}
+                            className="px-3.5 py-1.5 rounded bg-rust-500 hover:bg-rust-600 text-white text-xs font-medium disabled:opacity-50"
+                          >
+                            {switchingDb ? "Importing..." : "Import Selected Database"}
+                          </button>
+                        </div>
+                      )}
+
+                      {switchSseUrl && (
+                        <ProvisionLog
+                          sseUrl={switchSseUrl}
+                          title={`Importing Database for ${site?.domain || "WordPress"}...`}
+                          defaultShowLogs={true}
+                          onComplete={(ok, errDetail, compatMeta: ProvisionCompatMeta | undefined) => {
+                            if (ok === false && compatMeta?.requiresCompatConfirm) {
+                              setSwitchCompatPrompt({
+                                error: compatMeta.errorDetail || errDetail || "Compatibility fixes required",
+                                fixes: compatMeta.compatFixes || [],
+                                targetVersion: compatMeta.targetVersion,
+                              });
+                              return;
+                            }
+                            if (ok !== false) {
+                              loadDbInfo();
+                            }
+                          }}
+                          onDismiss={() => setSwitchSseUrl(null)}
+                        />
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -3152,6 +3397,23 @@ export default function WordPress() {
             </div>
           </div>
         </div>
+      )}
+      {switchCompatPrompt && (
+        <ConfirmDialog
+          tone="warn"
+          title="Database Compatibility Confirmation Required"
+          label={`Error on target server${switchCompatPrompt.targetVersion ? ` (${switchCompatPrompt.targetVersion})` : ""}: ${switchCompatPrompt.error}`}
+          consequences={[
+            ...switchCompatPrompt.fixes,
+            "Your original local .sql file is untouched — compatibility fixes apply only to the staged import.",
+          ]}
+          confirmLabel="Apply Compatibility Fixes & Retry"
+          onConfirm={() => {
+            setSwitchCompatPrompt(null);
+            void handleSwitchWordPressDatabase(true);
+          }}
+          onCancel={() => setSwitchCompatPrompt(null)}
+        />
       )}
     </div>
   );

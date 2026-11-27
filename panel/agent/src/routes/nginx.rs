@@ -440,10 +440,20 @@ async fn put_site(
     }
 }
 
-/// DELETE /nginx/sites/:domain — Remove site and all associated resources.
+/// DELETE /nginx/sites/:domain — Remove site and associated resources.
+/// Supports `?keep_files=true` or `?delete_files=false` to keep `/var/www/{domain}`.
 async fn delete_site(
     Path(domain): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<NginxResponse>, (StatusCode, Json<NginxResponse>)> {
+    let keep_files = params
+        .get("keep_files")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+        || params
+            .get("delete_files")
+            .map(|v| v == "false" || v == "0")
+            .unwrap_or(false);
     if !is_valid_domain(&domain) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -529,14 +539,16 @@ async fn delete_site(
         }
     }
 
-    // Site files
+    // Site files (unless keep_files=true)
     let site_dir = format!("/var/www/{domain}");
-    if std::path::Path::new(&site_dir).exists() {
+    if !keep_files && std::path::Path::new(&site_dir).exists() {
         if let Err(e) = std::fs::remove_dir_all(&site_dir) {
             tracing::warn!("Failed to remove site files for {domain}: {e}");
         } else {
             tracing::info!("Removed site files: {site_dir}");
         }
+    } else if keep_files {
+        tracing::info!("Kept site files on disk at {site_dir} (keep_files=true)");
     }
 
     // Nginx logs

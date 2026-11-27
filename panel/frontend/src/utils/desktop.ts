@@ -159,7 +159,6 @@ export const SERVER_ONLY_NAV_PATHS: readonly string[] = [
   "/git-deploys",
   "/migration",
   "/cdn",
-  "/mail",
   "/backup-orchestrator",
   "/container-policies",
   "/integrations",

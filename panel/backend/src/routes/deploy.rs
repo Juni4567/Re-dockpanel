@@ -858,3 +858,134 @@ pub async fn rollback_release(
 
     Ok(Json(result))
 }
+
+fn require_admin_git(claims: &Claims) -> Result<(), ApiError> {
+    if claims.role != "admin" {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "Only administrators can initialize or connect site Git repositories",
+        ));
+    }
+    Ok(())
+}
+
+/// GET /api/sites/{id}/git/status — Inspect Git repository status inside a site folder (Admin only).
+pub async fn git_status(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_git(&claims)?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let res = agent
+        .get(&format!("/deploy/git/{domain}/status"))
+        .await
+        .map_err(|e| agent_error("Git status", e))?;
+    Ok(Json(res))
+}
+
+/// POST /api/sites/{id}/git/init — Initialize a Git repository inside the site directory (Admin only).
+pub async fn git_init(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_git(&claims)?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let res = agent
+        .post(&format!("/deploy/git/{domain}/init"), Some(body))
+        .await
+        .map_err(|e| agent_error("Git init", e))?;
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "git.init",
+        Some("site"), Some(&domain), None, Some("success"), claims.key_id,
+    ).await;
+    Ok(Json(res))
+}
+
+/// POST /api/sites/{id}/git/connect — Connect site directory to an existing Git repository (Admin only).
+pub async fn git_connect(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_git(&claims)?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let res = agent
+        .post_long(&format!("/deploy/git/{domain}/connect"), Some(body.clone()), 180)
+        .await
+        .map_err(|e| agent_error("Git connect", e))?;
+
+    if let Some(repo_url) = body.get("repo_url").and_then(|v| v.as_str()) {
+        let branch = body.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
+        let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
+        if let Ok(enc_secret) = crate::services::secrets_crypto::encrypt_credential(&webhook_secret, &state.config.jwt_secret) {
+            let _ = sqlx::query(
+                "INSERT INTO deploy_configs (site_id, repo_url, branch, deploy_script, auto_deploy, webhook_secret, atomic_deploy, keep_releases) \
+                 VALUES ($1, $2, $3, '', false, $4, false, 5) \
+                 ON CONFLICT (site_id) DO UPDATE SET repo_url = $2, branch = $3, updated_at = NOW()",
+            )
+            .bind(id)
+            .bind(repo_url.trim())
+            .bind(branch.trim())
+            .bind(&enc_secret)
+            .execute(&state.db)
+            .await;
+        }
+    }
+
+    activity::log_activity(
+        &state.db, claims.sub, &claims.email, "git.connect",
+        Some("site"), Some(&domain), None, Some("success"), claims.key_id,
+    ).await;
+    Ok(Json(res))
+}
+
+/// POST /api/sites/{id}/git/pull — Pull latest changes from remote origin (Admin only).
+pub async fn git_pull(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_git(&claims)?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let res = agent
+        .post_long(&format!("/deploy/git/{domain}/pull"), Some(body), 180)
+        .await
+        .map_err(|e| agent_error("Git pull", e))?;
+    Ok(Json(res))
+}
+
+/// POST /api/sites/{id}/git/commit-push — Commit and optionally push changes (Admin only).
+pub async fn git_commit_push(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_git(&claims)?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let res = agent
+        .post_long(&format!("/deploy/git/{domain}/commit-push"), Some(body), 180)
+        .await
+        .map_err(|e| agent_error("Git commit/push", e))?;
+    Ok(Json(res))
+}
+
+/// POST /api/sites/{id}/git/disconnect — Remove origin remote from site directory (Admin only).
+pub async fn git_disconnect(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_git(&claims)?;
+    let (domain, agent) = crate::helpers::site_agent_for_caller(&state, id, &claims).await?;
+    let res = agent
+        .post(&format!("/deploy/git/{domain}/disconnect"), None::<serde_json::Value>)
+        .await
+        .map_err(|e| agent_error("Git disconnect", e))?;
+    Ok(Json(res))
+}

@@ -4,6 +4,124 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.257.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.257.0 — Launch Service Readiness Bar & MariaDB-First Startup Ordering
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.257.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added & Fixed
+- **MariaDB-First Launch Ordering & Readiness Tracking (`main.rs`, `state.rs`, `hosts_manager.rs`):**
+  - Reordered desktop launch startup so `start_mariadb()` executes **before** `reconcile_active_sites()`, ensuring MariaDB is accepting connections on `127.0.0.1:3306` before PHP/site workers become live and eliminating premature database connection errors when opening sites immediately after launch.
+  - Added `StartupReadiness` phase tracking (`mariadb`, `php_workers`, `mail_catcher`) on `AppState` plus `is_host_helper_pipe_present()` in `hosts_manager.rs`, emitting a `system_ready` SSE event once all startup tasks finish.
+- **Service Readiness Status Endpoint & Enriched Health Check (`main.rs`):**
+  - Added `/api/system/services-status` (`system_services_status_handler`) and enriched `/api/health` (`health_handler`) with live per-service readiness (`mariadb`, `php`, `http_router`, `https_router`, `mail_catcher`, `host_helper`), `ready`, `initializing`, `uptime_secs`, and summary status.
+- **Launch Service Readiness Banner (`ServiceReadinessBanner.tsx`, `CommandLayout.tsx`, `GlassLayout.tsx`, `AtlasLayout.tsx`):**
+  - Mounted a prominent, collapsible live readiness bar across all desktop layouts showing real-time `Starting...` → `Ready` / `Stopped` / `Error` badges for **MariaDB**, **PHP & Workers**, **HTTP Router**, **HTTPS Router**, **Mail Catcher**, and **Host Helper**, plus a 1-click **Start MariaDB** recovery button.
+
+## [2.256.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.256.0 — Direct-DB WordPress Recovery Engine, Manual Folder Scan, Keep-Files Deletion, Coalesced Alerts & Cached Site Previews
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.256.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added & Changed
+- **Resilient Direct-DB WordPress Toolkit Engine (`wordpress.rs`, `panel/agent/src/services/wordpress.rs`, `panel/backend/src/routes/wordpress.rs`, `WordPress.tsx`, `WordPressToolkit.tsx`):**
+  - Bypassed `wp-load.php` / `wp-config.php` execution for listing plugins & themes, activating/deactivating themes, toggling/deactivating plugins, auto-updates, `blog_public` search indexing, setup/password resets, transient clearing, and WP-CLI commands so fatal PHP errors in broken themes/plugins (`Cannot redeclare function ...`) never break toolkit recovery.
+  - Added theme `deactivate` support (auto-switching directly in DB to a healthy fallback theme) and UI controls across Desktop and Cloud.
+- **Manual Local Folder Scan Trigger (`Sites.tsx`):**
+  - Disabled automatic folder scanning on Sites page load; added manual **Scan Local Folders** / **Scan Local Folder** triggers showing the configured Default Websites Directory.
+- **Preserve Website Folder & Files on Deletion (`SiteDetail.tsx`, `ConfirmDialog.tsx`, `panel/backend/src/routes/sites.rs`, `panel/agent/src/routes/nginx.rs`):**
+  - Added a **"Delete website folder and files from disk"** checkbox (checked by default) in the Delete Site confirmation dialog so users can uncheck it to unregister a site while keeping its files on disk (`?keep_files=true`) across Desktop and Cloud.
+- **Coalesced Single-Card Alerts with Brief Logs & Expandable Details (`NotificationContext.tsx`, `DesktopSiteActions.tsx`, `Sites.tsx`, `SiteDetail.tsx`, `WordPress.tsx`):**
+  - Implemented bidirectional coalescing (`action` ↔ `live-sse`) so one user action produces a single dynamic notification card with a timestamped brief log strip and an expandable full diagnostic log view.
+- **Cached Website Preview Thumbnails (`main.rs`, `panel/backend/src/routes/sites.rs`, `panel/backend/src/routes/mod.rs`, `SiteThumbnail.tsx`):**
+  - Added persistent disk-cached `/api/sites/thumbnail` endpoints and client cache versioning, warming the site preview once on initialization and supporting manual re-fetch via the refresh icon.
+
+## [2.255.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.255.0 — Folder Discovery, Recursive SQL Picker, Confirmation-First SQL Compat Fixer, DB Cleanup/Optimize, & Admin Git Repo Management
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.255.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Default Websites Directory Scanning & Recursive SQL Picker (`DiscoveredFoldersPanel.tsx`, `DirectoryDbSelector.tsx`, `wordpress.rs`, `main.rs`):**
+  - Automatically scans folders in the configured Default Websites Directory, suggests unregistered projects for one-click domain configuration & import, and discovers `.sql`/`.sql.gz`/`.zip` dumps recursively inside subdirectories so users can pick or switch databases before connecting.
+- **Confirmation-First SQL Compatibility Fixer — Backward/Forward & MySQL ↔ MariaDB (`mariadb.rs`, `wordpress.rs`, `databases.rs`, `ProvisionLog.tsx`, `Sites.tsx`, `WordPress.tsx`, `Databases.tsx`):**
+  - Detects and reports compatibility incompatibilities (`utf8mb4_0900_*`, `utf8mb4_uca1400_*`, `utf8mb3`, `DEFINER=`, `GTID_PURGED`/`SQL_LOG_BIN`, `INVISIBLE`/`SRID`/`ENCRYPTION`, `WITH SYSTEM VERSIONING`/`PAGE_CHECKSUM`/`TRANSACTIONAL`, legacy `TYPE=`/`ROW_FORMAT=FIXED`, and errors `1071`, `1273`, `1115`, `1227`, `1449`, `1286`, `1064`, `1067`), showing the exact SQL error and proposed rewrites for user confirmation before applying fixes and retrying.
+  - Preserves lossless automatic normalization of phpMyAdmin binary-hex defaults and rolls back failed site imports cleanly back to Discovered Folders without deleting site files on disk.
+- **Database Cleanup, Pruning & Optimization Tools (`DatabaseMaintenanceTab.tsx`, `DatabaseCleanupModal.tsx`, `databases.rs`, `mariadb.rs`):**
+  - Added inspection, bloat/autoload pruning, revision/transient cleanup, and table optimization workflows across both Desktop and Cloud.
+- **Admin Git Repository Initialization & Connection (`git_repo.rs`, `SiteGitRepoPanel.tsx`, `SiteDetail.tsx`, `Deploy.tsx`, `GitDeploys.tsx`, `panel/backend`, `panel/agent`):**
+  - Added `git init` (custom branch, `.gitignore` presets, optional initial commit), connect/pull/clone remote `origin` (HTTPS token or SSH), commit & push, and disconnect actions across Desktop and admin-gated Cloud routes.
+
+## [2.254.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.254.0 — Real-Time Dynamic Alerts, Tray/Auto-Updater, WP Security Parity, Live Telemetry & Full Local Router/PHP Controls
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.254.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Real-Time Dynamic Alert Stack & Live SSE Integration (`NotificationContext.tsx`, `useLayoutState.ts`, `api.ts`, `state.rs`):**
+  - Replaced the single static top banner with a floating real-time alert HUD stack supporting up to 4 concurrent alerts, slide-in animations, live relative timestamps (`just now`, `Ns ago`), countdown progress bars (auto-pausing on hover, sticky for errors or pinned/expanded alerts), and one-click `Dismiss All`.
+  - Connected `/api/notifications/stream` SSE payloads directly to `GlobalNotificationBanner` with `Live`/`Verified` badges and smart 3.5s target deduplication so backend events enrich matching in-flight action alerts instead of double-popping.
+  - Enhanced `ApiError` (`method`, `endpoint`, `durationMs`, `timestamp`) and added `buildAlertDetails()` so failures and operations across `DesktopSiteActions`, `SiteDetail`, `Sites`, and `Dashboard` surface HTTP status codes, elapsed timing (`ms`), targets, expandable diagnostics, and one-click `Copy Log`.
+- **Desktop PHP Worker Pool, Resource Limits, Extensions, & `.env` Runtime Injection (`state.rs`, `main.rs`, `SiteDetail.tsx`):**
+  - Added multi-worker PHP-CGI pool (`1..=8` `php -S` workers per site with atomic round-robin routing) enforcing `memory_limit`, `upload_max_filesize`, `post_max_size`, and `.env` environment variables with automatic worker restarts.
+  - Implemented real Windows `ext/php_*.dll` extension scanning and `php.ini` toggle handlers (`/api/php/extensions/{version}`, `/install`, `/disable`) and ungated Resource Limits & PHP Extensions in `SiteDetail.tsx`.
+- **WebSockets, Streaming Proxy, Aliases, SAN SSL, & Redirect Rules (`router.rs`, `ssl.rs`, `state.rs`, `main.rs`):**
+  - Added `101 Switching Protocols` bidirectional WebSocket tunneling and true unbuffered streaming request/response proxying.
+  - Added site domain aliases (auto-updating Windows `hosts`, `mkcert` SAN certificates, and `DynamicCertResolver`), wildcard/exact 301/302 redirect matching, and password protection handlers.
+- **WordPress Vulnerability/Hardening Parity & Live Windows Telemetry (`wordpress.rs`, `main.rs`, `Dashboard.tsx`):**
+  - Implemented real CVE vulnerability scanning, 7-point WP security audit & hardening with rollback-safe ZIP smart updates, and bulk WP updates.
+  - Wired Win32 `GetSystemTimes` CPU %, `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` processes, `GetIfTable` network adapter stats, 10s metrics history sampler, and per-site traffic/bandwidth tracking.
+- **Native Windows System Tray, Background Mode, & In-App Auto-Updater (`tray.rs`, `updater.rs`, `Settings.tsx`, `Dashboard.tsx`):**
+  - Added native `Shell_NotifyIconW` system tray (`Show DockPanel Desktop`, `Open Sites Folder`, `Quit DockPanel Desktop`), minimize-to-tray preserving active site runtimes, and `launch_at_startup` HKCU Run integration.
+  - Added 15-minute cached GitHub Releases update checker (`/api/telemetry/update-status`) and SHA-256 verified installer download/launch (`/api/desktop/update/install`).
+
+## [2.253.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.253.0 — Production Build & Installer Release
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.253.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Changed
+- **Version Bump & Production Rebuild (`desktop/dockpanel-app`, `desktop/host-helper`, `desktop/installer`, `panel/frontend`):**
+  - Bumped DockPanel Desktop, Host Helper service, frontend package, and Windows installer metadata (`setup.iss`, `install.ps1`) to `2.253.0`.
+  - Rebuilt production frontend bundle, Rust desktop binaries (`dockpanel.exe`, `dockpanel-host-helper.exe`), and `DockPanel-Desktop-Setup.exe` Inno Setup installer.
+
+## [2.252.0] - 2026-11-27
+
+### Release: DockPanel Desktop — Real-Time Import Progress, HTTPS Proxy Fix, & Live PHP Logs
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.252.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Real-Time Existing Website & Database Import Progress (`Sites.tsx`, `ProvisionLog.tsx`, `main.rs`, `wordpress.rs`, `mariadb.rs`, `live_sync.rs`, `state.rs`):**
+  - Replaced the blocking existing-WordPress database import request with non-blocking client upload progress (`api.upload`) transitioning seamlessly into a live SSE stream (`/api/sites/{id}/wordpress/import-log/{job_id}`).
+  - Added `import_existing_wp_database_with_progress()`, `rewrite_domains_with_progress()`, `import_mysql_dump_with_progress()`, and `AppState::append_install_progress()` to stream timestamped logs and live progress percentages for `site_connect`, `upload`, `unpack`, `mariadb`, `metadata`, `rewrite`, `db_create`, `db_import`, `wp_config`, `ssl_start`, and `complete`.
+  - Added folder-scanning indicator (`inspectingFolder`), `$table_prefix` badge, auto-expanded Terminal Output (`defaultShowLogs`), and dismissible log viewer in `ProvisionLog.tsx`.
+- **Real-Time Per-Site PHP & Access/Redirect Logs (`state.rs`, `router.rs`, `main.rs`, `SiteDetail.tsx`):**
+  - Isolated per-site logs under `logs/<domain>.php_errors.log`, `logs/<domain>.php_worker.log`, and `logs/<domain>.access.log` (recording HTTP/HTTPS method, path, status, `Location` header on redirects, and duration in ms), plus `wp-content/debug.log` when present.
+  - Added `GET /api/sites/{id}/logs/stream` SSE live-tail endpoint, fixed `/sites/{id}/access-logs` and `/sites/{id}/php-errors` query filtering, and added **Live Tail On/Off** in `SiteDetail.tsx`.
+
+#### Fixed
+- **HTTPS `ERR_TOO_MANY_REDIRECTS` Loop on PHP Sites (`state.rs`):**
+  - Added `ensure_php_proxy_shim()` (`dockpanel_proxy_env.php` via `-d auto_prepend_file=...`) so built-in `php -S` workers behind DockPanel Desktop's TLS-terminating router populate `$_SERVER['HTTPS'] = 'on'`, `REQUEST_SCHEME = 'https'`, and `SERVER_PORT = '443'` from `X-Forwarded-Proto: https`.
+- **Plesk Maintenance Page Drop-In Replacement (`wordpress.rs`, `main.rs`):**
+  - Added `sanitize_plesk_maintenance_dropin()` to detect leftover Plesk/WP Toolkit `wp-content/maintenance.php` drop-ins and replace them with DockPanel Desktop's clean 503 maintenance template during existing-site connection, database import, core reinstallation, and maintenance toggles.
+
+## [2.251.0] - 2026-11-26
+
+### Release: DockPanel Desktop — Built-in Mail Catcher, Existing Folder Import, & Live Sync
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.251.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Built-in Local Mail Catcher (`mail_catcher.rs`, `DesktopMailCatcher.tsx`, `Mail.tsx`, `Dashboard.tsx`, `state.rs`):**
+  - Added an embedded local SMTP server (`127.0.0.1`) with persistent `mail_inbox.json` storage (up to 500 messages, 25 MB max per message, multipart/MIME & RFC 2047 header decoding).
+  - Automatically wired active PHP (`SMTP`, `smtp_port`, `sendmail_from`) and Node.js (`SMTP_HOST`, `SMTP_PORT`) site workers to route outbound mail to the local Mail Catcher.
+  - Added the Desktop Mail Catcher UI at `/mail` with HTML/Text/Headers/Raw message inspection, domain & search filtering, unread tracking, test email dispatch, and a Dashboard Local Mail summary widget.
+- **Connect Existing Site Folders & WordPress Database Import (`Sites.tsx`, `wordpress.rs`, `mariadb.rs`, `main.rs`):**
+  - Added native Windows folder picker (`/desktop/pick-folder`) and folder inspection (`/desktop/inspect-folder`) to detect existing static, PHP, Node.js, and WordPress projects (`wp-config.php`, table prefix, database name, `siteurl`).
+  - Added `/api/sites/{id}/wordpress/import-database` (up to 512 MB) supporting `.sql`, `.sql.gz`, `.zip`, and `.sqlite`/`.db` dumps with automatic MariaDB provisioning, domain/URL rewriting, and `wp-config.php` updates.
+  - Upgraded `import_mysql_dump()` to stream via native `mariadb.exe`/`mysql.exe` stdin (with a PHP `PDO_MySQL` file-read fallback) to avoid the Windows 32 KB `CreateProcess` command-line limit.
+- **Live Sync Push/Pull (`live_sync.rs`, `LiveSyncModal.tsx`, `main.rs`):**
+  - Added `/api/sites/{id}/sync/preflight`, `/api/sites/{id}/sync/push`, and `/api/sites/{id}/sync/pull` endpoints to sync files and databases with remote DockPanel servers, including domain pair rewriting, safety snapshot enforcement, and `wp-config.php` preservation.
+
 ## [2.250.0] - 2026-11-26
 
 ### Release: DockPanel Cloud & Desktop v2.250.0 — Unified Stable Release

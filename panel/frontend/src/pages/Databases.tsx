@@ -6,6 +6,8 @@ import { useAuth } from "../context/AuthContext";
 import { isDesktopApp } from "../utils/desktop";
 import ConfirmDialog from "../components/ConfirmDialog";
 import ProvisionLog from "../components/ProvisionLog";
+import DatabaseMaintenanceTab from "../components/DatabaseMaintenanceTab";
+import DatabaseCleanupModal from "../components/DatabaseCleanupModal";
 import { showGlobalNotification } from "../context/NotificationContext";
 
 interface Site {
@@ -61,7 +63,7 @@ const engineLabels: Record<string, string> = {
 
 /* ─── Advanced Database Manager ───────────── */
 
-type ManagerTab = "browse" | "structure" | "sql" | "import" | "export" | "find_replace";
+type ManagerTab = "browse" | "structure" | "sql" | "import" | "export" | "find_replace" | "maintenance";
 
 interface DumpFile {
   filename: string;
@@ -725,11 +727,59 @@ function AdvancedDatabaseManager({
         setUploadProgress(70);
         setUploadStatus(autoImportUpload ? "Uploading and restoring into database container..." : "Saving dump on server...");
 
-        await api.post(`/databases/${database.id}/upload-dump`, {
+        const uploadPayload = {
           filename: file.name,
           content: base64Content,
           auto_import: autoImportUpload,
-        });
+        };
+
+        try {
+          await api.post(`/databases/${database.id}/upload-dump`, uploadPayload);
+        } catch (err) {
+          const body = err instanceof ApiError ? (err.body as any) : null;
+          if (body?.requires_compat_confirm && Array.isArray(body?.compat_fixes)) {
+            setConfirmModal({
+              title: "SQL Compatibility Confirmation Required",
+              label:
+                (body.error as string) ||
+                "This SQL dump contains syntax or collations incompatible with the target database.",
+              consequences: [
+                ...(body.compat_fixes as string[]),
+                "Your original local .sql file is untouched — DockPanel only normalizes the staged copy sent to the database.",
+              ],
+              confirmLabel: "Apply Fixes & Import",
+              onConfirm: async () => {
+                setConfirmModal(null);
+                setUploadProgress(75);
+                setUploadStatus("Applying compatibility fixes and restoring database...");
+                try {
+                  await api.post(`/databases/${database.id}/upload-dump`, {
+                    ...uploadPayload,
+                    apply_compat_fixes: true,
+                  });
+                  setUploadProgress(100);
+                  setUploadStatus("Finished!");
+                  showGlobalNotification(
+                    "success",
+                    `Applied compatibility fixes and restored "${file.name}" into ${database.name}!`
+                  );
+                  loadDumps();
+                  loadTables();
+                } catch (retryErr) {
+                  const msg = retryErr instanceof Error ? retryErr.message : "Compat import failed";
+                  showGlobalNotification("error", msg);
+                } finally {
+                  setUploadProgress(null);
+                  setUploadStatus("");
+                }
+              },
+            });
+            setUploadProgress(null);
+            setUploadStatus("");
+            return;
+          }
+          throw err;
+        }
 
         setUploadProgress(100);
         setUploadStatus("Finished!");
@@ -956,6 +1006,7 @@ function AdvancedDatabaseManager({
             { id: "import", label: "Import & Upload", icon: "M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.5V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" },
             { id: "export", label: "Export & Backups", icon: "M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.5V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" },
             { id: "find_replace", label: "Find & Replace", icon: "M21 21l-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607ZM10.5 7.5v6m3-3h-6" },
+            { id: "maintenance", label: "Optimize & Clean", icon: "M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 0 0-2.456 2.456Z" },
           ].map((t) => (
             <button
               key={t.id}
@@ -2021,6 +2072,15 @@ function AdvancedDatabaseManager({
               </div>
             </div>
           )}
+
+          {activeTab === "maintenance" && (
+            <DatabaseMaintenanceTab
+              databaseId={database.id}
+              databaseName={database.name}
+              engine={database.engine}
+              onChanged={loadTables}
+            />
+          )}
         </div>
       </div>
 
@@ -2292,6 +2352,7 @@ export default function Databases() {
   // Advanced Database Manager & Lethal Confirmation states
   const [manageDb, setManageDb] = useState<{ db: Database; tab?: ManagerTab } | null>(null);
   const [deleteTargetDb, setDeleteTargetDb] = useState<Database | null>(null);
+  const [showCleanupModal, setShowCleanupModal] = useState(false);
   const [viewMode, setViewMode] = useState<"table" | "grid">("table");
   const [sortBy, setSortBy] = useState<"name" | "engine" | "port" | "created">("name");
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
@@ -2533,6 +2594,13 @@ export default function Databases() {
               </svg>
             </button>
           </div>
+          <button
+            type="button"
+            onClick={() => setShowCleanupModal(true)}
+            className="px-3.5 py-2 bg-dark-800 border border-dark-600 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-700 transition-colors"
+          >
+            Cleanup &amp; Optimize
+          </button>
           <button
             onClick={() => setShowForm(!showForm)}
             className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 transition-colors"
@@ -3061,6 +3129,12 @@ export default function Databases() {
                                     Import / Export
                                   </button>
                                   <button
+                                    onClick={() => { setActiveMenuDbId(null); setManageDb({ db, tab: "maintenance" }); }}
+                                    className="w-full px-3 py-2 text-rust-400 hover:text-rust-300 hover:bg-dark-800 text-left flex items-center gap-2 font-medium"
+                                  >
+                                    Optimize &amp; Clean
+                                  </button>
+                                  <button
                                     onClick={() => { setActiveMenuDbId(null); handleResetPassword(db.id); }}
                                     disabled={resettingPw === db.id}
                                     className="w-full px-3 py-2 text-dark-200 hover:text-dark-50 hover:bg-dark-800 text-left flex items-center gap-2"
@@ -3232,6 +3306,14 @@ export default function Databases() {
             handleDelete(id);
           }}
           onCancel={() => setDeleteTargetDb(null)}
+        />
+      )}
+      {showCleanupModal && (
+        <DatabaseCleanupModal
+          onClose={() => setShowCleanupModal(false)}
+          onCompleted={() => {
+            fetchData();
+          }}
         />
       )}
       </div>
