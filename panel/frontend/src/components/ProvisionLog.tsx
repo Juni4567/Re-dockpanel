@@ -7,6 +7,17 @@ export interface ProvisionStep {
   status: "pending" | "in_progress" | "done" | "error";
   progress?: number;
   message?: string;
+  requires_compat_confirm?: boolean;
+  compat_fixes?: string[];
+  target_version?: string;
+  error_detail?: string;
+}
+
+export interface ProvisionCompatMeta {
+  requiresCompatConfirm?: boolean;
+  compatFixes?: string[];
+  targetVersion?: string;
+  errorDetail?: string;
 }
 
 interface Props {
@@ -16,7 +27,7 @@ interface Props {
   autoClose?: boolean;
   defaultShowLogs?: boolean;
   externalSteps?: ProvisionStep[];
-  onComplete?: () => void;
+  onComplete?: (ok?: boolean, errorDetail?: string, compatMeta?: ProvisionCompatMeta) => void;
   onDismiss?: () => void;
 }
 
@@ -82,6 +93,15 @@ export default function ProvisionLog({
           es.close();
           setDone(true);
           const ok = step.status !== "error";
+          const errDetail = !ok ? (step.error_detail || step.message || step.label || "Operation failed") : undefined;
+          const compatMeta: ProvisionCompatMeta | undefined = step.requires_compat_confirm
+            ? {
+                requiresCompatConfirm: true,
+                compatFixes: step.compat_fixes || [],
+                targetVersion: step.target_version,
+                errorDetail: step.error_detail || errDetail,
+              }
+            : undefined;
           showGlobalNotification(
             ok ? "success" : "error",
             step.label || (ok ? (isDeploy ? "Deployment completed successfully" : "Provisioning complete") : (isDeploy ? "Deployment failed" : "Provisioning failed")),
@@ -90,10 +110,10 @@ export default function ProvisionLog({
           );
 
           if (autoClose) {
-            setTimeout(() => onComplete?.(), 3000);
+            setTimeout(() => onComplete?.(ok, errDetail, compatMeta), 3000);
           } else {
             // Signal completion to parent for background data refresh
-            onComplete?.();
+            onComplete?.(ok, errDetail, compatMeta);
           }
         }
       } catch {
@@ -111,7 +131,9 @@ export default function ProvisionLog({
         "The progress stream closed before reporting status. Check the history or site status for current state."
       );
       if (autoClose) {
-        setTimeout(() => onComplete?.(), 4000);
+        setTimeout(() => onComplete?.(false, "The progress stream closed unexpectedly."), 4000);
+      } else {
+        onComplete?.(false, "The progress stream closed unexpectedly.");
       }
     };
 
@@ -263,6 +285,18 @@ export default function ProvisionLog({
           list below for its current state.
         </p>
       )}
+
+      {hasError &&
+        /allowed memory size|out of memory|memory_limit|max_allowed_packet/i.test(allLogs) && (
+          <div className="mb-3 px-3 py-2.5 rounded-lg bg-warn-500/10 border border-warn-500/35 text-xs text-warn-300 space-y-1">
+            <p className="font-semibold">
+              Workable Fix: Memory limit reached during SQL import
+            </p>
+            <p className="text-dark-200">
+              Increase <strong>Import PHP Memory Limit</strong> to <strong>2048 MB</strong> or <strong>Unlimited (-1)</strong> and click Retry. Your folder has been safely preserved on disk and returned to <strong>Unregistered Folders Ready to Import</strong>.
+            </p>
+          </div>
+        )}
 
       {/* Step List */}
       <div className="space-y-1.5 mb-3">

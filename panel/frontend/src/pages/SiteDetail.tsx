@@ -1798,7 +1798,6 @@ export default function SiteDetail() {
           </div>
         </Link>
         )}
-        {!desktop && (
         <Link
           to={`/sites/${id}/deploy`}
           className="bg-dark-800 rounded-lg border border-dark-500 p-5 hover:border-accent-400 hover:shadow-sm transition-all group"
@@ -1810,12 +1809,11 @@ export default function SiteDetail() {
               </svg>
             </div>
             <div>
-              <p className="text-sm font-medium text-dark-50">Git Deploy</p>
-              <p className="text-xs text-dark-200">Push to deploy</p>
+              <p className="text-sm font-medium text-dark-50">{desktop ? "Git Repository" : "Git & Deploy"}</p>
+              <p className="text-xs text-dark-200">{desktop ? "Init & connect repo" : "Init repo & deploy"}</p>
             </div>
           </div>
         </Link>
-        )}
         {(!site.runtime || site.runtime === "php" || site.runtime === "static" || site.php_preset === "wordpress") && (
           site.php_preset === "wordpress" ? (
             <Link

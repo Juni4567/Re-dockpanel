@@ -4,6 +4,9 @@ import { api, ApiError } from "../api";
 import { formatDate } from "../utils/format";
 import ProvisionLog from "../components/ProvisionLog";
 import ConfirmDialog from "../components/ConfirmDialog";
+import SiteGitRepoPanel from "../components/SiteGitRepoPanel";
+import { isDesktopApp } from "../utils/desktop";
+import { useAuth } from "../context/AuthContext";
 import { showGlobalNotification } from "../context/NotificationContext";
 
 interface ActiveIncidentInfo {
@@ -53,7 +56,11 @@ interface ReleaseInfo {
 
 export default function Deploy() {
   const { id } = useParams<{ id: string }>();
+  const { user } = useAuth();
+  const desktop = isDesktopApp();
   const [siteDomain, setSiteDomain] = useState<string | null>(null);
+  const [siteRuntime, setSiteRuntime] = useState<string | undefined>(undefined);
+  const [sitePreset, setSitePreset] = useState<string | null>(null);
   const [config, setConfig] = useState<DeployConfig | null>(null);
   const [logs, setLogs] = useState<DeployLog[]>([]);
   const [releases, setReleases] = useState<ReleaseInfo[]>([]);
@@ -86,6 +93,10 @@ export default function Deploy() {
   // logs fetch looked identical to "never configured". See Databases.tsx's
   // loadTableDetails for the same fix applied to the same class of bug.
   const load = async () => {
+    if (desktop) {
+      setLoading(false);
+      return;
+    }
     const [cfgResult, logsResult] = await Promise.allSettled([
       api.get<DeployConfig | null>(`/sites/${id}/deploy`),
       api.get<DeployLog[]>(`/sites/${id}/deploy/logs?limit=20`),
@@ -134,7 +145,14 @@ export default function Deploy() {
   // best-effort fetch Backups.tsx/Crons.tsx/Files.tsx already do for their
   // own "Sites / {domain} / ..." trail.
   useEffect(() => {
-    api.get<{ domain: string }>(`/sites/${id}`).then((s) => setSiteDomain(s.domain)).catch(() => {});
+    api
+      .get<{ domain: string; runtime?: string; php_preset?: string | null }>(`/sites/${id}`)
+      .then((s) => {
+        setSiteDomain(s.domain);
+        setSiteRuntime(s.runtime);
+        setSitePreset(s.php_preset ?? null);
+      })
+      .catch(() => {});
   }, [id]);
 
   const handleSave = async () => {
@@ -280,8 +298,10 @@ export default function Deploy() {
       </div>
 
       <div className="flex items-center justify-between">
-        <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">Git Deploy</h1>
-        {config && (
+        <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest">
+          {desktop ? "Git Repository" : "Git Repository & Deploy"}
+        </h1>
+        {!desktop && config && (
           <div className="flex items-center gap-3">
             <button
               onClick={() => handleDeploy()}
@@ -299,6 +319,20 @@ export default function Deploy() {
           </div>
         )}
       </div>
+
+      {id && (
+        <SiteGitRepoPanel
+          siteId={id}
+          siteDomain={siteDomain || undefined}
+          runtime={siteRuntime}
+          phpPreset={sitePreset}
+          isAdmin={user?.role === "admin"}
+          onRepoChanged={load}
+        />
+      )}
+
+      {desktop ? null : (
+      <>
 
       {/* Active Incident Blocker Panel */}
       {activeIncidentBlock && (
@@ -766,6 +800,8 @@ export default function Deploy() {
             ))}
           </div>
         </div>
+      )}
+      </>
       )}
     </div>
   );

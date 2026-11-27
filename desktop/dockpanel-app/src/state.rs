@@ -225,6 +225,7 @@ pub struct AppState {
     pub site_stats: Arc<Mutex<HashMap<String, SiteTrafficStats>>>,
     pub metrics_history: Arc<Mutex<Vec<serde_json::Value>>>,
     pub update_cache: Arc<Mutex<Option<(std::time::Instant, serde_json::Value)>>>,
+    pub approved_db_scan_dirs: Arc<Mutex<Vec<PathBuf>>>,
     pub notif_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     #[cfg(windows)]
     pub worker_job: Option<Arc<WorkerJobGuard>>,
@@ -601,6 +602,7 @@ impl AppState {
             site_stats: Arc::new(Mutex::new(HashMap::new())),
             metrics_history: Arc::new(Mutex::new(Vec::new())),
             update_cache: Arc::new(Mutex::new(None)),
+            approved_db_scan_dirs: Arc::new(Mutex::new(Vec::new())),
             notif_tx,
             #[cfg(windows)]
             worker_job: create_kill_on_close_job(),
@@ -953,6 +955,29 @@ impl AppState {
         message: Option<&str>,
         done: bool,
     ) {
+        self.push_install_progress_with_meta(
+            install_id,
+            step,
+            label,
+            status,
+            progress,
+            message,
+            None,
+            done,
+        );
+    }
+
+    pub fn push_install_progress_with_meta(
+        &self,
+        install_id: &str,
+        step: &str,
+        label: &str,
+        status: &str,
+        progress: Option<u8>,
+        message: Option<&str>,
+        extra: Option<serde_json::Value>,
+        done: bool,
+    ) {
         let mut obj = serde_json::json!({
             "step": step,
             "label": label,
@@ -963,6 +988,13 @@ impl AppState {
         }
         if let Some(m) = message {
             obj["message"] = serde_json::json!(m);
+        }
+        if let Some(serde_json::Value::Object(map)) = extra {
+            if let Some(dst) = obj.as_object_mut() {
+                for (k, v) in map {
+                    dst.insert(k, v);
+                }
+            }
         }
         self.push_php_install_step(install_id, obj, done);
     }
@@ -1573,6 +1605,76 @@ server.listen(port, '127.0.0.1', () => {{
         } else {
             false
         }
+    }
+
+    /// Unregisters a site from DockPanel (stops workers, removes hosts entry & certs)
+    /// WITHOUT removing any website files or directories from disk. Used when rolling
+    /// back a failed existing-folder import so it returns to discoverable folders cleanly.
+    pub fn unregister_site_keep_files(&self, id: &str) -> bool {
+        let removed = {
+            let mut data = self.data.lock().unwrap();
+            let pos = data.sites.iter().position(|s| s.id == id || s.domain == id);
+            pos.map(|idx| data.sites.remove(idx))
+        };
+
+        if let Some(site) = removed {
+            let clean = site.domain.trim().to_lowercase();
+            self.stop_domain_workers(&clean);
+            self.save_data();
+            let _ = crate::hosts_manager::remove_domain_from_hosts(&site.domain);
+            for alias in &site.aliases {
+                let _ = crate::hosts_manager::remove_domain_from_hosts(alias);
+            }
+            let cert_dir = self.certs_dir().join(&clean);
+            if cert_dir.is_dir() {
+                let _ = fs::remove_dir_all(cert_dir);
+            }
+            let sec_file = self.site_security_path(&clean);
+            if sec_file.is_file() {
+                let _ = fs::remove_file(sec_file);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Registers a directory that was explicitly scanned or picked by the user in the UI
+    /// so database dumps selected from that directory can be imported cleanly without re-upload.
+    pub fn approve_db_scan_dir(&self, dir: &Path) {
+        if !dir.is_dir() {
+            return;
+        }
+        let canon = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        if let Ok(mut guard) = self.approved_db_scan_dirs.lock() {
+            if !guard.iter().any(|existing| existing == &canon) {
+                if guard.len() >= 32 {
+                    guard.remove(0);
+                }
+                guard.push(canon);
+            }
+        }
+    }
+
+    /// Checks whether a canonicalized local database file path resides inside the site directory,
+    /// the Default Websites Directory, or an explicitly approved scanned directory.
+    pub fn is_approved_db_path(&self, site: &LocalSite, canonical_file: &Path) -> bool {
+        if let Ok(site_canon) = fs::canonicalize(self.site_dir(site)) {
+            if canonical_file.starts_with(&site_canon) {
+                return true;
+            }
+        }
+        if let Ok(root_canon) = fs::canonicalize(self.get_default_sites_dir()) {
+            if canonical_file.starts_with(&root_canon) {
+                return true;
+            }
+        }
+        if let Ok(guard) = self.approved_db_scan_dirs.lock() {
+            if guard.iter().any(|dir| canonical_file.starts_with(dir)) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn load_site_env_vars(doc_root: &Path) -> Vec<(String, String)> {

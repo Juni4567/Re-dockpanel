@@ -4,6 +4,22 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.255.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.255.0 — Folder Discovery, Recursive SQL Picker, Confirmation-First SQL Compat Fixer, DB Cleanup/Optimize, & Admin Git Repo Management
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.255.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added
+- **Default Websites Directory Scanning & Recursive SQL Picker (`DiscoveredFoldersPanel.tsx`, `DirectoryDbSelector.tsx`, `wordpress.rs`, `main.rs`):**
+  - Automatically scans folders in the configured Default Websites Directory, suggests unregistered projects for one-click domain configuration & import, and discovers `.sql`/`.sql.gz`/`.zip` dumps recursively inside subdirectories so users can pick or switch databases before connecting.
+- **Confirmation-First SQL Compatibility Fixer — Backward/Forward & MySQL ↔ MariaDB (`mariadb.rs`, `wordpress.rs`, `databases.rs`, `ProvisionLog.tsx`, `Sites.tsx`, `WordPress.tsx`, `Databases.tsx`):**
+  - Detects and reports compatibility incompatibilities (`utf8mb4_0900_*`, `utf8mb4_uca1400_*`, `utf8mb3`, `DEFINER=`, `GTID_PURGED`/`SQL_LOG_BIN`, `INVISIBLE`/`SRID`/`ENCRYPTION`, `WITH SYSTEM VERSIONING`/`PAGE_CHECKSUM`/`TRANSACTIONAL`, legacy `TYPE=`/`ROW_FORMAT=FIXED`, and errors `1071`, `1273`, `1115`, `1227`, `1449`, `1286`, `1064`, `1067`), showing the exact SQL error and proposed rewrites for user confirmation before applying fixes and retrying.
+  - Preserves lossless automatic normalization of phpMyAdmin binary-hex defaults and rolls back failed site imports cleanly back to Discovered Folders without deleting site files on disk.
+- **Database Cleanup, Pruning & Optimization Tools (`DatabaseMaintenanceTab.tsx`, `DatabaseCleanupModal.tsx`, `databases.rs`, `mariadb.rs`):**
+  - Added inspection, bloat/autoload pruning, revision/transient cleanup, and table optimization workflows across both Desktop and Cloud.
+- **Admin Git Repository Initialization & Connection (`git_repo.rs`, `SiteGitRepoPanel.tsx`, `SiteDetail.tsx`, `Deploy.tsx`, `GitDeploys.tsx`, `panel/backend`, `panel/agent`):**
+  - Added `git init` (custom branch, `.gitignore` presets, optional initial commit), connect/pull/clone remote `origin` (HTTPS token or SSH), commit & push, and disconnect actions across Desktop and admin-gated Cloud routes.
+
 ## [2.254.0] - 2026-11-27
 
 ### Release: DockPanel Desktop v2.254.0 — Real-Time Dynamic Alerts, Tray/Auto-Updater, WP Security Parity, Live Telemetry & Full Local Router/PHP Controls

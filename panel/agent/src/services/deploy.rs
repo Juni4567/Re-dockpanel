@@ -933,6 +933,434 @@ pub fn generate_deploy_key(domain: &str) -> Result<(String, String), String> {
     Ok((public_key, key_path))
 }
 
+#[derive(serde::Serialize)]
+pub struct GitCommitInfo {
+    pub hash: String,
+    pub author: String,
+    pub date: String,
+    pub message: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct SiteGitStatus {
+    pub git_available: bool,
+    pub git_version: Option<String>,
+    pub initialized: bool,
+    pub doc_root: String,
+    pub branch: Option<String>,
+    pub branches: Vec<String>,
+    pub remote_name: Option<String>,
+    pub remote_url: Option<String>,
+    pub clean: bool,
+    pub changed_files: usize,
+    pub recent_commits: Vec<GitCommitInfo>,
+    pub has_gitignore: bool,
+    pub error: Option<String>,
+}
+
+fn validate_git_branch(branch: &str) -> Result<String, String> {
+    let clean = branch.trim();
+    if clean.is_empty()
+        || clean.len() > 100
+        || clean.starts_with('-')
+        || clean.contains("..")
+        || clean.chars().any(|c| c.is_whitespace() || c == '\0' || c == '\\')
+    {
+        return Err("Invalid branch name".into());
+    }
+    Ok(clean.to_string())
+}
+
+fn validate_git_url(url: &str) -> Result<String, String> {
+    let clean = url.trim();
+    if clean.is_empty() || clean.starts_with('-') || clean.chars().any(|c| c.is_whitespace() || c == '\0') {
+        return Err("Invalid repository URL".into());
+    }
+    if !clean.starts_with("https://")
+        && !clean.starts_with("http://")
+        && !clean.starts_with("git@")
+        && !clean.starts_with("ssh://")
+    {
+        return Err("Repository URL must start with https://, http://, ssh://, or git@".into());
+    }
+    Ok(clean.to_string())
+}
+
+fn mask_remote_credentials(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after = &url[scheme_end + 3..];
+        let auth_end = after.find('/').unwrap_or(after.len());
+        if let Some(at_pos) = after[..auth_end].rfind('@') {
+            return format!("{}***@{}", &url[..scheme_end + 3], &after[at_pos + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+fn run_site_git(site_dir: &str, args: &[&str], token: Option<&str>) -> Result<(bool, String), String> {
+    let out = safe_command_sync("git")
+        .args(GIT_NO_EXEC)
+        .args(args)
+        .current_dir(site_dir)
+        .output()
+        .map_err(|e| format!("Failed executing git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let mut combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.trim().to_string(),
+        (true, false) => stderr.trim().to_string(),
+        (false, false) => format!("{}\n{}", stdout.trim(), stderr.trim()),
+    };
+    if let Some(tok) = token.map(str::trim).filter(|t| !t.is_empty()) {
+        combined = combined.replace(tok, "***");
+    }
+    Ok((out.status.success(), combined))
+}
+
+fn inject_token_url(url: &str, token: Option<&str>) -> String {
+    let Some(tok) = token.map(str::trim).filter(|t| !t.is_empty()) else {
+        return url.to_string();
+    };
+    if let Some(rest) = url.strip_prefix("https://") {
+        format!("https://x-access-token:{tok}@{rest}")
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        format!("http://x-access-token:{tok}@{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
+pub fn git_repo_status(domain: &str) -> Result<SiteGitStatus, String> {
+    let site_dir = format!("{WEBROOT}/{domain}");
+    if !Path::new(&site_dir).is_dir() {
+        return Err("Site directory not found".into());
+    }
+    let ver = safe_command_sync("git")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(git_version) = ver else {
+        return Ok(SiteGitStatus {
+            git_available: false,
+            git_version: None,
+            initialized: Path::new(&format!("{site_dir}/.git")).exists(),
+            doc_root: site_dir,
+            branch: None,
+            branches: Vec::new(),
+            remote_name: None,
+            remote_url: None,
+            clean: true,
+            changed_files: 0,
+            recent_commits: Vec::new(),
+            has_gitignore: false,
+            error: Some("Git binary not found on server".into()),
+        });
+    };
+
+    let initialized = Path::new(&format!("{site_dir}/.git")).exists();
+    let has_gitignore = Path::new(&format!("{site_dir}/.gitignore")).is_file();
+    if !initialized {
+        return Ok(SiteGitStatus {
+            git_available: true,
+            git_version: Some(git_version),
+            initialized: false,
+            doc_root: site_dir,
+            branch: None,
+            branches: Vec::new(),
+            remote_name: None,
+            remote_url: None,
+            clean: true,
+            changed_files: 0,
+            recent_commits: Vec::new(),
+            has_gitignore,
+            error: None,
+        });
+    }
+
+    let branch = run_site_git(&site_dir, &["symbolic-ref", "--short", "HEAD"], None)
+        .ok()
+        .filter(|(ok, s)| *ok && !s.is_empty())
+        .map(|(_, s)| s);
+    let branches = run_site_git(&site_dir, &["for-each-ref", "--format=%(refname:short)", "refs/heads"], None)
+        .ok()
+        .filter(|(ok, _)| *ok)
+        .map(|(_, s)| s.lines().map(|l| l.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    let remote_url = run_site_git(&site_dir, &["remote", "get-url", "origin"], None)
+        .ok()
+        .filter(|(ok, s)| *ok && !s.is_empty())
+        .map(|(_, u)| mask_remote_credentials(&u));
+    let changed_files = run_site_git(&site_dir, &["status", "--porcelain"], None)
+        .ok()
+        .filter(|(ok, _)| *ok)
+        .map(|(_, s)| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    let recent_commits = run_site_git(&site_dir, &["log", "-n", "5", "--pretty=format:%h%x09%an%x09%cr%x09%s"], None)
+        .ok()
+        .filter(|(ok, _)| *ok)
+        .map(|(_, s)| {
+            s.lines()
+                .filter_map(|line| {
+                    let mut p = line.splitn(4, '\t');
+                    Some(GitCommitInfo {
+                        hash: p.next()?.to_string(),
+                        author: p.next()?.to_string(),
+                        date: p.next()?.to_string(),
+                        message: p.next().unwrap_or("").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(SiteGitStatus {
+        git_available: true,
+        git_version: Some(git_version),
+        initialized: true,
+        doc_root: site_dir,
+        branch,
+        branches,
+        remote_name: remote_url.as_ref().map(|_| "origin".to_string()),
+        remote_url,
+        clean: changed_files == 0,
+        changed_files,
+        recent_commits,
+        has_gitignore,
+        error: None,
+    })
+}
+
+pub fn git_repo_init(
+    domain: &str,
+    branch: Option<&str>,
+    gitignore_preset: Option<&str>,
+    initial_commit: bool,
+    commit_message: Option<&str>,
+    user_name: Option<&str>,
+    user_email: Option<&str>,
+) -> Result<(SiteGitStatus, String), String> {
+    let site_dir = format!("{WEBROOT}/{domain}");
+    if !Path::new(&site_dir).is_dir() {
+        return Err("Site directory not found".into());
+    }
+    let clean_branch = validate_git_branch(branch.unwrap_or("main"))?;
+    let mut logs = Vec::new();
+    if !Path::new(&format!("{site_dir}/.git")).exists() {
+        let (ok, out) = run_site_git(&site_dir, &["init", "-b", &clean_branch], None)?;
+        if !ok {
+            let (ok2, out2) = run_site_git(&site_dir, &["init"], None)?;
+            if !ok2 {
+                return Err(if out2.is_empty() { out } else { out2 });
+            }
+            let _ = run_site_git(&site_dir, &["symbolic-ref", "HEAD", &format!("refs/heads/{clean_branch}")], None);
+        }
+        logs.push(format!("Initialized Git repository on branch '{clean_branch}'"));
+    }
+
+    if let Some(preset) = gitignore_preset {
+        let content = match preset.trim().to_ascii_lowercase().as_str() {
+            "wordpress" => Some("# WordPress\nwp-content/cache/\nwp-content/uploads/\nwp-config.php\n*.sql\n*.sql.gz\n*.log\n"),
+            "node" => Some("# Node.js\nnode_modules/\n.next/\ndist/\n.env\n*.log\n"),
+            "php" | "laravel" => Some("# PHP / Laravel\nvendor/\nnode_modules/\n.env\nstorage/logs/*.log\n*.sql\n"),
+            "static" => Some("node_modules/\n.env\n*.log\n"),
+            _ => None,
+        };
+        if let Some(body) = content {
+            let gi = format!("{site_dir}/.gitignore");
+            if !Path::new(&gi).exists() {
+                let _ = std::fs::write(gi, body);
+            }
+        }
+    }
+
+    let n = user_name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("DockPanel Admin");
+    let e = user_email.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("admin@dockpanel.local");
+    let _ = run_site_git(&site_dir, &["config", "user.name", n], None);
+    let _ = run_site_git(&site_dir, &["config", "user.email", e], None);
+
+    if initial_commit {
+        let _ = run_site_git(&site_dir, &["add", "-A"], None)?;
+        let msg = commit_message.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Initial commit");
+        let (ok_c, out_c) = run_site_git(&site_dir, &["commit", "-m", msg], None)?;
+        if ok_c {
+            logs.push(out_c);
+        } else if !out_c.contains("nothing to commit") {
+            return Err(format!("Initial commit failed: {out_c}"));
+        }
+    }
+
+    Ok((git_repo_status(domain)?, logs.join("\n")))
+}
+
+pub fn git_repo_connect(
+    domain: &str,
+    repo_url: &str,
+    branch: Option<&str>,
+    token: Option<&str>,
+    mode: Option<&str>,
+    gitignore_preset: Option<&str>,
+    user_name: Option<&str>,
+    user_email: Option<&str>,
+) -> Result<(SiteGitStatus, String), String> {
+    let site_dir = format!("{WEBROOT}/{domain}");
+    if !Path::new(&site_dir).is_dir() {
+        return Err("Site directory not found".into());
+    }
+    let clean_url = validate_git_url(repo_url)?;
+    let clean_branch = validate_git_branch(branch.unwrap_or("main"))?;
+    let authed_url = inject_token_url(&clean_url, token);
+    let connect_mode = mode.unwrap_or("link").trim().to_ascii_lowercase();
+    let mut logs = Vec::new();
+
+    if connect_mode == "clone" && !Path::new(&format!("{site_dir}/.git")).exists() {
+        let foreign = foreign_entries(&site_dir);
+        if !foreign.is_empty() {
+            return Err(format!(
+                "Site folder has existing files ({}) — use Link mode instead of overwriting with Clone.",
+                foreign.join(", ")
+            ));
+        }
+        let stage = format!("/tmp/dockpanel_git_clone_{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+        let (ok, out) = run_site_git(&stage, &["clone", "--branch", &clean_branch, &authed_url, "."], token)?;
+        if !ok {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(format!("Clone failed: {out}"));
+        }
+        merge_into(Path::new(&stage), Path::new(&site_dir))?;
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = run_site_git(&site_dir, &["remote", "set-url", "origin", &clean_url], token);
+        logs.push(format!("Cloned '{}' ({clean_branch}) cleanly.", mask_remote_credentials(&clean_url)));
+        return Ok((git_repo_status(domain)?, logs.join("\n")));
+    }
+
+    if !Path::new(&format!("{site_dir}/.git")).exists() {
+        let (_, init_log) = git_repo_init(
+            domain,
+            Some(&clean_branch),
+            gitignore_preset,
+            false,
+            None,
+            user_name,
+            user_email,
+        )?;
+        logs.push(init_log);
+    }
+
+    let has_origin = run_site_git(&site_dir, &["remote", "get-url", "origin"], None)
+        .map(|(ok, _)| ok)
+        .unwrap_or(false);
+    if has_origin {
+        let (ok, out) = run_site_git(&site_dir, &["remote", "set-url", "origin", &clean_url], token)?;
+        if !ok {
+            return Err(format!("Failed updating remote origin: {out}"));
+        }
+        logs.push(format!("Updated origin -> {}", mask_remote_credentials(&clean_url)));
+    } else {
+        let (ok, out) = run_site_git(&site_dir, &["remote", "add", "origin", &clean_url], token)?;
+        if !ok {
+            return Err(format!("Failed adding remote origin: {out}"));
+        }
+        logs.push(format!("Connected origin -> {}", mask_remote_credentials(&clean_url)));
+    }
+
+    let (ok_f, out_f) = run_site_git(&site_dir, &["fetch", &authed_url, &clean_branch], token)?;
+    if ok_f {
+        logs.push(format!("Fetched branch '{clean_branch}'"));
+    } else {
+        logs.push(format!("Remote linked (fetch notice: {out_f})"));
+    }
+
+    if connect_mode == "link_and_pull" && ok_f {
+        let (ok_p, out_p) = run_site_git(
+            &site_dir,
+            &["pull", &authed_url, &clean_branch, "--allow-unrelated-histories", "--no-edit"],
+            token,
+        )?;
+        if !ok_p {
+            return Err(format!("Connected remote, but pull failed: {out_p}"));
+        }
+        logs.push(out_p);
+    }
+
+    Ok((git_repo_status(domain)?, logs.join("\n")))
+}
+
+pub fn git_repo_pull(domain: &str, branch: Option<&str>, token: Option<&str>) -> Result<(SiteGitStatus, String), String> {
+    let site_dir = format!("{WEBROOT}/{domain}");
+    if !Path::new(&format!("{site_dir}/.git")).exists() {
+        return Err("Git repository not initialized for this site".into());
+    }
+    let clean_branch = validate_git_branch(branch.unwrap_or("main"))?;
+    let remote = run_site_git(&site_dir, &["remote", "get-url", "origin"], None)
+        .ok()
+        .filter(|(ok, s)| *ok && !s.is_empty())
+        .map(|(_, s)| s)
+        .ok_or_else(|| "No 'origin' remote connected".to_string())?;
+    let authed = inject_token_url(&remote, token);
+    let (ok, out) = run_site_git(&site_dir, &["pull", &authed, &clean_branch, "--no-edit"], token)?;
+    if !ok {
+        return Err(format!("Git pull failed: {out}"));
+    }
+    Ok((git_repo_status(domain)?, out))
+}
+
+pub fn git_repo_commit_push(
+    domain: &str,
+    message: &str,
+    branch: Option<&str>,
+    token: Option<&str>,
+    push: bool,
+) -> Result<(SiteGitStatus, String), String> {
+    let site_dir = format!("{WEBROOT}/{domain}");
+    if !Path::new(&format!("{site_dir}/.git")).exists() {
+        return Err("Git repository not initialized for this site".into());
+    }
+    let clean_msg = message.trim();
+    if clean_msg.is_empty() {
+        return Err("Commit message is required".into());
+    }
+    let _ = run_site_git(&site_dir, &["add", "-A"], None)?;
+    let mut logs = Vec::new();
+    let (ok_c, out_c) = run_site_git(&site_dir, &["commit", "-m", clean_msg], None)?;
+    if ok_c {
+        logs.push(out_c);
+    } else if out_c.contains("nothing to commit") {
+        logs.push("Working tree clean — nothing new to commit".into());
+    } else {
+        return Err(format!("Git commit failed: {out_c}"));
+    }
+    if push {
+        let cur_branch = branch
+            .map(validate_git_branch)
+            .transpose()?
+            .unwrap_or_else(|| "main".to_string());
+        let remote = run_site_git(&site_dir, &["remote", "get-url", "origin"], None)
+            .ok()
+            .filter(|(ok, s)| *ok && !s.is_empty())
+            .map(|(_, s)| s)
+            .ok_or_else(|| "Committed locally, but no 'origin' remote is connected".to_string())?;
+        let authed = inject_token_url(&remote, token);
+        let (ok_p, out_p) = run_site_git(&site_dir, &["push", "-u", &authed, &cur_branch], token)?;
+        if !ok_p {
+            return Err(format!("Git push failed: {out_p}"));
+        }
+        logs.push(out_p);
+    }
+    Ok((git_repo_status(domain)?, logs.join("\n")))
+}
+
+pub fn git_repo_disconnect(domain: &str) -> Result<SiteGitStatus, String> {
+    let site_dir = format!("{WEBROOT}/{domain}");
+    if Path::new(&format!("{site_dir}/.git")).exists() {
+        let _ = run_site_git(&site_dir, &["remote", "remove", "origin"], None);
+    }
+    git_repo_status(domain)
+}
+
 #[cfg(test)]
 mod first_deploy_tests {
     use super::*;

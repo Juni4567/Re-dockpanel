@@ -1,15 +1,27 @@
-import { useState, useEffect, FormEvent } from "react";
+import { useState, useEffect, useRef, FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { formatDate, formatSize } from "../utils/format";
 import { statusColors, runtimeLabels } from "../constants";
-import ProvisionLog, { type ProvisionStep } from "../components/ProvisionLog";
+import ProvisionLog, {
+  type ProvisionStep,
+  type ProvisionCompatMeta,
+} from "../components/ProvisionLog";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
 import { FieldHelp, InfoTip } from "../components/FieldHelp";
 import PhpVersionPicker from "../components/PhpVersionPicker";
 import SiteThumbnail from "../components/SiteThumbnail";
 import SiteFavicon from "../components/SiteFavicon";
 import DesktopSiteActions from "../components/DesktopSiteActions";
+import DiscoveredFoldersPanel, {
+  type DiscoveredFolder,
+  type FolderImportRequest,
+  type FailedFolderImportState,
+  type DetectedDbFile,
+  MEMORY_LIMIT_OPTIONS,
+} from "../components/DiscoveredFoldersPanel";
+import DirectoryDbSelector from "../components/DirectoryDbSelector";
 import InstallWordPressModal from "../components/InstallWordPressModal";
 import LiveSyncModal from "../components/LiveSyncModal";
 import PortConflictModal, {
@@ -122,10 +134,39 @@ export default function Sites() {
     wp_table_prefix?: string | null;
     wp_db_name?: string | null;
     wp_siteurl?: string | null;
+    detected_db_files?: DetectedDbFile[];
+    other_directory_db_files?: DetectedDbFile[];
   } | null>(null);
   const [wpDbFile, setWpDbFile] = useState<File | null>(null);
+  const [wpLocalDb, setWpLocalDb] = useState<DetectedDbFile | null>(null);
   const [wpSourceUrl, setWpSourceUrl] = useState("");
+  const [wpMemoryLimitMb, setWpMemoryLimitMb] = useState<number>(1024);
   const [skipWpDbUpload, setSkipWpDbUpload] = useState(false);
+  const [discoveredFolders, setDiscoveredFolders] = useState<DiscoveredFolder[]>([]);
+  const [discoveredRootDbFiles, setDiscoveredRootDbFiles] = useState<DetectedDbFile[]>([]);
+  const [scanningFolders, setScanningFolders] = useState(false);
+  const [failedFolderImports, setFailedFolderImports] = useState<Record<string, FailedFolderImportState>>({});
+  const [compatPrompt, setCompatPrompt] = useState<{
+    error: string;
+    fixes: string[];
+    targetVersion?: string;
+    retry: () => Promise<void>;
+  } | null>(null);
+  const activeImportRef = useRef<{
+    siteId: string;
+    domain: string;
+    runtime: string;
+    isWordPress: boolean;
+    appCommand?: string;
+    isConnectExisting: boolean;
+    folderPath?: string;
+    dbFile: File | null;
+    localDbPath: string;
+    localDbObj: DetectedDbFile | null;
+    sourceUrl: string;
+    dbName: string;
+    memoryLimitMb: number;
+  } | null>(null);
   const [sslPort, setSslPort] = useState<number | null>(null);
   const [enableBackup, setEnableBackup] = useState(false);
   const [backupFrequency, setBackupFrequency] = useState("daily");
@@ -195,6 +236,24 @@ export default function Sites() {
 
   useEffect(fetchSites, [allSites]);
 
+  const discoverFolders = () => {
+    if (!isDesktopApp()) return;
+    setScanningFolders(true);
+    api
+      .get<{
+        sites_dir?: string;
+        folders?: DiscoveredFolder[];
+        root_db_files?: DetectedDbFile[];
+      }>("/desktop/discover-folders")
+      .then((res) => {
+        if (res?.sites_dir) setDefaultSitesDir(res.sites_dir);
+        setDiscoveredFolders(Array.isArray(res?.folders) ? res.folders : []);
+        setDiscoveredRootDbFiles(Array.isArray(res?.root_db_files) ? res.root_db_files : []);
+      })
+      .catch(() => {})
+      .finally(() => setScanningFolders(false));
+  };
+
   useEffect(() => {
     if (!isDesktopApp()) return;
     api.get<PortConflictInfo>("/system/ports/conflict").then(setConflictInfo).catch(() => {});
@@ -207,6 +266,7 @@ export default function Sites() {
         if (s?.default_sites_dir) setDefaultSitesDir(s.default_sites_dir);
       })
       .catch(() => {});
+    discoverFolders();
   }, []);
 
   useEffect(() => {
@@ -216,6 +276,7 @@ export default function Sites() {
       setInspectingFolder(false);
       setFolderInspection(null);
       setWpDbFile(null);
+      setWpLocalDb(null);
       setWpSourceUrl("");
       setSkipWpDbUpload(false);
       return;
@@ -236,12 +297,20 @@ export default function Sites() {
 
   const applyFolderInspection = (insp: NonNullable<typeof folderInspection>) => {
     setFolderInspection(insp);
+    const detectedList = Array.isArray(insp.detected_db_files) ? insp.detected_db_files : [];
+    const suggestedDb =
+      detectedList.find((d) => d.matches_site === true) ||
+      detectedList.find((d) => d.matches_site !== false) ||
+      null;
+    if (!wpDbFile && !wpLocalDb && suggestedDb) {
+      setWpLocalDb(suggestedDb);
+    }
     if (insp.is_wordpress) {
       setCms("");
       setRuntime("php");
       setPhpPreset("wordpress");
-      if (insp.wp_siteurl && !wpSourceUrl) {
-        setWpSourceUrl(insp.wp_siteurl);
+      if ((insp.wp_siteurl || suggestedDb?.detected_site_url) && !wpSourceUrl) {
+        setWpSourceUrl(insp.wp_siteurl || suggestedDb?.detected_site_url || "");
       }
     } else if (!insp.is_empty && insp.exists && insp.is_dir) {
       setCms("");
@@ -306,8 +375,8 @@ export default function Sites() {
     setError("");
 
     const isExistingWpDir = isDesktopApp() && !!folderInspection?.is_wordpress;
-    if (isExistingWpDir && !skipWpDbUpload && !wpDbFile) {
-      setError("Existing WordPress directory detected — please upload a database dump (.sql, .sql.gz, .zip, or .sqlite) or check 'Skip database upload for now'.");
+    if (isExistingWpDir && !skipWpDbUpload && !wpDbFile && !wpLocalDb) {
+      setError("Existing WordPress directory detected — please select or upload a database dump (.sql, .sql.gz, .zip, or .sqlite) or check 'Skip database upload for now'.");
       return;
     }
 
@@ -353,13 +422,11 @@ export default function Sites() {
 
       const created = await api.post<Site>("/sites", body);
       const isConnectExisting = !!body.connect_existing;
-      const selectedDbFile = isExistingWpDir && wpDbFile && !skipWpDbUpload ? wpDbFile : null;
+      const canAttachDb = isDesktopApp() && !!folderInspection && !folderInspection.is_empty && folderInspection.is_dir;
+      const selectedDbFile = canAttachDb && wpDbFile && !skipWpDbUpload ? wpDbFile : null;
+      const selectedLocalDb = canAttachDb && !wpDbFile && !skipWpDbUpload ? wpLocalDb : null;
       const selectedFolderPath = customRootPath.trim();
       const selectedSourceUrl = wpSourceUrl.trim();
-      const targetUrl =
-        sslPort && created.ssl_enabled
-          ? buildSiteExternalUrl(created.domain, sslPort, true)
-          : buildSiteExternalUrl(created.domain, conflictInfo?.active_port, false);
 
       setShowForm(false);
       setDomain("");
@@ -375,214 +442,26 @@ export default function Sites() {
       setCustomRootPath("");
       setFolderInspection(null);
       setWpDbFile(null);
+      setWpLocalDb(null);
       setWpSourceUrl("");
       setSkipWpDbUpload(false);
       setEnableBackup(false);
       setBackupFrequency("daily");
       setBackupRetention(7);
       fetchSites();
+      discoverFolders();
 
-      if (selectedDbFile) {
-        const ts = () => new Date().toTimeString().slice(0, 8);
-        const fmtSize = (bytes: number) =>
-          bytes < 1024 * 1024
-            ? `${Math.max(1, Math.round(bytes / 1024))} KB`
-            : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-        const fileSizeLabel = fmtSize(selectedDbFile.size);
-        const connectMsg = `[${ts()}] Folder: ${selectedFolderPath || created.domain}\n[${ts()}] Registered ${created.domain} -> ${targetUrl}`;
-        const initialUploadMsg = `[${ts()}] Reading ${selectedDbFile.name} (${fileSizeLabel})...`;
-
-        const updateUploadStep = (uploadStep: ProvisionStep, extraStep?: ProvisionStep) => {
-          setProvisionJob((prev) => {
-            const base = (prev?.externalSteps || [
-              {
-                step: "site_connect",
-                label: `Connected existing WordPress folder for ${created.domain}`,
-                status: "done",
-                progress: 100,
-                message: connectMsg,
-              },
-            ]).filter((s) => s.step !== "upload" && (!extraStep || s.step !== extraStep.step));
-            const nextSteps = [...base, uploadStep];
-            if (extraStep) nextSteps.push(extraStep);
-            return {
-              sseUrl: prev?.sseUrl,
-              title: `Connecting ${created.domain} & Importing Database...`,
-              defaultShowLogs: true,
-              externalSteps: nextSteps,
-            };
-          });
-        };
-
-        setProvisionJob({
-          title: `Connecting ${created.domain} & Importing Database...`,
-          defaultShowLogs: true,
-          externalSteps: [
-            {
-              step: "site_connect",
-              label: `Connected existing WordPress folder for ${created.domain}`,
-              status: "done",
-              progress: 100,
-              message: connectMsg,
-            },
-            {
-              step: "upload",
-              label: `Reading ${selectedDbFile.name} (${fileSizeLabel})...`,
-              status: "in_progress",
-              progress: 5,
-              message: initialUploadMsg,
-            },
-          ],
-        });
-        showGlobalNotification(
-          "info",
-          `Uploading & importing database for ${created.domain}...`,
-          "Database Import Started",
-          `Site: ${created.domain}\nDump: ${selectedDbFile.name} (${fileSizeLabel})`,
-          { category: "database", target: created.domain }
-        );
-
-        let uploadLog = initialUploadMsg;
-        let lastLoggedBucket = -1;
-        void (async () => {
-          try {
-            const contentBase64 = await fileToBase64(selectedDbFile, (readPct) => {
-              const overallPct = Math.max(5, Math.min(25, Math.round(readPct * 0.25)));
-              updateUploadStep({
-                step: "upload",
-                label: `Preparing ${selectedDbFile.name} (${readPct}%)...`,
-                status: "in_progress",
-                progress: overallPct,
-                message: uploadLog,
-              });
-            });
-
-            uploadLog += `\n[${ts()}] Uploading ${selectedDbFile.name} (${fileSizeLabel}) to local server...`;
-            updateUploadStep({
-              step: "upload",
-              label: `Uploading ${selectedDbFile.name} (0%)...`,
-              status: "in_progress",
-              progress: 25,
-              message: uploadLog,
-            });
-
-            const imp = await api.upload<{
-              ok?: boolean;
-              streaming?: boolean;
-              job_id?: string;
-              sse_url?: string;
-              db_name?: string;
-            }>(
-              `/sites/${created.id}/wordpress/import-database`,
-              {
-                filename: selectedDbFile.name,
-                content_base64: contentBase64,
-                source_url: selectedSourceUrl || undefined,
-                target_url: targetUrl,
-                stream: true,
-              },
-              (loaded, total) => {
-                const upPct = total > 0 ? Math.round((loaded / total) * 100) : 50;
-                const combinedPct = Math.min(98, 25 + Math.round(upPct * 0.73));
-                const bucket = Math.floor(upPct / 25);
-                if (bucket > lastLoggedBucket && upPct < 100) {
-                  lastLoggedBucket = bucket;
-                  uploadLog += `\n[${ts()}] Uploaded ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`;
-                }
-                updateUploadStep({
-                  step: "upload",
-                  label: `Uploading ${selectedDbFile.name}: ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`,
-                  status: "in_progress",
-                  progress: combinedPct,
-                  message: uploadLog,
-                });
-              },
-            );
-
-            uploadLog += `\n[${ts()}] Upload complete — starting server-side import pipeline...`;
-            if (imp.sse_url) {
-              setProvisionJob((prev) => ({
-                sseUrl: imp.sse_url,
-                title: `Connecting ${created.domain} & Importing Database...`,
-                defaultShowLogs: true,
-                externalSteps: [
-                  ...(prev?.externalSteps || []).filter((s) => s.step !== "upload"),
-                  {
-                    step: "upload",
-                    label: `Uploaded ${selectedDbFile.name} (${fileSizeLabel})`,
-                    status: "done",
-                    progress: 100,
-                    message: uploadLog,
-                  },
-                ],
-              }));
-            } else {
-              updateUploadStep(
-                {
-                  step: "upload",
-                  label: `Uploaded ${selectedDbFile.name} (${fileSizeLabel})`,
-                  status: "done",
-                  progress: 100,
-                  message: uploadLog,
-                },
-                {
-                  step: "complete",
-                  label: `Connected ${created.domain}${imp.db_name ? ` (${imp.db_name})` : ""}`,
-                  status: "done",
-                  progress: 100,
-                  message: `${uploadLog}\n[${ts()}] Database imported and wp-config.php updated.`,
-                },
-              );
-              fetchSites();
-            }
-          } catch (impErr) {
-            const errMsg = impErr instanceof Error ? impErr.message : "Database import failed";
-            uploadLog += `\n[${ts()}] ERROR: ${errMsg}`;
-            updateUploadStep(
-              {
-                step: "upload",
-                label: `Failed uploading/importing ${selectedDbFile.name}`,
-                status: "error",
-                message: uploadLog,
-              },
-              {
-                step: "complete",
-                label: `Database import failed for ${created.domain}`,
-                status: "error",
-                message: errMsg,
-              },
-            );
-            setError(errMsg);
-            const info = buildAlertDetails(impErr, {
-              context: `Import ${selectedDbFile.name} for ${created.domain}`,
-              fallback: errMsg,
-              category: "database",
-              target: created.domain,
-            });
-            showGlobalNotification(
-              "error",
-              errMsg,
-              "Database Import Failed",
-              uploadLog ? `${info.details ? `${info.details}\n\n` : ""}── Upload Log ──\n${uploadLog}` : info.details,
-              info.meta
-            );
-          }
-        })();
-      } else {
-        setProvisionJob({
-          siteId: created.id,
-          title: isConnectExisting
-            ? `Connecting Existing Site (${created.domain})...`
-            : `Provisioning ${created.domain}...`,
-          defaultShowLogs: isConnectExisting,
-        });
-        showGlobalNotification(
-          "info",
-          isConnectExisting
-            ? `Connecting existing site ${created.domain}...`
-            : `Creating local site ${created.domain}...`,
-        );
-      }
+      await runAfterCreateFlow(created, {
+        isConnectExisting,
+        isWordPress: isExistingWpDir,
+        runtime: effectiveRuntime,
+        appCommand: effectiveRuntime === "node" ? appCommand : undefined,
+        folderPath: selectedFolderPath,
+        dbFile: selectedDbFile,
+        localDbFile: selectedLocalDb,
+        sourceUrl: selectedSourceUrl,
+        memoryLimitMb: wpMemoryLimitMb,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create site");
     } finally {
@@ -590,8 +469,505 @@ export default function Sites() {
     }
   };
 
-  const handleProvisionComplete = () => {
+  const suggestWorkableMemoryMb = (errMsg: string, curMb: number): { nextMb: number; suggestion?: string } => {
+    const lower = errMsg.toLowerCase();
+    const isMemory =
+      lower.includes("allowed memory size") ||
+      lower.includes("out of memory") ||
+      lower.includes("memory_limit") ||
+      lower.includes("max_allowed_packet") ||
+      lower.includes("packet bigger") ||
+      lower.includes("413") ||
+      lower.includes("exhausted");
+    if (!isMemory) {
+      return { nextMb: curMb };
+    }
+    const nextMb = curMb < 0 ? -1 : curMb < 2048 ? 2048 : curMb < 4096 ? 4096 : -1;
+    const label = nextMb <= 0 ? "Unlimited (-1)" : `${nextMb} MB`;
+    return {
+      nextMb,
+      suggestion: `Workable Fix: Memory limit (${curMb <= 0 ? "Unlimited" : `${curMb} MB`}) was exhausted. Try bumping Import Memory to ${label} and click Retry.`,
+    };
+  };
+
+  const rollbackFailedImport = async (errMsg: string) => {
+    const ctx = activeImportRef.current;
+    activeImportRef.current = null;
+    if (!ctx) return;
+
+    if (ctx.isConnectExisting) {
+      await api.delete(`/sites/${ctx.siteId}?keep_files=true`).catch(() => {});
+      if (ctx.folderPath) {
+        const memAdvice = suggestWorkableMemoryMb(errMsg, ctx.memoryLimitMb);
+        setFailedFolderImports((prev) => ({
+          ...prev,
+          [ctx.folderPath!]: {
+            domain: ctx.domain,
+            runtime: ctx.runtime,
+            appCommand: ctx.appCommand || "",
+            dbFile: ctx.dbFile,
+            localDbPath: ctx.localDbPath,
+            localDb: ctx.localDbObj,
+            sourceUrl: ctx.sourceUrl,
+            dbName: ctx.dbName,
+            memoryLimitMb: memAdvice.nextMb,
+            error: errMsg,
+            memorySuggestion: memAdvice.suggestion,
+          },
+        }));
+      }
+    }
     fetchSites();
+    discoverFolders();
+  };
+
+  const runAfterCreateFlow = async (
+    created: Site,
+    opts: {
+      isConnectExisting: boolean;
+      isWordPress: boolean;
+      runtime?: string;
+      appCommand?: string;
+      folderPath?: string;
+      dbFile: File | null;
+      localDbFile: DetectedDbFile | null;
+      sourceUrl?: string;
+      dbName?: string;
+      memoryLimitMb?: number;
+      applyCompatFixes?: boolean;
+    }
+  ) => {
+    const memLimitMb = opts.memoryLimitMb ?? 1024;
+    activeImportRef.current = opts.isConnectExisting
+      ? {
+          siteId: created.id,
+          domain: created.domain,
+          runtime: opts.runtime || created.runtime || "php",
+          isWordPress: opts.isWordPress,
+          appCommand: opts.appCommand,
+          isConnectExisting: true,
+          folderPath: opts.folderPath,
+          dbFile: opts.dbFile,
+          localDbPath: opts.localDbFile?.path || "",
+          localDbObj: opts.localDbFile,
+          sourceUrl: opts.sourceUrl || "",
+          dbName: opts.dbName || "",
+          memoryLimitMb: memLimitMb,
+        }
+      : null;
+
+    const targetUrl =
+      sslPort && created.ssl_enabled
+        ? buildSiteExternalUrl(created.domain, sslPort, true)
+        : buildSiteExternalUrl(created.domain, conflictInfo?.active_port, false);
+    const hasDbToImport = !!(opts.dbFile || opts.localDbFile);
+    const importEndpoint = opts.isWordPress
+      ? `/sites/${created.id}/wordpress/import-database`
+      : `/sites/${created.id}/database/import`;
+
+    if (hasDbToImport) {
+      const ts = () => new Date().toTimeString().slice(0, 8);
+      const fmtSize = (bytes: number) =>
+        bytes < 1024 * 1024
+          ? `${Math.max(1, Math.round(bytes / 1024))} KB`
+          : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      const dbFilename = opts.dbFile ? opts.dbFile.name : opts.localDbFile!.name;
+      const dbBytes = opts.dbFile ? opts.dbFile.size : opts.localDbFile!.size_bytes;
+      const fileSizeLabel = fmtSize(dbBytes);
+      const connectMsg = `[${ts()}] Folder: ${opts.folderPath || created.domain}\n[${ts()}] Registered ${created.domain} -> ${targetUrl}`;
+      const initialUploadMsg = `[${ts()}] ${opts.dbFile ? `Reading ${dbFilename}` : `Using local file ${dbFilename}`} (${fileSizeLabel})...`;
+
+      const updateUploadStep = (uploadStep: ProvisionStep, extraStep?: ProvisionStep) => {
+        setProvisionJob((prev) => {
+          const base = (prev?.externalSteps || [
+            {
+              step: "site_connect",
+              label: `Connected existing folder for ${created.domain}`,
+              status: "done",
+              progress: 100,
+              message: connectMsg,
+            },
+          ]).filter((s) => s.step !== "upload" && (!extraStep || s.step !== extraStep.step));
+          const nextSteps = [...base, uploadStep];
+          if (extraStep) nextSteps.push(extraStep);
+          return {
+            sseUrl: prev?.sseUrl,
+            title: `Importing ${created.domain} & Database...`,
+            defaultShowLogs: true,
+            externalSteps: nextSteps,
+          };
+        });
+      };
+
+      setProvisionJob({
+        title: `Importing ${created.domain} & Database...`,
+        defaultShowLogs: true,
+        externalSteps: [
+          {
+            step: "site_connect",
+            label: `Connected existing folder for ${created.domain}`,
+            status: "done",
+            progress: 100,
+            message: connectMsg,
+          },
+          {
+            step: "upload",
+            label: opts.dbFile
+              ? `Reading ${dbFilename} (${fileSizeLabel})...`
+              : `Preparing local ${dbFilename} (${fileSizeLabel})...`,
+            status: "in_progress",
+            progress: 5,
+            message: initialUploadMsg,
+          },
+        ],
+      });
+      showGlobalNotification(
+        "info",
+        `Uploading & importing database for ${created.domain}...`,
+        "Database Import Started",
+        `Site: ${created.domain}\nDump: ${dbFilename} (${fileSizeLabel})\nMemory Limit: ${memLimitMb <= 0 ? "Unlimited" : `${memLimitMb} MB`}`,
+        { category: "database", target: created.domain }
+      );
+
+      let uploadLog = initialUploadMsg;
+      let lastLoggedBucket = -1;
+      void (async () => {
+        try {
+          let payload: Record<string, unknown>;
+          if (opts.dbFile) {
+            const contentBase64 = await fileToBase64(opts.dbFile, (readPct) => {
+              const overallPct = Math.max(5, Math.min(25, Math.round(readPct * 0.25)));
+              updateUploadStep({
+                step: "upload",
+                label: `Preparing ${dbFilename} (${readPct}%)...`,
+                status: "in_progress",
+                progress: overallPct,
+                message: uploadLog,
+              });
+            });
+            uploadLog += `\n[${ts()}] Uploading ${dbFilename} (${fileSizeLabel}) to local server...`;
+            updateUploadStep({
+              step: "upload",
+              label: `Uploading ${dbFilename} (0%)...`,
+              status: "in_progress",
+              progress: 25,
+              message: uploadLog,
+            });
+            payload = {
+              filename: dbFilename,
+              content_base64: contentBase64,
+              source_url: opts.sourceUrl || undefined,
+              target_url: targetUrl,
+              db_name: opts.dbName || undefined,
+              memory_limit_mb: memLimitMb,
+              rollback_on_failure: opts.isConnectExisting,
+              apply_compat_fixes: !!opts.applyCompatFixes,
+              stream: true,
+            };
+          } else {
+            payload = {
+              filename: dbFilename,
+              local_path: opts.localDbFile!.path,
+              source_url: opts.sourceUrl || undefined,
+              target_url: targetUrl,
+              db_name: opts.dbName || undefined,
+              memory_limit_mb: memLimitMb,
+              rollback_on_failure: opts.isConnectExisting,
+              apply_compat_fixes: !!opts.applyCompatFixes,
+              stream: true,
+            };
+          }
+
+          const imp = await api.upload<{
+            ok?: boolean;
+            streaming?: boolean;
+            job_id?: string;
+            sse_url?: string;
+            db_name?: string;
+          }>(
+            importEndpoint,
+            payload,
+            (loaded, total) => {
+              const upPct = total > 0 ? Math.round((loaded / total) * 100) : 50;
+              const combinedPct = Math.min(98, 25 + Math.round(upPct * 0.73));
+              const bucket = Math.floor(upPct / 25);
+              if (bucket > lastLoggedBucket && upPct < 100) {
+                lastLoggedBucket = bucket;
+                uploadLog += `\n[${ts()}] Uploaded ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`;
+              }
+              updateUploadStep({
+                step: "upload",
+                label: `Uploading ${dbFilename}: ${fmtSize(loaded)} / ${fmtSize(total)} (${upPct}%)`,
+                status: "in_progress",
+                progress: combinedPct,
+                message: uploadLog,
+              });
+            }
+          );
+
+          uploadLog += `\n[${ts()}] Upload complete — starting server-side import pipeline...`;
+          if (imp.sse_url) {
+            setProvisionJob((prev) => ({
+              sseUrl: imp.sse_url,
+              title: `Importing ${created.domain} & Database...`,
+              defaultShowLogs: true,
+              externalSteps: [
+                ...(prev?.externalSteps || []).filter((s) => s.step !== "upload"),
+                {
+                  step: "upload",
+                  label: `Uploaded ${dbFilename} (${fileSizeLabel})`,
+                  status: "done",
+                  progress: 100,
+                  message: uploadLog,
+                },
+              ],
+            }));
+          } else {
+            activeImportRef.current = null;
+            updateUploadStep(
+              {
+                step: "upload",
+                label: `Uploaded ${dbFilename} (${fileSizeLabel})`,
+                status: "done",
+                progress: 100,
+                message: uploadLog,
+              },
+              {
+                step: "complete",
+                label: `Connected ${created.domain}${imp.db_name ? ` (${imp.db_name})` : ""}`,
+                status: "done",
+                progress: 100,
+                message: `${uploadLog}\n[${ts()}] Database imported cleanly.`,
+              }
+            );
+            if (opts.folderPath) {
+              setFailedFolderImports((prev) => {
+                const copy = { ...prev };
+                delete copy[opts.folderPath!];
+                return copy;
+              });
+            }
+            fetchSites();
+            discoverFolders();
+          }
+        } catch (impErr) {
+          const snapshot = activeImportRef.current;
+          const errBody = impErr instanceof ApiError ? (impErr.body as any) : null;
+          const errMsg = (errBody?.error as string) || (impErr instanceof Error ? impErr.message : "Database import failed");
+          await rollbackFailedImport(errMsg);
+          if (errBody?.requires_compat_confirm && snapshot) {
+            setCompatPrompt({
+              error: errMsg,
+              fixes: Array.isArray(errBody.compat_fixes) ? errBody.compat_fixes : [],
+              targetVersion: errBody.target_version,
+              retry: () => retryImportWithCompat(snapshot),
+            });
+          }
+          uploadLog += `\n[${ts()}] ERROR: ${errMsg}`;
+          if (opts.isConnectExisting) {
+            uploadLog += `\n[${ts()}] Unregistered temporary site registration (website files kept on disk) so you can retry from "Unregistered Folders Ready to Import".`;
+          }
+          updateUploadStep(
+            {
+              step: "upload",
+              label: `Failed uploading/importing ${dbFilename}`,
+              status: "error",
+              message: uploadLog,
+            },
+            {
+              step: "complete",
+              label: `Database import failed for ${created.domain}`,
+              status: "error",
+              message: errMsg,
+            }
+          );
+          setError(errMsg);
+          const info = buildAlertDetails(impErr, {
+            context: `Import ${dbFilename} for ${created.domain}`,
+            fallback: errMsg,
+            category: "database",
+            target: created.domain,
+          });
+          showGlobalNotification(
+            "error",
+            errMsg,
+            "Database Import Failed",
+            uploadLog ? `${info.details ? `${info.details}\n\n` : ""}── Upload Log ──\n${uploadLog}` : info.details,
+            info.meta
+          );
+        }
+      })();
+    } else {
+      activeImportRef.current = null;
+      setProvisionJob({
+        siteId: created.id,
+        title: opts.isConnectExisting
+          ? `Connecting Existing Site (${created.domain})...`
+          : `Provisioning ${created.domain}...`,
+        defaultShowLogs: opts.isConnectExisting,
+      });
+      showGlobalNotification(
+        "info",
+        opts.isConnectExisting
+          ? `Connecting existing site ${created.domain}...`
+          : `Creating local site ${created.domain}...`,
+        opts.isConnectExisting ? "Importing Site" : "Provisioning Site",
+        opts.folderPath ? `Domain: ${created.domain}\nFolder: ${opts.folderPath}` : `Domain: ${created.domain}`,
+        { category: "site", target: created.domain }
+      );
+    }
+  };
+
+  const handleImportDiscoveredFolder = async (req: FolderImportRequest) => {
+    setError("");
+    const effectiveRuntime = req.folder.inspection.is_wordpress ? "php" : req.runtime || "php";
+    const body: Record<string, unknown> = {
+      domain: req.domain,
+      runtime: effectiveRuntime,
+      document_root: req.folder.path,
+      connect_existing: true,
+      stream: true,
+    };
+    if (effectiveRuntime === "php") {
+      body.php_version = phpVersion;
+      if (req.folder.inspection.is_wordpress) body.php_preset = "wordpress";
+    } else if (effectiveRuntime === "node" && req.appCommand) {
+      body.app_command = req.appCommand;
+    }
+
+    try {
+      const created = await api.post<Site>("/sites", body);
+      setFailedFolderImports((prev) => {
+        const copy = { ...prev };
+        delete copy[req.folder.path];
+        return copy;
+      });
+      fetchSites();
+      discoverFolders();
+      await runAfterCreateFlow(created, {
+        isConnectExisting: true,
+        isWordPress: req.folder.inspection.is_wordpress,
+        runtime: effectiveRuntime,
+        appCommand: req.appCommand,
+        folderPath: req.folder.path,
+        dbFile: req.dbFile,
+        localDbFile: req.localDbFile,
+        sourceUrl: req.sourceUrl,
+        dbName: req.dbName,
+        memoryLimitMb: req.memoryLimitMb,
+      });
+    } catch (err) {
+      const info = buildAlertDetails(err, {
+        context: `Import folder ${req.folder.name} as ${req.domain}`,
+        fallback: "Failed to import folder",
+        category: "site",
+        target: req.domain,
+      });
+      setError(info.message);
+      showGlobalNotification("error", info.message, "Folder Import Failed", info.details, info.meta);
+    }
+  };
+
+  const handleOpenFolderInFullForm = (
+    folder: DiscoveredFolder,
+    customDomain: string,
+    dbFile: File | null,
+    memoryLimitMb?: number,
+    localDb?: DetectedDbFile | null
+  ) => {
+    setShowForm(true);
+    setCms("");
+    setCustomRootPath(folder.path);
+    setFolderInspection({
+      ...folder.inspection,
+      detected_db_files: folder.detected_db_files,
+      other_directory_db_files: discoveredRootDbFiles,
+    });
+    const suffix = customDomain.endsWith(".local") ? ".local" : ".test";
+    setDomainSuffix(suffix);
+    setDomain(customDomain);
+    setRuntime(folder.suggested_runtime || "php");
+    setPhpPreset(folder.inspection.is_wordpress ? "wordpress" : "generic");
+    if (folder.inspection.wp_siteurl || localDb?.detected_site_url) {
+      setWpSourceUrl(folder.inspection.wp_siteurl || localDb?.detected_site_url || "");
+    }
+    if (memoryLimitMb !== undefined) setWpMemoryLimitMb(memoryLimitMb);
+    setWpLocalDb(dbFile ? null : localDb || null);
+    if (dbFile) {
+      setWpDbFile(dbFile);
+      setSkipWpDbUpload(false);
+    } else if (localDb) {
+      setWpDbFile(null);
+      setSkipWpDbUpload(false);
+    }
+  };
+
+  const retryImportWithCompat = async (snapshot: NonNullable<typeof activeImportRef.current>) => {
+    setError("");
+    const body: Record<string, unknown> = {
+      domain: snapshot.domain,
+      runtime: snapshot.isWordPress ? "php" : snapshot.runtime || "php",
+      document_root: snapshot.folderPath,
+      connect_existing: snapshot.isConnectExisting,
+      stream: true,
+    };
+    if (body.runtime === "php") {
+      body.php_version = phpVersion;
+      if (snapshot.isWordPress) body.php_preset = "wordpress";
+    } else if (body.runtime === "node" && snapshot.appCommand) {
+      body.app_command = snapshot.appCommand;
+    }
+    try {
+      const recreated = await api.post<Site>("/sites", body);
+      fetchSites();
+      discoverFolders();
+      await runAfterCreateFlow(recreated, {
+        isConnectExisting: snapshot.isConnectExisting,
+        isWordPress: snapshot.isWordPress,
+        runtime: snapshot.runtime,
+        appCommand: snapshot.appCommand,
+        folderPath: snapshot.folderPath,
+        dbFile: snapshot.dbFile,
+        localDbFile: snapshot.localDbObj,
+        sourceUrl: snapshot.sourceUrl || undefined,
+        dbName: snapshot.dbName || undefined,
+        memoryLimitMb: snapshot.memoryLimitMb,
+        applyCompatFixes: true,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed retrying import with compatibility fixes");
+    }
+  };
+
+  const handleProvisionComplete = async (
+    ok?: boolean,
+    errorDetail?: string,
+    compatMeta?: ProvisionCompatMeta
+  ) => {
+    if (ok === false) {
+      const snapshot = activeImportRef.current;
+      await rollbackFailedImport(errorDetail || "Site import failed");
+      if (compatMeta?.requiresCompatConfirm && snapshot) {
+        setCompatPrompt({
+          error: compatMeta.errorDetail || errorDetail || "Database compatibility fixes required",
+          fixes: compatMeta.compatFixes || [],
+          targetVersion: compatMeta.targetVersion,
+          retry: () => retryImportWithCompat(snapshot),
+        });
+      }
+      return;
+    }
+    const ctx = activeImportRef.current;
+    activeImportRef.current = null;
+    if (ctx?.folderPath) {
+      setFailedFolderImports((prev) => {
+        const copy = { ...prev };
+        delete copy[ctx.folderPath!];
+        return copy;
+      });
+    }
+    fetchSites();
+    discoverFolders();
   };
 
   return (
@@ -713,6 +1089,27 @@ export default function Sites() {
           externalSteps={provisionJob.externalSteps}
           onComplete={handleProvisionComplete}
           onDismiss={() => setProvisionJob(null)}
+        />
+      )}
+
+      {/* Discovered folders in Default Websites Directory */}
+      {isDesktopApp() && !isClient && (
+        <DiscoveredFoldersPanel
+          sitesDir={defaultSitesDir}
+          folders={discoveredFolders}
+          rootDbFiles={discoveredRootDbFiles}
+          scanning={scanningFolders}
+          failedImports={failedFolderImports}
+          onDismissFailure={(fp) =>
+            setFailedFolderImports((prev) => {
+              const copy = { ...prev };
+              delete copy[fp];
+              return copy;
+            })
+          }
+          onRescan={discoverFolders}
+          onImport={handleImportDiscoveredFolder}
+          onOpenFullForm={handleOpenFolderInFullForm}
         />
       )}
 
@@ -931,6 +1328,7 @@ export default function Sites() {
                         setCustomRootPath("");
                         setFolderInspection(null);
                         setWpDbFile(null);
+                        setWpLocalDb(null);
                       }}
                       className="px-3 py-2.5 bg-dark-800 hover:bg-dark-700 text-dark-300 border border-dark-600 rounded-lg text-xs"
                       title="Reset to default folder"
@@ -985,66 +1383,140 @@ export default function Sites() {
                 )}
               </div>
 
-              {folderInspection?.is_wordpress && (
+              {folderInspection && !folderInspection.is_empty && folderInspection.exists && folderInspection.is_dir && (
                 <div className="p-4 rounded-lg bg-dark-850 border border-accent-700/50 space-y-3">
                   <div>
                     <h4 className="text-sm font-medium text-dark-50">
-                      Upload WordPress Database Dump
+                      {folderInspection.is_wordpress
+                        ? "Upload WordPress Database Dump"
+                        : "Upload Website Database Dump (Optional)"}
                     </h4>
                     <p className="text-xs text-dark-300 mt-0.5">
-                      Upload your <code className="text-dark-100">.sql</code>,{" "}
-                      <code className="text-dark-100">.sql.gz</code>, <code className="text-dark-100">.zip</code>, or{" "}
-                      <code className="text-dark-100">.sqlite</code> export. DockPanel will rewrite URLs for{" "}
-                      <span className="font-mono text-accent-300">{effectiveDomain || "this site"}</span>, import it into local MariaDB, and update{" "}
-                      <code className="text-dark-100">wp-config.php</code> credentials automatically.
+                      {folderInspection.is_wordpress ? (
+                        <>
+                          Upload your <code className="text-dark-100">.sql</code>,{" "}
+                          <code className="text-dark-100">.sql.gz</code>, <code className="text-dark-100">.zip</code>, or{" "}
+                          <code className="text-dark-100">.sqlite</code> export. DockPanel will rewrite URLs for{" "}
+                          <span className="font-mono text-accent-300">{effectiveDomain || "this site"}</span>, import it into local MariaDB, and update{" "}
+                          <code className="text-dark-100">wp-config.php</code> credentials automatically.
+                        </>
+                      ) : (
+                        <>
+                          Upload a <code className="text-dark-100">.sql</code>,{" "}
+                          <code className="text-dark-100">.sql.gz</code>, <code className="text-dark-100">.zip</code>, or{" "}
+                          <code className="text-dark-100">.sqlite</code> dump to provision a local database and wire{" "}
+                          <code className="text-dark-100">.env</code> credentials automatically.
+                        </>
+                      )}
                     </p>
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div>
+                    <div className="md:col-span-2">
                       <label htmlFor="wp-db-upload" className="block text-xs font-medium text-dark-200 mb-1">
                         Database File
                       </label>
-                      <input
-                        id="wp-db-upload"
-                        type="file"
-                        accept=".sql,.gz,.sql.gz,.zip,.sqlite,.db"
-                        disabled={skipWpDbUpload}
-                        onChange={(e) => setWpDbFile(e.target.files?.[0] || null)}
-                        className="w-full text-xs text-dark-200 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-accent-600 file:text-white hover:file:bg-accent-500 disabled:opacity-40"
-                      />
-                      {wpDbFile && (
-                        <p className="text-[11px] text-emerald-300 mt-1 font-mono">
-                          Selected: {wpDbFile.name} ({Math.max(1, Math.round(wpDbFile.size / 1024))} KB)
-                        </p>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <input
+                          id="wp-db-upload"
+                          type="file"
+                          accept=".sql,.gz,.sql.gz,.zip,.sqlite,.db"
+                          disabled={skipWpDbUpload}
+                          onChange={(e) => {
+                            const f = e.target.files?.[0] || null;
+                            setWpDbFile(f);
+                            if (f) setWpLocalDb(null);
+                          }}
+                          className="text-xs text-dark-200 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-medium file:bg-accent-600 file:text-white hover:file:bg-accent-500 disabled:opacity-40"
+                        />
+                        {wpDbFile && (
+                          <span className="text-[11px] text-emerald-300 font-mono">
+                            Selected: {wpDbFile.name} ({Math.max(1, Math.round(wpDbFile.size / 1024))} KB)
+                          </span>
+                        )}
+                        {(wpDbFile || wpLocalDb) && !skipWpDbUpload && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setWpDbFile(null);
+                              setWpLocalDb(null);
+                            }}
+                            className="text-[11px] text-dark-400 hover:text-dark-100 underline"
+                          >
+                            Clear DB
+                          </button>
+                        )}
+                      </div>
+                      {!skipWpDbUpload && (
+                        <DirectoryDbSelector
+                          detectedDbFiles={folderInspection.detected_db_files || []}
+                          otherDirectoryDbFiles={
+                            folderInspection.other_directory_db_files || discoveredRootDbFiles
+                          }
+                          selectedLocalDb={wpLocalDb}
+                          uploadedFile={wpDbFile}
+                          siteDir={folderInspection.path}
+                          sitesRootDir={defaultSitesDir}
+                          onSelectLocalDb={(dbItem) => {
+                            setWpLocalDb(dbItem);
+                            if (dbItem) {
+                              setWpDbFile(null);
+                              if (!wpSourceUrl && dbItem.detected_site_url) {
+                                setWpSourceUrl(dbItem.detected_site_url);
+                              }
+                            }
+                          }}
+                        />
                       )}
                     </div>
 
+                    {folderInspection.is_wordpress && (
+                      <div>
+                        <label htmlFor="wp-source-url" className="block text-xs font-medium text-dark-200 mb-1">
+                          Source Site URL <span className="text-dark-400 font-normal">(auto-detected if blank)</span>
+                        </label>
+                        <input
+                          id="wp-source-url"
+                          type="url"
+                          disabled={skipWpDbUpload}
+                          value={wpSourceUrl}
+                          onChange={(e) => setWpSourceUrl(e.target.value)}
+                          placeholder="https://old-website.com"
+                          className="w-full px-3 py-1.5 bg-dark-900 border border-dark-600 rounded-lg text-xs text-dark-100 font-mono focus:outline-none focus:border-accent-500 disabled:opacity-40"
+                        />
+                      </div>
+                    )}
                     <div>
-                      <label htmlFor="wp-source-url" className="block text-xs font-medium text-dark-200 mb-1">
-                        Source Site URL <span className="text-dark-400 font-normal">(auto-detected if blank)</span>
+                      <label htmlFor="wp-memory-limit" className="block text-xs font-medium text-dark-200 mb-1">
+                        Import PHP Memory Limit <span className="text-dark-400 font-normal">(for large SQL dumps)</span>
                       </label>
-                      <input
-                        id="wp-source-url"
-                        type="url"
+                      <select
+                        id="wp-memory-limit"
                         disabled={skipWpDbUpload}
-                        value={wpSourceUrl}
-                        onChange={(e) => setWpSourceUrl(e.target.value)}
-                        placeholder="https://old-website.com"
+                        value={wpMemoryLimitMb}
+                        onChange={(e) => setWpMemoryLimitMb(parseInt(e.target.value, 10))}
                         className="w-full px-3 py-1.5 bg-dark-900 border border-dark-600 rounded-lg text-xs text-dark-100 font-mono focus:outline-none focus:border-accent-500 disabled:opacity-40"
-                      />
+                      >
+                        {MEMORY_LIMIT_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   </div>
 
-                  <label className="inline-flex items-center gap-2 text-xs text-dark-300 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={skipWpDbUpload}
-                      onChange={(e) => setSkipWpDbUpload(e.target.checked)}
-                      className="rounded border-dark-600 bg-dark-800 text-accent-500 focus:ring-0"
-                    />
-                    Skip database upload for now (connect existing WordPress files only)
-                  </label>
+                  {folderInspection.is_wordpress && (
+                    <label className="inline-flex items-center gap-2 text-xs text-dark-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={skipWpDbUpload}
+                        onChange={(e) => setSkipWpDbUpload(e.target.checked)}
+                        className="rounded border-dark-600 bg-dark-800 text-accent-500 focus:ring-0"
+                      />
+                      Skip database upload for now (connect existing WordPress files only)
+                    </label>
+                  )}
                 </div>
               )}
             </div>
@@ -1761,6 +2233,24 @@ export default function Sites() {
           );
         }}
       />
+      {compatPrompt && (
+        <ConfirmDialog
+          tone="warn"
+          title="Database Compatibility Confirmation Required"
+          label={`Error on target server${compatPrompt.targetVersion ? ` (${compatPrompt.targetVersion})` : ""}: ${compatPrompt.error}`}
+          consequences={[
+            ...compatPrompt.fixes,
+            "Your original local .sql dump file is never modified — fixes only apply during import into local MariaDB.",
+          ]}
+          confirmLabel="Apply Compatibility Fixes & Retry"
+          onConfirm={() => {
+            const runRetry = compatPrompt.retry;
+            setCompatPrompt(null);
+            void runRetry();
+          }}
+          onCancel={() => setCompatPrompt(null)}
+        />
+      )}
       </div>
     </div>
   );

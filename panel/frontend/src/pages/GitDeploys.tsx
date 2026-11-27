@@ -1,5 +1,5 @@
 import { useAuth } from "../context/AuthContext";
-import { Navigate } from "react-router-dom";
+import { Navigate, Link } from "react-router-dom";
 import { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { api, ApiError } from "../api";
@@ -166,6 +166,8 @@ export default function GitDeploys() {
   const [approvals, setApprovals] = useState<DeployApproval[]>([]);
   const [resolving, setResolving] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: string; id: string; label: string } | null>(null);
+  const [adminSites, setAdminSites] = useState<{ id: string; domain: string }[]>([]);
+  const [selectedAdminSiteId, setSelectedAdminSiteId] = useState("");
 
   // Form state
   const [formName, setFormName] = useState("");
@@ -582,6 +584,70 @@ export default function GitDeploys() {
       </div>
 
       <div className="p-6 lg:p-8">
+
+      {/* Admin: Initialize / Connect Git Repo inside any Website Directory */}
+      <div className="mb-6 p-4 rounded-xl bg-dark-800 border border-dark-600 flex items-center justify-between gap-4 flex-wrap">
+        <div>
+          <h2 className="text-sm font-semibold text-dark-100">
+            Site Git Repositories (Initialize or Connect Existing)
+          </h2>
+          <p className="text-xs text-dark-400 mt-0.5">
+            Select a website to run <code className="text-dark-200">git init</code> or link an existing GitHub/GitLab repository inside its folder.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <select
+            value={selectedAdminSiteId}
+            onFocus={() => {
+              if (adminSites.length === 0) {
+                api
+                  .get<{ id: string; domain: string }[]>("/admin/sites")
+                  .then((rows) => {
+                    const list = Array.isArray(rows) ? rows : [];
+                    setAdminSites(list);
+                    if (!selectedAdminSiteId && list[0]) setSelectedAdminSiteId(list[0].id);
+                  })
+                  .catch(() => {});
+              }
+            }}
+            onChange={(e) => setSelectedAdminSiteId(e.target.value)}
+            aria-label="Select website for Git setup"
+            className="px-3 py-1.5 bg-dark-900 border border-dark-600 rounded-lg text-xs font-mono text-dark-100 min-w-[210px]"
+          >
+            <option value="">Choose a website...</option>
+            {adminSites.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.domain}
+              </option>
+            ))}
+          </select>
+          {selectedAdminSiteId ? (
+            <Link
+              to={`/sites/${selectedAdminSiteId}/deploy`}
+              className="px-3.5 py-1.5 rounded-lg bg-accent-600 hover:bg-accent-700 text-white text-xs font-medium transition-colors"
+            >
+              Manage Site Git Repo &rarr;
+            </Link>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                api
+                  .get<{ id: string; domain: string }[]>("/admin/sites")
+                  .then((rows) => {
+                    const list = Array.isArray(rows) ? rows : [];
+                    setAdminSites(list);
+                    if (list[0]) setSelectedAdminSiteId(list[0].id);
+                  })
+                  .catch(() => {});
+              }}
+              className="px-3 py-1.5 rounded-lg bg-dark-700 hover:bg-dark-600 text-xs text-dark-200"
+            >
+              Load Websites
+            </button>
+          )}
+        </div>
+      </div>
 
       {/* Active Incident Blocker Panel */}
       {activeIncidentBlock && (

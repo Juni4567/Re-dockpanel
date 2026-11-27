@@ -4,6 +4,7 @@ mod backups;
 mod databases;
 mod downloads;
 mod files;
+mod git_repo;
 mod hosts_manager;
 pub mod live_sync;
 pub mod mail_catcher;
@@ -584,20 +585,33 @@ async fn create_site_handler(
 async fn delete_site_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    let keep_files = params
+        .get("keep_files")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
     let domain = state.get_site(&id).map(|s| s.domain).unwrap_or_else(|| id.clone());
-    let ok = state.delete_site(&id);
+    let ok = if keep_files {
+        state.unregister_site_keep_files(&id)
+    } else {
+        state.delete_site(&id)
+    };
     if ok {
         state.record_event(
-            "delete_site",
+            if keep_files { "unregister_site" } else { "delete_site" },
             "site",
             &domain,
-            "Site Deleted",
-            &format!("Deleted local site {}", domain),
+            if keep_files { "Site Unregistered" } else { "Site Deleted" },
+            &format!(
+                "{} local site {}",
+                if keep_files { "Unregistered" } else { "Deleted" },
+                domain
+            ),
             "info",
         );
     }
-    Json(serde_json::json!({ "success": ok }))
+    Json(serde_json::json!({ "success": ok, "kept_files": keep_files }))
 }
 
 async fn start_site_handler(
@@ -3345,12 +3359,78 @@ async fn desktop_pick_folder_handler(
         .map(String::from)
         .unwrap_or_else(|| state.get_default_sites_dir().to_string_lossy().to_string());
 
-    let pick_res: Result<Option<String>, String> = tokio::task::spawn_blocking(move || {
+    let dialog_title = payload
+        .as_ref()
+        .and_then(|p| p.get("description"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| "Select website folder (empty or existing website)".to_string());
+
+    let pick_res = pick_windows_folder_blocking(initial_dir, dialog_title).await;
+
+    match pick_res {
+        Ok(Some(path)) => {
+            let folder_path = std::path::PathBuf::from(&path);
+            let st_clone = state.clone();
+            let fp_clone = folder_path.clone();
+            let (inspection, detected_db_files, other_directory_db_files) =
+                tokio::task::spawn_blocking(move || {
+                    st_clone.approve_db_scan_dir(&fp_clone);
+                    let insp = wordpress::inspect_site_folder(&fp_clone);
+                    let name_hint = fp_clone
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let db_files = scan_folder_db_files(&fp_clone, Some(&name_hint), Some(&insp));
+                    let root_dir = st_clone.get_default_sites_dir();
+                    st_clone.approve_db_scan_dir(&root_dir);
+                    let other_files = scan_other_directory_db_files(
+                        &root_dir,
+                        Some(&fp_clone),
+                        Some(&name_hint),
+                        Some(&insp),
+                    );
+                    (insp, db_files, other_files)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    (
+                        wordpress::inspect_site_folder(std::path::Path::new(&path)),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                });
+            Json(serde_json::json!({
+                "cancelled": false,
+                "path": path,
+                "inspection": inspection,
+                "detected_db_files": detected_db_files,
+                "other_directory_db_files": other_directory_db_files,
+            }))
+            .into_response()
+        }
+        Ok(None) => Json(serde_json::json!({ "cancelled": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn pick_windows_folder_blocking(
+    initial_dir: String,
+    description: String,
+) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             let escaped = initial_dir.replace('\'', "''");
+            let escaped_desc = description.replace('\'', "''");
             let ps = format!(
                 r#"
 Add-Type -AssemblyName System.Windows.Forms
@@ -3364,7 +3444,7 @@ $owner.Location = New-Object System.Drawing.Point(-32000, -32000)
 $owner.Size = New-Object System.Drawing.Size(1, 1)
 $owner.Show()
 $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-$dlg.Description = 'Select website folder (empty or existing website)'
+$dlg.Description = '{escaped_desc}'
 $dlg.UseDescriptionForTitle = $true
 $dlg.ShowNewFolderButton = $true
 $init = '{escaped}'
@@ -3402,41 +3482,516 @@ if ($res -eq [System.Windows.Forms.DialogResult]::OK) {{
         }
         #[cfg(not(windows))]
         {
-            let _ = initial_dir;
+            let _ = (initial_dir, description);
             Ok(None)
         }
     })
     .await
     .map_err(|e| e.to_string())
-    .and_then(|r| r);
+    .and_then(|r| r)
+}
 
-    match pick_res {
-        Ok(Some(path)) => {
-            let inspection = wordpress::inspect_site_folder(std::path::Path::new(&path));
-            Json(serde_json::json!({
-                "cancelled": false,
-                "path": path,
-                "inspection": inspection,
-            }))
-            .into_response()
+#[derive(Debug, Clone, serde::Serialize)]
+struct DetectedDbFile {
+    name: String,
+    relative_path: String,
+    path: String,
+    size_bytes: u64,
+    source_scope: String,
+    source_dir: String,
+    detected_prefix: Option<String>,
+    detected_site_url: Option<String>,
+    detected_db_name: Option<String>,
+    matches_site: Option<bool>,
+    match_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DiscoveredFolderCandidate {
+    name: String,
+    path: String,
+    suggested_domain: String,
+    suggested_runtime: String,
+    detected_db_files: Vec<DetectedDbFile>,
+    inspection: wordpress::FolderInspection,
+}
+
+fn normalize_dir_key(path: &std::path::Path) -> String {
+    let raw = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let no_unc = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    no_unc
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn suggest_domain_for_folder(
+    folder_name: &str,
+    taken_domains: &std::collections::HashSet<String>,
+) -> String {
+    let lower = folder_name.trim().to_ascii_lowercase();
+    let (base_stem, preferred_suffix) = if let Some(s) = lower.strip_suffix(".test") {
+        (s, ".test")
+    } else if let Some(s) = lower.strip_suffix(".local") {
+        (s, ".local")
+    } else {
+        let mut stripped = lower.as_str();
+        for ext in [".com", ".net", ".org", ".io", ".dev", ".co", ".app", ".shop", ".store"] {
+            if let Some(s) = stripped.strip_suffix(ext) {
+                if !s.is_empty() {
+                    stripped = s;
+                    break;
+                }
+            }
         }
-        Ok(None) => Json(serde_json::json!({ "cancelled": true })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e })),
-        )
-            .into_response(),
+        (stripped, ".test")
+    };
+
+    let mut clean: String = base_stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while clean.contains("--") {
+        clean = clean.replace("--", "-");
     }
+    let clean = clean.trim_matches('-').to_string();
+    let stem = if clean.is_empty() {
+        "site".to_string()
+    } else {
+        clean.chars().take(48).collect()
+    };
+
+    let first = format!("{}{}", stem, preferred_suffix);
+    if !taken_domains.contains(&first) {
+        return first;
+    }
+    for n in 2..=99 {
+        let next = format!("{}-{}{}", stem, n, preferred_suffix);
+        if !taken_domains.contains(&next) {
+            return next;
+        }
+    }
+    format!("{}-{}{}", stem, uuid::Uuid::new_v4().simple(), preferred_suffix)
+}
+
+fn is_supported_db_dump_filename(lower_name: &str, rel_lower: &str) -> bool {
+    if lower_name.ends_with(".sql")
+        || lower_name.ends_with(".sql.gz")
+        || lower_name.ends_with(".sqlite")
+        || lower_name.ends_with(".db")
+    {
+        return true;
+    }
+    if lower_name.ends_with(".zip") {
+        let in_db_subdir = ["db", "database", "sql", "backup", "backups", "dump", "dumps", "ai1wm-backups", "updraft"]
+            .iter()
+            .any(|seg| rel_lower.contains(&format!("{}/", seg)));
+        return in_db_subdir
+            || lower_name.contains("db")
+            || lower_name.contains("sql")
+            || lower_name.contains("dump")
+            || lower_name.contains("backup")
+            || lower_name.contains("database");
+    }
+    false
+}
+
+fn should_skip_scan_subdir(lower_name: &str) -> bool {
+    lower_name.starts_with('.')
+        || matches!(
+            lower_name,
+            "node_modules"
+                | "__pycache__"
+                | "vendor"
+                | "wp-includes"
+                | "wp-admin"
+                | ".git"
+                | ".svn"
+                | ".hg"
+                | ".next"
+                | "dist"
+                | "build"
+                | "target"
+                | "$recycle.bin"
+                | "system volume information"
+        )
+}
+
+fn url_host_stem(url_or_domain: &str) -> String {
+    let no_scheme = url_or_domain
+        .trim()
+        .to_ascii_lowercase()
+        .replace("https://", "")
+        .replace("http://", "");
+    let host = no_scheme.split('/').next().unwrap_or("").trim_start_matches("www.");
+    let stem = host.split('.').next().unwrap_or(host);
+    stem.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn evaluate_db_file_match(
+    folder_name_hint: Option<&str>,
+    inspection: Option<&wordpress::FolderInspection>,
+    filename: &str,
+    relative_path: &str,
+    peek: &wordpress::SqlDumpPeek,
+    _is_in_site_folder: bool,
+) -> (Option<bool>, Option<String>) {
+    let mut matches: Option<bool> = None;
+    let mut reason: Option<String> = None;
+
+    if let Some(insp) = inspection {
+        if let (Some(cfg_prefix), Some(dump_prefix)) =
+            (insp.wp_table_prefix.as_deref(), peek.prefix.as_deref())
+        {
+            if cfg_prefix.eq_ignore_ascii_case(dump_prefix) {
+                matches = Some(true);
+                reason = Some(format!("Table prefix matches wp-config.php ({})", dump_prefix));
+            } else {
+                return (
+                    Some(false),
+                    Some(format!(
+                        "Table prefix '{}' differs from wp-config.php ('{}')",
+                        dump_prefix, cfg_prefix
+                    )),
+                );
+            }
+        }
+
+        if matches.is_none() {
+            if let (Some(cfg_db), Some(dump_db)) =
+                (insp.wp_db_name.as_deref(), peek.db_name.as_deref())
+            {
+                if cfg_db.eq_ignore_ascii_case(dump_db) {
+                    matches = Some(true);
+                    reason = Some(format!("Database name matches wp-config.php ({})", dump_db));
+                }
+            }
+        }
+
+        if let (Some(cfg_url), Some(dump_url)) =
+            (insp.wp_siteurl.as_deref(), peek.site_url.as_deref())
+        {
+            let cfg_stem = url_host_stem(cfg_url);
+            let dump_stem = url_host_stem(dump_url);
+            if !cfg_stem.is_empty() && !dump_stem.is_empty() {
+                if cfg_stem == dump_stem {
+                    if matches.is_none() {
+                        matches = Some(true);
+                        reason = Some(format!("Site URL matches config ({})", dump_url));
+                    }
+                } else if matches.is_none() {
+                    return (
+                        Some(false),
+                        Some(format!(
+                            "Dump URL ({}) appears to belong to a different site ({})",
+                            dump_url, cfg_url
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    if matches.is_none() {
+        if let Some(folder_name) = folder_name_hint {
+            let folder_stem = url_host_stem(folder_name);
+            if folder_stem.len() >= 3 {
+                if let Some(dump_url) = peek.site_url.as_deref() {
+                    let dump_stem = url_host_stem(dump_url);
+                    if !dump_stem.is_empty() && (dump_stem.contains(&folder_stem) || folder_stem.contains(&dump_stem)) {
+                        matches = Some(true);
+                        reason = Some(format!("Dump URL ({}) matches folder '{}'", dump_url, folder_name));
+                    }
+                }
+                if matches.is_none() {
+                    let target_text = format!("{} {}", relative_path, filename)
+                        .to_ascii_lowercase()
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .collect::<String>();
+                    if target_text.contains(&folder_stem) {
+                        matches = Some(true);
+                        reason = Some(format!("Filename/path matches '{}'", folder_name));
+                    }
+                }
+            }
+        }
+    }
+
+    (matches, reason)
+}
+
+fn scan_directory_db_files_recursive(
+    scan_root: &std::path::Path,
+    source_scope: &str,
+    exclude_dir: Option<&std::path::Path>,
+    folder_name_hint: Option<&str>,
+    inspection: Option<&wordpress::FolderInspection>,
+    max_depth: usize,
+    max_results: usize,
+) -> Vec<DetectedDbFile> {
+    if !scan_root.is_dir() {
+        return Vec::new();
+    }
+
+    let exclude_key = exclude_dir.map(normalize_dir_key);
+    let source_dir_label = scan_root.to_string_lossy().to_string();
+    let is_in_site_folder = source_scope == "folder";
+    let mut found = Vec::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, String, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((scan_root.to_path_buf(), String::new(), 0));
+    let mut visited_dirs = 0usize;
+
+    while let Some((cur_dir, rel_prefix, depth)) = queue.pop_front() {
+        visited_dirs += 1;
+        if visited_dirs > 600 || found.len() >= max_results {
+            break;
+        }
+        if depth > 0 {
+            if let Some(ref ex) = exclude_key {
+                if normalize_dir_key(&cur_dir) == *ex {
+                    continue;
+                }
+            }
+        }
+
+        let Ok(entries) = std::fs::read_dir(&cur_dir) else {
+            continue;
+        };
+
+        let mut entry_list: Vec<std::fs::DirEntry> = entries.flatten().collect();
+        entry_list.sort_by_key(|e| e.file_name().to_string_lossy().to_ascii_lowercase());
+
+        for entry in entry_list {
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lower_name = name.to_ascii_lowercase();
+
+            if p.is_dir() {
+                if depth < max_depth && !should_skip_scan_subdir(&lower_name) {
+                    if let Some(ref ex) = exclude_key {
+                        if normalize_dir_key(&p) == *ex {
+                            continue;
+                        }
+                    }
+                    queue.push_back((p, format!("{}{}/", rel_prefix, name), depth + 1));
+                }
+                continue;
+            }
+
+            if !p.is_file() {
+                continue;
+            }
+            let relative_path = format!("{}{}", rel_prefix, name);
+            let rel_lower = relative_path.to_ascii_lowercase();
+            if !is_supported_db_dump_filename(&lower_name, &rel_lower) {
+                continue;
+            }
+
+            let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let peek = wordpress::peek_db_file_metadata(&p);
+            let (matches_site, match_reason) = evaluate_db_file_match(
+                folder_name_hint,
+                inspection,
+                &name,
+                &relative_path,
+                &peek,
+                is_in_site_folder,
+            );
+
+            found.push(DetectedDbFile {
+                name,
+                relative_path,
+                path: p.to_string_lossy().to_string(),
+                size_bytes,
+                source_scope: source_scope.to_string(),
+                source_dir: source_dir_label.clone(),
+                detected_prefix: peek.prefix,
+                detected_site_url: peek.site_url,
+                detected_db_name: peek.db_name,
+                matches_site,
+                match_reason,
+            });
+            if found.len() >= max_results {
+                break;
+            }
+        }
+    }
+
+    found.sort_by(|a, b| {
+        let rank = |item: &DetectedDbFile| -> (u8, usize) {
+            let match_rank = match item.matches_site {
+                Some(true) => 0,
+                None => 1,
+                Some(false) => 2,
+            };
+            let depth_rank = item.relative_path.matches('/').count();
+            (match_rank, depth_rank)
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.relative_path.cmp(&b.relative_path))
+    });
+    found
+}
+
+fn scan_folder_db_files(
+    dir: &std::path::Path,
+    folder_name_hint: Option<&str>,
+    inspection: Option<&wordpress::FolderInspection>,
+) -> Vec<DetectedDbFile> {
+    scan_directory_db_files_recursive(
+        dir,
+        "folder",
+        None,
+        folder_name_hint,
+        inspection,
+        6,
+        40,
+    )
+}
+
+fn scan_other_directory_db_files(
+    root_dir: &std::path::Path,
+    exclude_dir: Option<&std::path::Path>,
+    folder_name_hint: Option<&str>,
+    inspection: Option<&wordpress::FolderInspection>,
+) -> Vec<DetectedDbFile> {
+    scan_directory_db_files_recursive(
+        root_dir,
+        "sites_dir",
+        exclude_dir,
+        folder_name_hint,
+        inspection,
+        4,
+        40,
+    )
+}
+
+fn discover_unregistered_folders(state: &AppState) -> (PathBuf, Vec<DiscoveredFolderCandidate>, Vec<DetectedDbFile>) {
+    let root_dir = state.get_default_sites_dir();
+    state.approve_db_scan_dir(&root_dir);
+    let sites = state.list_sites();
+    let mut registered_dirs = std::collections::HashSet::new();
+    let mut taken_domains = std::collections::HashSet::new();
+
+    for site in &sites {
+        registered_dirs.insert(normalize_dir_key(&state.site_dir(site)));
+        taken_domains.insert(site.domain.trim().to_ascii_lowercase());
+        for alias in &site.aliases {
+            taken_domains.insert(alias.trim().to_ascii_lowercase());
+        }
+    }
+
+    let mut out = Vec::new();
+    if !root_dir.is_dir() {
+        return (root_dir, out, Vec::new());
+    }
+
+    let Ok(entries) = std::fs::read_dir(&root_dir) else {
+        return (root_dir, out, Vec::new());
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let lower_name = name.to_ascii_lowercase();
+        if name.starts_with('.')
+            || matches!(
+                lower_name.as_str(),
+                "node_modules" | "__pycache__" | "vendor" | "$recycle.bin" | "system volume information"
+            )
+        {
+            continue;
+        }
+
+        if registered_dirs.contains(&normalize_dir_key(&path)) {
+            continue;
+        }
+
+        let inspection = wordpress::inspect_site_folder(&path);
+        let suggested_domain = suggest_domain_for_folder(&name, &taken_domains);
+        taken_domains.insert(suggested_domain.clone());
+
+        let suggested_runtime = match inspection.detected_type.as_str() {
+            "wordpress" | "php" => "php",
+            "node" => "node",
+            _ => "static",
+        }
+        .to_string();
+
+        let detected_db_files = scan_folder_db_files(&path, Some(&name), Some(&inspection));
+
+        out.push(DiscoveredFolderCandidate {
+            name,
+            path: path.to_string_lossy().to_string(),
+            suggested_domain,
+            suggested_runtime,
+            detected_db_files,
+            inspection,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        let rank = |c: &DiscoveredFolderCandidate| -> (u8, u8) {
+            let empty_rank = if c.inspection.is_empty { 1 } else { 0 };
+            let type_rank = match c.inspection.detected_type.as_str() {
+                "wordpress" => 0,
+                "php" => 1,
+                "node" => 2,
+                "static" => 3,
+                _ => 4,
+            };
+            (empty_rank, type_rank)
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+    });
+
+    let root_db_files = scan_other_directory_db_files(&root_dir, None, None, None);
+
+    (root_dir, out, root_db_files)
+}
+
+async fn desktop_discover_folders_handler(State(state): State<Arc<AppState>>) -> Response {
+    let (sites_dir, folders, root_db_files) =
+        tokio::task::spawn_blocking(move || discover_unregistered_folders(&state))
+            .await
+            .unwrap_or_else(|_| (PathBuf::new(), Vec::new(), Vec::new()));
+    Json(serde_json::json!({
+        "sites_dir": sites_dir.to_string_lossy().to_string(),
+        "folders": folders,
+        "root_db_files": root_db_files,
+    }))
+    .into_response()
 }
 
 async fn desktop_inspect_folder_handler(
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let raw = payload
         .get("path")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim();
+        .trim()
+        .to_string();
     if raw.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -3444,31 +3999,228 @@ async fn desktop_inspect_folder_handler(
         )
             .into_response();
     }
-    let inspection = wordpress::inspect_site_folder(std::path::Path::new(raw));
-    Json(inspection).into_response()
+    let st_clone = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let target = std::path::PathBuf::from(&raw);
+        st_clone.approve_db_scan_dir(&target);
+        let inspection = wordpress::inspect_site_folder(&target);
+        let name_hint = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let detected_db_files = scan_folder_db_files(&target, Some(&name_hint), Some(&inspection));
+        let root_dir = st_clone.get_default_sites_dir();
+        st_clone.approve_db_scan_dir(&root_dir);
+        let other_directory_db_files = scan_other_directory_db_files(
+            &root_dir,
+            Some(&target),
+            Some(&name_hint),
+            Some(&inspection),
+        );
+        let mut val = serde_json::to_value(&inspection).unwrap_or_default();
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "detected_db_files".to_string(),
+                serde_json::to_value(&detected_db_files).unwrap_or_default(),
+            );
+            obj.insert(
+                "other_directory_db_files".to_string(),
+                serde_json::to_value(&other_directory_db_files).unwrap_or_default(),
+            );
+        }
+        val
+    })
+    .await
+    .unwrap_or_else(|_| serde_json::json!({ "error": "Inspection failed" }));
+    Json(result).into_response()
 }
 
-async fn wordpress_import_database_handler(
+async fn desktop_scan_db_files_handler(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<serde_json::Value>,
+    Json(payload): Json<Option<serde_json::Value>>,
 ) -> Response {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let payload_val = payload.unwrap_or_else(|| serde_json::json!({}));
+    let pick = payload_val
+        .get("pick")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let requested_dir = payload_val
+        .get("dir")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let site_id = payload_val
+        .get("site_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let requested_site_dir = payload_val
+        .get("site_dir")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
-    let Some(site) = state.get_site(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "Site not found" })),
+    let site_dir_path = site_id
+        .as_deref()
+        .and_then(|id| state.get_site(id))
+        .map(|s| state.site_dir(&s))
+        .or_else(|| requested_site_dir.map(PathBuf::from));
+
+    let root_sites_dir = state.get_default_sites_dir();
+    let initial_dir = requested_dir
+        .clone()
+        .or_else(|| {
+            site_dir_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| root_sites_dir.to_string_lossy().to_string());
+
+    let scan_dir_str = if pick {
+        match pick_windows_folder_blocking(
+            initial_dir,
+            "Select directory to scan (including subdirectories) for .sql / database dumps"
+                .to_string(),
         )
-            .into_response();
+        .await
+        {
+            Ok(Some(chosen)) => chosen,
+            Ok(None) => return Json(serde_json::json!({ "cancelled": true })).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        initial_dir
     };
 
-    let filename = payload
+    let target_dir = PathBuf::from(&scan_dir_str);
+    if !target_dir.is_dir() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Directory '{}' does not exist", scan_dir_str)
+            })),
+        )
+            .into_response();
+    }
+
+    let st_clone = state.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        st_clone.approve_db_scan_dir(&target_dir);
+        let root_dir = st_clone.get_default_sites_dir();
+        st_clone.approve_db_scan_dir(&root_dir);
+
+        let (inspection, folder_name_hint) = if let Some(ref sd) = site_dir_path {
+            let insp = wordpress::inspect_site_folder(sd);
+            let name = sd
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (Some(insp), Some(name))
+        } else {
+            let insp = wordpress::inspect_site_folder(&target_dir);
+            let name = target_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (
+                if insp.is_wordpress || !insp.is_empty {
+                    Some(insp)
+                } else {
+                    None
+                },
+                Some(name),
+            )
+        };
+
+        let is_same_as_site = site_dir_path
+            .as_ref()
+            .is_some_and(|sd| normalize_dir_key(sd) == normalize_dir_key(&target_dir));
+        let scope = if is_same_as_site { "folder" } else { "directory" };
+        let files = scan_directory_db_files_recursive(
+            &target_dir,
+            scope,
+            None,
+            folder_name_hint.as_deref(),
+            inspection.as_ref(),
+            6,
+            60,
+        );
+        let sites_dir_files = scan_other_directory_db_files(
+            &root_dir,
+            Some(&target_dir),
+            folder_name_hint.as_deref(),
+            inspection.as_ref(),
+        );
+
+        serde_json::json!({
+            "cancelled": false,
+            "dir": target_dir.to_string_lossy().to_string(),
+            "sites_dir": root_dir.to_string_lossy().to_string(),
+            "files": files,
+            "sites_dir_files": sites_dir_files,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }));
+
+    Json(res).into_response()
+}
+
+fn read_uploaded_or_local_db_bytes(
+    state: &AppState,
+    site: &state::LocalSite,
+    payload: &serde_json::Value,
+) -> Result<(String, Vec<u8>), (StatusCode, String)> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+    let local_path = payload
+        .get("local_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut filename = payload
         .get("filename")
         .and_then(|v| v.as_str())
-        .unwrap_or("database.sql")
+        .unwrap_or("")
         .trim()
         .to_string();
+
+    if let Some(lp) = local_path {
+        let p = PathBuf::from(lp);
+        if !p.is_file() {
+            return Err((StatusCode::BAD_REQUEST, "Selected local database file not found".to_string()));
+        }
+        let canonical = std::fs::canonicalize(&p).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        if !state.is_approved_db_path(site, &canonical) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Local database path must reside inside the site, default websites directory, or a scanned directory".to_string(),
+            ));
+        }
+        if filename.is_empty() {
+            filename = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "database.sql".to_string());
+        }
+        let bytes = std::fs::read(&canonical)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Failed reading local database file: {}", e)))?;
+        return Ok((filename, bytes));
+    }
+
+    if filename.is_empty() {
+        filename = "database.sql".to_string();
+    }
     let b64_raw = payload
         .get("content_base64")
         .or_else(|| payload.get("content"))
@@ -3477,23 +4229,64 @@ async fn wordpress_import_database_handler(
         .trim();
 
     if b64_raw.is_empty() {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Database file content is required" })),
-        )
-            .into_response();
+            "Database file content is required".to_string(),
+        ));
     }
 
     let cleaned_b64: String = b64_raw.chars().filter(|c| !c.is_whitespace()).collect();
-    let raw_bytes = match B64.decode(&cleaned_b64) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("Invalid base64 database payload: {}", e) })),
-            )
-                .into_response();
+    let raw_bytes = B64.decode(&cleaned_b64).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid base64 database payload: {}", e),
+        )
+    })?;
+    Ok((filename, raw_bytes))
+}
+
+fn upsert_site_env_kv(site_dir: &std::path::Path, pairs: &[(&str, &str)]) {
+    let env_path = site_dir.join(".env");
+    if !env_path.is_file() {
+        return;
+    }
+    let Ok(raw) = std::fs::read_to_string(&env_path) else {
+        return;
+    };
+    let mut lines: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
+    for (k, v) in pairs {
+        let mut updated = false;
+        for line in &mut lines {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('#') && trimmed.starts_with(&format!("{}=", k)) {
+                *line = format!("{}={}", k, v);
+                updated = true;
+                break;
+            }
         }
+        if !updated {
+            lines.push(format!("{}={}", k, v));
+        }
+    }
+    let _ = std::fs::write(env_path, lines.join("\n") + "\n");
+}
+
+async fn wordpress_import_database_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Site not found" })),
+        )
+            .into_response();
+    };
+
+    let (filename, raw_bytes) = match read_uploaded_or_local_db_bytes(&state, &site, &payload) {
+        Ok(v) => v,
+        Err((status, msg)) => return (status, Json(serde_json::json!({ "error": msg }))).into_response(),
     };
 
     let lower_fn = filename.to_ascii_lowercase();
@@ -3528,6 +4321,21 @@ async fn wordpress_import_database_handler(
         .get("source_url")
         .and_then(|v| v.as_str())
         .map(String::from);
+
+    let memory_limit_mb = payload
+        .get("memory_limit_mb")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32);
+
+    let rollback_on_failure = payload
+        .get("rollback_on_failure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let apply_compat_fixes = payload
+        .get("apply_compat_fixes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let stream = payload
         .get("stream")
@@ -3624,6 +4432,9 @@ async fn wordpress_import_database_handler(
                             Some(&e),
                             false,
                         );
+                        if rollback_on_failure {
+                            bg_state.unregister_site_keep_files(&bg_site_id);
+                        }
                         bg_state.append_install_progress(
                             &bg_job_id,
                             "complete",
@@ -3672,6 +4483,9 @@ async fn wordpress_import_database_handler(
                             Some(&e),
                             false,
                         );
+                        if rollback_on_failure {
+                            bg_state.unregister_site_keep_files(&bg_site_id);
+                        }
                         bg_state.append_install_progress(
                             &bg_job_id,
                             "complete",
@@ -3685,6 +4499,9 @@ async fn wordpress_import_database_handler(
                     }
                     Err(e) => {
                         let msg = e.to_string();
+                        if rollback_on_failure {
+                            bg_state.unregister_site_keep_files(&bg_site_id);
+                        }
                         bg_state.append_install_progress(
                             &bg_job_id,
                             "complete",
@@ -3721,7 +4538,7 @@ async fn wordpress_import_database_handler(
             let src_cb = bg_source_override.clone();
 
             let res = tokio::task::spawn_blocking(move || {
-                wordpress::import_existing_wp_database_with_progress(
+                wordpress::import_existing_wp_database_with_compat(
                     &sd_cb,
                     &dom_cb,
                     &tgt_cb,
@@ -3729,6 +4546,8 @@ async fn wordpress_import_database_handler(
                     &fn_cb,
                     &raw_bytes,
                     src_cb.as_deref(),
+                    memory_limit_mb,
+                    apply_compat_fixes,
                     |step, lbl, status, pct, log_line| {
                         st_cb.append_install_progress(
                             &jid_cb,
@@ -3743,6 +4562,24 @@ async fn wordpress_import_database_handler(
                 )
             })
             .await;
+
+            let rollback_site_msg = |state_ref: &AppState, sid: &str, dom: &str| -> String {
+                if rollback_on_failure {
+                    if !looks_sqlite {
+                        if let Some(p) = state_ref.get_mariadb_port() {
+                            let partial_db = format!("{}_wp", dom.replace('.', "_").replace('-', "_"));
+                            let _ = mariadb::drop_database(p, &partial_db);
+                        }
+                    }
+                    if state_ref.unregister_site_keep_files(sid) {
+                        return format!(
+                            "\n\nRolled back temporary site '{}' (website files preserved on disk) — it has been returned to \"Unregistered Folders Ready to Import\" so you can adjust settings and retry.",
+                            dom
+                        );
+                    }
+                }
+                String::new()
+            };
 
             match res {
                 Ok(Ok(val)) => {
@@ -3810,31 +4647,45 @@ async fn wordpress_import_database_handler(
                         true,
                     );
                 }
-                Ok(Err(e)) => {
+                Ok(Err(imp_err)) => {
+                    let rb_note = rollback_site_msg(&bg_state, &bg_site_id, &bg_domain);
+                    let err_msg = imp_err.message().to_string();
+                    let full_err = format!("{}{}", err_msg, rb_note);
                     bg_state.record_event(
                         "wp_import_db_error",
                         "site",
                         &bg_domain,
                         "WordPress Database Import Failed",
-                        &e,
+                        &full_err,
                         "critical",
                     );
-                    bg_state.append_install_progress(
+                    let extra_meta = match &imp_err {
+                        mariadb::SqlImportError::CompatConfirm(c) => Some(serde_json::json!({
+                            "requires_compat_confirm": true,
+                            "compat_fixes": c.fixes,
+                            "target_version": c.target_version,
+                            "error_detail": c.error,
+                        })),
+                        mariadb::SqlImportError::Fatal(_) => None,
+                    };
+                    bg_state.push_install_progress_with_meta(
                         &bg_job_id,
                         "complete",
-                        &format!("Database import failed: {}", e),
+                        &format!("Database import failed: {}", err_msg),
                         "error",
                         None,
-                        Some(&e),
+                        Some(&full_err),
+                        extra_meta,
                         true,
                     );
                 }
                 Err(e) => {
-                    let msg = e.to_string();
+                    let rb_note = rollback_site_msg(&bg_state, &bg_site_id, &bg_domain);
+                    let msg = format!("{}{}", e, rb_note);
                     bg_state.append_install_progress(
                         &bg_job_id,
                         "complete",
-                        &format!("Database import worker error: {}", msg),
+                        &format!("Database import worker error: {}", e),
                         "error",
                         None,
                         Some(&msg),
@@ -3890,9 +4741,10 @@ async fn wordpress_import_database_handler(
     }
 
     let mdb_port = state.get_mariadb_port();
+    let rb_site_id = site.id.clone();
 
     let res = tokio::task::spawn_blocking(move || {
-        wordpress::import_existing_wp_database(
+        wordpress::import_existing_wp_database_with_compat(
             &site_dir,
             &domain,
             &target_url,
@@ -3900,6 +4752,9 @@ async fn wordpress_import_database_handler(
             &filename,
             &raw_bytes,
             source_url_override.as_deref(),
+            memory_limit_mb,
+            apply_compat_fixes,
+            |_, _, _, _, _| {},
         )
     })
     .await;
@@ -3922,16 +4777,505 @@ async fn wordpress_import_database_handler(
             );
             Json(val).into_response()
         }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
+        Ok(Err(imp_err)) => {
+            if rollback_on_failure {
+                if !looks_sqlite {
+                    if let Some(p) = state.get_mariadb_port() {
+                        let partial_db = format!("{}_wp", site.domain.replace('.', "_").replace('-', "_"));
+                        let _ = mariadb::drop_database(p, &partial_db);
+                    }
+                }
+                state.unregister_site_keep_files(&rb_site_id);
+            }
+            match imp_err {
+                mariadb::SqlImportError::CompatConfirm(c) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": c.error,
+                        "requires_compat_confirm": true,
+                        "compat_fixes": c.fixes,
+                        "target_version": c.target_version,
+                        "rolled_back": rollback_on_failure,
+                    })),
+                )
+                    .into_response(),
+                mariadb::SqlImportError::Fatal(e) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e, "rolled_back": rollback_on_failure })),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => {
+            if rollback_on_failure {
+                state.unregister_site_keep_files(&rb_site_id);
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string(), "rolled_back": rollback_on_failure })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn site_import_database_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Site not found" })),
         )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+            .into_response();
+    };
+
+    let (filename, raw_bytes) = match read_uploaded_or_local_db_bytes(&state, &site, &payload) {
+        Ok(v) => v,
+        Err((status, msg)) => return (status, Json(serde_json::json!({ "error": msg }))).into_response(),
+    };
+
+    let requested_name = payload
+        .get("db_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| site.domain.clone());
+
+    let memory_limit_mb = payload
+        .get("memory_limit_mb")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32);
+
+    let rollback_on_failure = payload
+        .get("rollback_on_failure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let apply_compat_fixes = payload
+        .get("apply_compat_fixes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let stream = payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let site_dir = state.site_dir(&site);
+    let domain = site.domain.clone();
+    let site_id = site.id.clone();
+    let rollback_id = site.id.clone();
+
+    let (is_sqlite, data_bytes, unpack_msg) = match wordpress::unpack_uploaded_db_bytes(&filename, &raw_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            if rollback_on_failure {
+                state.unregister_site_keep_files(&rollback_id);
+            }
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response();
+        }
+    };
+
+    let import_work = move |st: Arc<AppState>, job_opt: Option<String>| -> Result<(String, String, Option<u16>), mariadb::SqlImportError> {
+        let log = |step: &str, lbl: &str, status: &str, pct: Option<u8>, msg: Option<&str>| {
+            if let Some(ref jid) = job_opt {
+                st.append_install_progress(jid, step, lbl, status, pct, msg, false);
+            }
+        };
+
+        log("unpack", &unpack_msg, "done", Some(35), Some(&unpack_msg));
+        let normalized_req = requested_name.replace(['.', '-'], "_");
+        let clean_name = databases::sanitize_db_name(&normalized_req).map_err(mariadb::SqlImportError::Fatal)?;
+
+        if is_sqlite {
+            let db_dir = site_dir.join("database");
+            let _ = std::fs::create_dir_all(&db_dir);
+            let target_sqlite = if site_dir.join(".env").is_file() {
+                db_dir.join("database.sqlite")
+            } else {
+                db_dir.join(format!("{}.sqlite", clean_name))
+            };
+            std::fs::write(&target_sqlite, &data_bytes)
+                .map_err(|e| mariadb::SqlImportError::Fatal(format!("Failed saving SQLite database: {}", e)))?;
+            upsert_site_env_kv(
+                &site_dir,
+                &[
+                    ("DB_CONNECTION", "sqlite"),
+                    ("DB_DATABASE", &target_sqlite.to_string_lossy()),
+                ],
+            );
+            let _ = st.start_site(&site_id);
+            log(
+                "db_import",
+                &format!("Imported SQLite database to {}", target_sqlite.display()),
+                "done",
+                Some(90),
+                Some(&format!("Saved SQLite file at {}", target_sqlite.display())),
+            );
+            return Ok((clean_name, "sqlite".to_string(), None));
+        }
+
+        let port = st
+            .get_mariadb_port()
+            .ok_or_else(|| mariadb::SqlImportError::Fatal("MariaDB daemon is not running".to_string()))?;
+        log("db_create", &format!("Preparing clean MariaDB database '{}'", clean_name), "in_progress", Some(50), None);
+        let actual_name = mariadb::reset_database(port, &clean_name).map_err(mariadb::SqlImportError::Fatal)?;
+
+        let dump_path = std::env::temp_dir().join(format!("dockpanel-site-db-{}.sql", uuid::Uuid::new_v4()));
+        std::fs::write(&dump_path, &data_bytes)
+            .map_err(|e| mariadb::SqlImportError::Fatal(format!("Failed staging SQL dump: {}", e)))?;
+        let imp_res = mariadb::import_mysql_dump_with_compat(
+            port,
+            &actual_name,
+            &dump_path,
+            memory_limit_mb,
+            apply_compat_fixes,
+            |_, _, _| {},
+        );
+        let _ = std::fs::remove_file(&dump_path);
+        if let Err(e) = imp_res {
+            if rollback_on_failure {
+                let _ = mariadb::drop_database(port, &actual_name);
+            }
+            return Err(e);
+        }
+
+        let port_str = port.to_string();
+        upsert_site_env_kv(
+            &site_dir,
+            &[
+                ("DB_CONNECTION", "mysql"),
+                ("DB_HOST", "127.0.0.1"),
+                ("DB_PORT", &port_str),
+                ("DB_DATABASE", &actual_name),
+                ("DB_USERNAME", "root"),
+                ("DB_PASSWORD", ""),
+            ],
+        );
+        let _ = st.start_site(&site_id);
+        log(
+            "db_import",
+            &format!("Imported SQL dump into MariaDB database '{}'", actual_name),
+            "done",
+            Some(95),
+            Some(&format!("Engine: MariaDB 127.0.0.1:{} | Database: {}", port, actual_name)),
+        );
+        Ok((actual_name, "mariadb".to_string(), Some(port)))
+    };
+
+    if stream {
+        let job_id = format!("site-db-import-{}", uuid::Uuid::new_v4());
+        let sse_url = format!("/api/sites/{}/wordpress/import-log/{}", site.id, job_id);
+        state.append_install_progress(
+            &job_id,
+            "site_connect",
+            &format!("Connected site folder for {}", domain),
+            "done",
+            Some(100),
+            Some(&format!("Preparing database import for '{}'...", domain)),
+            false,
+        );
+
+        let bg_state = state.clone();
+        let bg_job = job_id.clone();
+        let bg_domain = domain.clone();
+        let bg_site_id = rollback_id.clone();
+        tokio::spawn(async move {
+            let rollback_note = || {
+                if rollback_on_failure && bg_state.unregister_site_keep_files(&bg_site_id) {
+                    format!(
+                        "\n\nRolled back temporary site '{}' (website files preserved on disk) — returned to \"Unregistered Folders Ready to Import\".",
+                        bg_domain
+                    )
+                } else {
+                    String::new()
+                }
+            };
+            if !is_sqlite && bg_state.get_mariadb_port().is_none() {
+                if mariadb::find_mariadbd_binary().is_none() {
+                    if let Err(e) = mariadb::install_mariadb_with_progress(|_, lbl, pct, msg| {
+                        bg_state.append_install_progress(&bg_job, "mariadb", lbl, "in_progress", pct, msg.as_deref(), false);
+                    })
+                    .await
+                    {
+                        let full = format!("{}{}", e, rollback_note());
+                        bg_state.append_install_progress(&bg_job, "complete", &format!("MariaDB install failed: {}", e), "error", None, Some(&full), true);
+                        return;
+                    }
+                }
+                let st_start = bg_state.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || st_start.start_mariadb())
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r.map(|_| ()))
+                {
+                    let full = format!("{}{}", e, rollback_note());
+                    bg_state.append_install_progress(&bg_job, "complete", &format!("Failed starting MariaDB: {}", e), "error", None, Some(&full), true);
+                    return;
+                }
+            }
+
+            let st_work = bg_state.clone();
+            let job_work = bg_job.clone();
+            let res = tokio::task::spawn_blocking(move || import_work(st_work, Some(job_work))).await;
+            match res {
+                Ok(Ok((db_name, engine, port))) => {
+                    bg_state.record_event(
+                        "import_database",
+                        "site",
+                        &bg_domain,
+                        "Site Database Imported",
+                        &format!("Imported {} database '{}' for {}", engine, db_name, bg_domain),
+                        "success",
+                    );
+                    bg_state.append_install_progress(
+                        &bg_job,
+                        "complete",
+                        &format!("Imported '{}' ({}) for {}", db_name, engine, bg_domain),
+                        "done",
+                        Some(100),
+                        Some(&format!(
+                            "Database: {} | Engine: {}{}",
+                            db_name,
+                            engine,
+                            port.map(|p| format!(" (127.0.0.1:{})", p)).unwrap_or_default()
+                        )),
+                        true,
+                    );
+                }
+                Ok(Err(imp_err)) => {
+                    let err_msg = imp_err.message().to_string();
+                    let full = format!("{}{}", err_msg, rollback_note());
+                    bg_state.record_event(
+                        "import_database_error",
+                        "site",
+                        &bg_domain,
+                        "Database Import Failed",
+                        &full,
+                        "critical",
+                    );
+                    let extra_meta = match &imp_err {
+                        mariadb::SqlImportError::CompatConfirm(c) => Some(serde_json::json!({
+                            "requires_compat_confirm": true,
+                            "compat_fixes": c.fixes,
+                            "target_version": c.target_version,
+                            "error_detail": c.error,
+                        })),
+                        mariadb::SqlImportError::Fatal(_) => None,
+                    };
+                    bg_state.push_install_progress_with_meta(
+                        &bg_job,
+                        "complete",
+                        &format!("Database import failed: {}", err_msg),
+                        "error",
+                        None,
+                        Some(&full),
+                        extra_meta,
+                        true,
+                    );
+                }
+                Err(e) => {
+                    let msg = format!("{}{}", e, rollback_note());
+                    bg_state.append_install_progress(&bg_job, "complete", &format!("Worker error: {}", e), "error", None, Some(&msg), true);
+                }
+            }
+        });
+
+        return Json(serde_json::json!({
+            "ok": true,
+            "streaming": true,
+            "job_id": job_id,
+            "sse_url": sse_url,
+        }))
+        .into_response();
+    }
+
+    if !is_sqlite && state.get_mariadb_port().is_none() {
+        if mariadb::find_mariadbd_binary().is_none() {
+            if let Err(e) = mariadb::install_mariadb_with_progress(|_, _, _, _| {}).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
+            }
+        }
+        let st_start = state.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || st_start.start_mariadb())
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map(|_| ()))
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
+        }
+    }
+
+    let st_work = state.clone();
+    match tokio::task::spawn_blocking(move || import_work(st_work, None)).await {
+        Ok(Ok((db_name, engine, port))) => {
+            state.record_event(
+                "import_database",
+                "site",
+                &domain,
+                "Site Database Imported",
+                &format!("Imported {} database '{}' for {}", engine, db_name, domain),
+                "success",
+            );
+            Json(serde_json::json!({
+                "ok": true,
+                "db_name": db_name,
+                "engine": engine,
+                "port": port,
+            }))
+            .into_response()
+        }
+        Ok(Err(imp_err)) => {
+            if rollback_on_failure {
+                state.unregister_site_keep_files(&rollback_id);
+            }
+            match imp_err {
+                mariadb::SqlImportError::CompatConfirm(c) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": c.error,
+                        "requires_compat_confirm": true,
+                        "compat_fixes": c.fixes,
+                        "target_version": c.target_version,
+                        "rolled_back": rollback_on_failure,
+                    })),
+                )
+                    .into_response(),
+                mariadb::SqlImportError::Fatal(e) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e, "rolled_back": rollback_on_failure })),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn site_git_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Site not found" }))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    let st = tokio::task::spawn_blocking(move || git_repo::get_status(&site_dir))
+        .await
+        .unwrap_or_else(|e| git_repo::GitRepoStatus {
+            git_available: false,
+            git_version: None,
+            initialized: false,
+            doc_root: String::new(),
+            branch: None,
+            branches: Vec::new(),
+            remote_name: None,
+            remote_url: None,
+            clean: true,
+            changed_files: 0,
+            recent_commits: Vec::new(),
+            has_gitignore: false,
+            error: Some(e.to_string()),
+        });
+    Json(st).into_response()
+}
+
+async fn site_git_init_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<git_repo::GitInitRequest>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Site not found" }))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    match tokio::task::spawn_blocking(move || git_repo::init_repo(&site_dir, &req)).await {
+        Ok(Ok((status, output))) => {
+            state.record_event("git_init", "site", &dom, "Initialized Git Repository", &output, "success");
+            Json(serde_json::json!({ "ok": true, "status": status, "output": output })).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn site_git_connect_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<git_repo::GitConnectRequest>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Site not found" }))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    match tokio::task::spawn_blocking(move || git_repo::connect_repo(&site_dir, &req)).await {
+        Ok(Ok((status, output))) => {
+            state.record_event("git_connect", "site", &dom, "Connected Git Repository", &output, "success");
+            Json(serde_json::json!({ "ok": true, "status": status, "output": output })).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn site_git_pull_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<git_repo::GitPullRequest>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Site not found" }))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    match tokio::task::spawn_blocking(move || git_repo::pull_repo(&site_dir, &req)).await {
+        Ok(Ok((status, output))) => {
+            state.record_event("git_pull", "site", &dom, "Git Pull Completed", &output, "success");
+            Json(serde_json::json!({ "ok": true, "status": status, "output": output })).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn site_git_commit_push_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<git_repo::GitCommitPushRequest>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Site not found" }))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    match tokio::task::spawn_blocking(move || git_repo::commit_and_push(&site_dir, &req)).await {
+        Ok(Ok((status, output))) => {
+            state.record_event("git_commit_push", "site", &dom, "Git Commit/Push Completed", &output, "success");
+            Json(serde_json::json!({ "ok": true, "status": status, "output": output })).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn site_git_disconnect_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(site) = state.get_site(&id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Site not found" }))).into_response();
+    };
+    let site_dir = state.site_dir(&site);
+    let dom = site.domain.clone();
+    match tokio::task::spawn_blocking(move || git_repo::disconnect_remote(&site_dir)).await {
+        Ok(Ok(status)) => {
+            state.record_event("git_disconnect", "site", &dom, "Disconnected Git Remote", "Removed origin remote", "info");
+            Json(serde_json::json!({ "ok": true, "status": status })).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
     }
 }
 
@@ -5188,6 +6532,267 @@ async fn database_download_dump_handler(
         .header(axum::http::header::CONTENT_DISPOSITION, disp)
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn database_health_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(db) = find_database_by_id(&state, &id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Database not found"}))).into_response();
+    };
+    let res = tokio::task::spawn_blocking(move || databases::inspect_database_health(&db)).await;
+    match res {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn database_optimize_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Option<Json<databases::DbOptimizeRequest>>,
+) -> Response {
+    let Some(db) = find_database_by_id(&state, &id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Database not found"}))).into_response();
+    };
+    let db_name = db.name.clone();
+    let req = payload.map(|Json(v)| v).unwrap_or_default();
+    let res = tokio::task::spawn_blocking(move || databases::optimize_database(&db, &req)).await;
+    match res {
+        Ok(Ok(report)) => {
+            state.record_event(
+                "optimize_database",
+                "database",
+                &db_name,
+                "Database Optimized",
+                &format!(
+                    "Ran '{}' on {} ({} table(s), reclaimed {} bytes)",
+                    report.action, db_name, report.tables_processed, report.reclaimed_bytes
+                ),
+                "success",
+            );
+            Json(report).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn database_prune_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Option<Json<databases::DbPruneRequest>>,
+) -> Response {
+    let Some(db) = find_database_by_id(&state, &id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Database not found"}))).into_response();
+    };
+    let db_name = db.name.clone();
+    let req = payload.map(|Json(v)| v).unwrap_or_default();
+    let res = tokio::task::spawn_blocking(move || databases::prune_database(&db, &req)).await;
+    match res {
+        Ok(Ok(report)) => {
+            if !report.dry_run {
+                state.record_event(
+                    "prune_database",
+                    "database",
+                    &db_name,
+                    "Database Pruned",
+                    &format!(
+                        "Pruned {} row(s) and {} dump(s) from {} (reclaimed {} bytes)",
+                        report.rows_deleted, report.dumps_deleted, db_name, report.reclaimed_bytes
+                    ),
+                    "success",
+                );
+            }
+            Json(report).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn databases_maintenance_summary_handler(State(state): State<Arc<AppState>>) -> Response {
+    let sites = state.list_sites();
+    let sites_dir = state.get_default_sites_dir();
+    let mdb_port = state.get_mariadb_port();
+
+    let summary = tokio::task::spawn_blocking(move || {
+        let dbs = databases::discover_databases_with_mariadb(&sites, &sites_dir, mdb_port);
+        let (linked_names, linked_ids) = databases::linked_database_names_and_ids(&sites, &sites_dir);
+
+        let mut total_bytes = 0u64;
+        let mut total_overhead_bytes = 0u64;
+        let mut total_dumps = 0usize;
+        let mut total_dump_bytes = 0u64;
+        let mut orphan_databases = Vec::new();
+        let mut items = Vec::new();
+
+        for db in &dbs {
+            let health = databases::inspect_database_health(db).ok();
+            let size_bytes = health
+                .as_ref()
+                .map(|h| h.total_bytes)
+                .unwrap_or_else(|| databases::database_disk_size_bytes(db));
+            let overhead_bytes = health.as_ref().map(|h| h.overhead_bytes).unwrap_or(0);
+            let table_count = health.as_ref().map(|h| h.table_count).unwrap_or(0);
+            let (dump_count, dump_bytes) = databases::database_dump_stats(db);
+
+            total_bytes += size_bytes;
+            total_overhead_bytes += overhead_bytes;
+            total_dumps += dump_count;
+            total_dump_bytes += dump_bytes;
+
+            let is_linked = db.site_id.is_some()
+                || linked_ids.contains(&db.id)
+                || linked_names.contains(&db.name.to_ascii_lowercase());
+
+            if !is_linked {
+                orphan_databases.push(serde_json::json!({
+                    "id": db.id,
+                    "name": db.name,
+                    "engine": db.engine,
+                    "size_bytes": size_bytes,
+                    "table_count": table_count,
+                    "reason": "Not referenced by any registered site (.env / wp-config.php)"
+                }));
+            }
+
+            items.push(serde_json::json!({
+                "id": db.id,
+                "name": db.name,
+                "engine": db.engine,
+                "linked": is_linked,
+                "size_bytes": size_bytes,
+                "overhead_bytes": overhead_bytes,
+                "table_count": table_count,
+                "dump_count": dump_count,
+                "dump_bytes": dump_bytes
+            }));
+        }
+
+        serde_json::json!({
+            "total_databases": dbs.len(),
+            "total_bytes": total_bytes,
+            "total_overhead_bytes": total_overhead_bytes,
+            "total_dumps": total_dumps,
+            "total_dump_bytes": total_dump_bytes,
+            "orphan_databases": orphan_databases,
+            "databases": items,
+        })
+    })
+    .await
+    .unwrap_or_else(|_| serde_json::json!({ "total_databases": 0, "orphan_databases": [], "databases": [] }));
+
+    Json(summary).into_response()
+}
+
+#[derive(serde::Deserialize, Default)]
+struct GlobalMaintenanceCleanupReq {
+    #[serde(default)]
+    optimize_all: bool,
+    #[serde(default)]
+    prune_dumps_keep: Option<usize>,
+    #[serde(default)]
+    prune_dumps_older_than_days: Option<u64>,
+    #[serde(default)]
+    delete_orphan_ids: Vec<String>,
+}
+
+async fn databases_maintenance_cleanup_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GlobalMaintenanceCleanupReq>,
+) -> Response {
+    let sites = state.list_sites();
+    let sites_dir = state.get_default_sites_dir();
+    let mdb_port = state.get_mariadb_port();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let dbs = databases::discover_databases_with_mariadb(&sites, &sites_dir, mdb_port);
+        let (linked_names, linked_ids) = databases::linked_database_names_and_ids(&sites, &sites_dir);
+        let mut optimized_count = 0usize;
+        let mut reclaimed_bytes = 0u64;
+        let mut dumps_deleted = 0usize;
+        let mut orphans_deleted = 0usize;
+        let mut errors = Vec::new();
+
+        for target_id in &req.delete_orphan_ids {
+            if let Some(db) = dbs.iter().find(|d| d.id == *target_id) {
+                let is_linked = db.site_id.is_some()
+                    || linked_ids.contains(&db.id)
+                    || linked_names.contains(&db.name.to_ascii_lowercase());
+                if is_linked {
+                    errors.push(format!("Skipped '{}': database is linked to an active site", db.name));
+                    continue;
+                }
+                let sz = databases::database_disk_size_bytes(db);
+                match databases::delete_local_database(db) {
+                    Ok(()) => {
+                        orphans_deleted += 1;
+                        reclaimed_bytes += sz;
+                    }
+                    Err(e) => errors.push(format!("{}: {}", db.name, e)),
+                }
+            }
+        }
+
+        let surviving_dbs = databases::discover_databases_with_mariadb(&sites, &sites_dir, mdb_port);
+        for db in &surviving_dbs {
+            if req.prune_dumps_keep.is_some() || req.prune_dumps_older_than_days.is_some() {
+                match databases::prune_dumps(db, req.prune_dumps_keep, req.prune_dumps_older_than_days) {
+                    Ok((cnt, bytes)) => {
+                        dumps_deleted += cnt;
+                        reclaimed_bytes += bytes;
+                    }
+                    Err(e) => errors.push(format!("{} dumps: {}", db.name, e)),
+                }
+            }
+            if req.optimize_all {
+                match databases::optimize_database(
+                    db,
+                    &databases::DbOptimizeRequest {
+                        action: Some("optimize".to_string()),
+                        tables: None,
+                    },
+                ) {
+                    Ok(rep) => {
+                        optimized_count += 1;
+                        reclaimed_bytes += rep.reclaimed_bytes;
+                    }
+                    Err(e) => errors.push(format!("{} optimize: {}", db.name, e)),
+                }
+            }
+        }
+
+        serde_json::json!({
+            "ok": errors.is_empty(),
+            "optimized_count": optimized_count,
+            "reclaimed_bytes": reclaimed_bytes,
+            "dumps_deleted": dumps_deleted,
+            "orphans_deleted": orphans_deleted,
+            "errors": errors,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| serde_json::json!({ "ok": false, "errors": [e.to_string()] }));
+
+    state.record_event(
+        "cleanup_databases",
+        "database",
+        "workspace",
+        "Database Maintenance Completed",
+        &format!(
+            "Optimized {} database(s), pruned {} dump(s), removed {} orphan(s), reclaimed {} KB",
+            result["optimized_count"].as_u64().unwrap_or(0),
+            result["dumps_deleted"].as_u64().unwrap_or(0),
+            result["orphans_deleted"].as_u64().unwrap_or(0),
+            result["reclaimed_bytes"].as_u64().unwrap_or(0) / 1024
+        ),
+        "success",
+    );
+
+    Json(result).into_response()
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -6946,12 +8551,25 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/desktop/open-vscode", post(desktop_open_vscode_handler))
         .route("/desktop/pick-folder", post(desktop_pick_folder_handler))
         .route("/desktop/inspect-folder", post(desktop_inspect_folder_handler))
+        .route("/desktop/discover-folders", get(desktop_discover_folders_handler))
+        .route("/desktop/scan-db-files", post(desktop_scan_db_files_handler))
         .route("/desktop/clear-cache", post(desktop_clear_cache_handler))
         .route(
             "/sites/{id}/wordpress/import-database",
             post(wordpress_import_database_handler)
-                .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024)),
         )
+        .route(
+            "/sites/{id}/database/import",
+            post(site_import_database_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024)),
+        )
+        .route("/sites/{id}/git/status", get(site_git_status_handler))
+        .route("/sites/{id}/git/init", post(site_git_init_handler))
+        .route("/sites/{id}/git/connect", post(site_git_connect_handler))
+        .route("/sites/{id}/git/pull", post(site_git_pull_handler))
+        .route("/sites/{id}/git/commit-push", post(site_git_commit_push_handler))
+        .route("/sites/{id}/git/disconnect", post(site_git_disconnect_handler))
         .route(
             "/sites/{id}/wordpress/import-log/{job_id}",
             get(|State(s): State<Arc<AppState>>, Path((_id, job_id)): Path<(String, String)>| async move {
@@ -7070,7 +8688,12 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             get(list_databases_handler).post(create_database_handler),
         )
         .route("/databases/sizes", get(databases_sizes_handler))
+        .route("/databases/maintenance/summary", get(databases_maintenance_summary_handler))
+        .route("/databases/maintenance/cleanup", post(databases_maintenance_cleanup_handler))
         .route("/databases/{id}", delete(delete_database_handler))
+        .route("/databases/{id}/health", get(database_health_handler))
+        .route("/databases/{id}/optimize", post(database_optimize_handler))
+        .route("/databases/{id}/prune", post(database_prune_handler))
         .route("/databases/{id}/credentials", get(database_credentials_handler))
         .route("/databases/{id}/schema-overview", get(database_schema_overview_handler))
         .route("/databases/{id}/tables", get(database_tables_handler))
@@ -8915,6 +10538,626 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scan["domain"], "b3wp.test");
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_discover_folders_and_site_database_import() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_discover_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("cfg");
+        let sites_dir = temp_dir.join("sites");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&sites_dir).unwrap();
+
+        // Registered site folder (should be skipped by discovery)
+        let reg_dir = sites_dir.join("already.test");
+        std::fs::create_dir_all(&reg_dir).unwrap();
+        std::fs::write(reg_dir.join("index.html"), "ok").unwrap();
+
+        // Unregistered WordPress folder with an .sql dump inside
+        let wp_dir = sites_dir.join("myshop.com");
+        std::fs::create_dir_all(&wp_dir).unwrap();
+        std::fs::write(
+            wp_dir.join("wp-config.php"),
+            "<?php define('DB_NAME', 'shop_db'); $table_prefix = 'wp_';",
+        )
+        .unwrap();
+        std::fs::write(wp_dir.join("backup.sql"), "CREATE TABLE wp_options (id INT);").unwrap();
+
+        // Unregistered Node folder
+        let node_dir = sites_dir.join("api_backend");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(node_dir.join("package.json"), r#"{"name":"api"}"#).unwrap();
+
+        // Hidden folder (should be skipped)
+        std::fs::create_dir_all(sites_dir.join(".git")).unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir.clone()));
+        let reg_site = state
+            .create_site_with_options("already.test", Some("static"), None, None, None, None)
+            .unwrap();
+        assert_eq!(reg_site.domain, "already.test");
+
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        let disc: serde_json::Value = c
+            .get(format!("{}/desktop/discover-folders", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let folders = disc["folders"].as_array().unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0]["name"], "myshop.com");
+        assert_eq!(folders[0]["suggested_domain"], "myshop.test");
+        assert_eq!(folders[0]["suggested_runtime"], "php");
+        assert_eq!(folders[0]["inspection"]["is_wordpress"], true);
+        assert_eq!(folders[0]["detected_db_files"][0]["name"], "backup.sql");
+
+        assert_eq!(folders[1]["name"], "api_backend");
+        assert_eq!(folders[1]["suggested_domain"], "api-backend.test");
+        assert_eq!(folders[1]["suggested_runtime"], "node");
+
+        // Import api_backend and upload a SQLite DB payload to /sites/{id}/database/import
+        let imported: serde_json::Value = c
+            .post(format!("{}/sites", base))
+            .json(&serde_json::json!({
+                "domain": "api-backend.test",
+                "runtime": "node",
+                "document_root": node_dir.to_string_lossy().to_string(),
+                "connect_existing": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let imported_id = imported["id"].as_str().unwrap();
+
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let fake_sqlite = b"SQLite format 3\0test-db-bytes";
+        let imp_db: serde_json::Value = c
+            .post(format!("{}/sites/{}/database/import", base, imported_id))
+            .json(&serde_json::json!({
+                "filename": "local.sqlite",
+                "content_base64": B64.encode(fake_sqlite)
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(imp_db["ok"], true);
+        assert_eq!(imp_db["engine"], "sqlite");
+
+        // Re-discovering should now only show myshop.com
+        let disc2: serde_json::Value = c
+            .get(format!("{}/desktop/discover-folders", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(disc2["folders"].as_array().unwrap().len(), 1);
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_database_maintenance_health_optimize_and_prune() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_db_maint_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("cfg");
+        let sites_dir = temp_dir.join("sites");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&sites_dir).unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir.clone()));
+
+        // Create a temporary WP SQLite database inside a registered site
+        let site = state
+            .create_site_with_options("wpclean.test", Some("php"), None, None, None, None)
+            .unwrap();
+        let db_dir = state.site_dir(&site).join("wp-content").join("database");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let sqlite_path = db_dir.join(".ht.sqlite");
+
+        if state::find_php_binary(None).is_none() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return;
+        }
+
+        // Seed WP tables + bloat + free pages
+        std::fs::write(&sqlite_path, b"").unwrap();
+        databases::run_sqlite_query(
+            &sqlite_path,
+            "CREATE TABLE wp_posts (ID INTEGER PRIMARY KEY, post_type TEXT, post_status TEXT, post_title TEXT)",
+        )
+        .unwrap();
+        databases::run_sqlite_query(
+            &sqlite_path,
+            "CREATE TABLE wp_postmeta (meta_id INTEGER PRIMARY KEY, post_id INTEGER, meta_key TEXT)",
+        )
+        .unwrap();
+        databases::run_sqlite_query(
+            &sqlite_path,
+            "CREATE TABLE wp_options (option_id INTEGER PRIMARY KEY, option_name TEXT, option_value TEXT, autoload TEXT)",
+        )
+        .unwrap();
+        databases::run_sqlite_query(
+            &sqlite_path,
+            "INSERT INTO wp_posts (ID, post_type, post_status, post_title) VALUES (1, 'post', 'publish', 'Hello'), (2, 'revision', 'inherit', 'Rev1'), (3, 'post', 'auto-draft', 'Draft')",
+        )
+        .unwrap();
+        databases::run_sqlite_query(
+            &sqlite_path,
+            "INSERT INTO wp_postmeta (meta_id, post_id, meta_key) VALUES (1, 1, 'valid'), (2, 9999, 'orphan')",
+        )
+        .unwrap();
+        databases::run_sqlite_query(
+            &sqlite_path,
+            "INSERT INTO wp_options (option_id, option_name, option_value, autoload) VALUES (1, '_transient_timeout_old', '100', 'no'), (2, '_transient_old', 'payload', 'no')",
+        )
+        .unwrap();
+
+        let db_id = format!("wp:{}", site.id);
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        // 1. Health endpoint detects WP bloat
+        let health: serde_json::Value = c
+            .get(format!("{}/databases/{}/health", base, db_id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["wp_bloat"]["detected"], true);
+        assert_eq!(health["wp_bloat"]["revisions"], 1);
+        assert_eq!(health["wp_bloat"]["auto_drafts"], 1);
+        assert_eq!(health["wp_bloat"]["orphaned_meta"], 1);
+        assert_eq!(health["wp_bloat"]["expired_transients"], 1);
+
+        // 2. Dry-run prune leaves data intact
+        let dry: serde_json::Value = c
+            .post(format!("{}/databases/{}/prune", base, db_id))
+            .json(&serde_json::json!({
+                "dry_run": true,
+                "categories": ["revisions", "auto_drafts", "orphaned_meta", "expired_transients"]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["rows_deleted"], 4);
+
+        // 3. Apply prune + optimize
+        let pruned: serde_json::Value = c
+            .post(format!("{}/databases/{}/prune", base, db_id))
+            .json(&serde_json::json!({
+                "dry_run": false,
+                "categories": ["revisions", "auto_drafts", "orphaned_meta", "expired_transients"],
+                "optimize_after": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pruned["ok"], true);
+        assert_eq!(pruned["optimized"], true);
+
+        let health_after: serde_json::Value = c
+            .get(format!("{}/databases/{}/health", base, db_id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health_after["wp_bloat"]["revisions"], 0);
+        assert_eq!(health_after["wp_bloat"]["orphaned_meta"], 0);
+        assert_eq!(health_after["wp_bloat"]["expired_transients"], 0);
+
+        // 4. Direct optimize endpoint
+        let opt: serde_json::Value = c
+            .post(format!("{}/databases/{}/optimize", base, db_id))
+            .json(&serde_json::json!({ "action": "optimize" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(opt["ok"], true);
+        assert_eq!(opt["integrity_status"], "ok");
+
+        // 5. Maintenance summary
+        let summary: serde_json::Value = c
+            .get(format!("{}/databases/maintenance/summary", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(summary["total_databases"].as_u64().unwrap() >= 1);
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_failed_import_rollback_preserves_files_and_returns_to_discover_folders() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_rollback_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("cfg");
+        let sites_dir = temp_dir.join("sites");
+        let folder_dir = sites_dir.join("client-shop");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&folder_dir).unwrap();
+        std::fs::write(folder_dir.join("index.php"), "<?php echo 'shop ok';").unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir.clone()));
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        // 1. Register folder as a site (simulating initial step of import)
+        let site: serde_json::Value = c
+            .post(format!("{}/sites", base))
+            .json(&serde_json::json!({
+                "domain": "client-shop.local",
+                "runtime": "php",
+                "document_root": folder_dir.to_string_lossy().to_string(),
+                "connect_existing": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let site_id = site["id"].as_str().unwrap();
+
+        // Discover should NOT list it while registered
+        let disc1: serde_json::Value = c
+            .get(format!("{}/desktop/discover-folders", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(disc1["folders"].as_array().unwrap().len(), 0);
+
+        // 2. Database import fails (invalid ZIP / payload) with rollback_on_failure=true
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let fail_resp = c
+            .post(format!("{}/sites/{}/database/import", base, site_id))
+            .json(&serde_json::json!({
+                "filename": "broken.zip",
+                "content_base64": B64.encode(b"not-a-valid-zip"),
+                "rollback_on_failure": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fail_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 3. Site registration was rolled back, files STILL EXIST on disk,
+        // and discover-folders returns "client-shop" ready for retry!
+        assert!(folder_dir.join("index.php").is_file());
+        let disc2: serde_json::Value = c
+            .get(format!("{}/desktop/discover-folders", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let folders = disc2["folders"].as_array().unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0]["name"], "client-shop");
+
+        // 4. Explicit keep_files=true delete also preserves disk files
+        let site2: serde_json::Value = c
+            .post(format!("{}/sites", base))
+            .json(&serde_json::json!({
+                "domain": "client-shop.local",
+                "runtime": "php",
+                "document_root": folder_dir.to_string_lossy().to_string(),
+                "connect_existing": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let del: serde_json::Value = c
+            .delete(format!("{}/sites/{}?keep_files=true", base, site2["id"].as_str().unwrap()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(del["success"], true);
+        assert_eq!(del["kept_files"], true);
+        assert!(folder_dir.join("index.php").is_file());
+
+        // 5. Verify workable memory limit suggestion message
+        let hint = mariadb::suggest_memory_limit_hint(
+            "Allowed memory size of 134217728 bytes exhausted",
+            Some(512),
+        )
+        .unwrap();
+        assert!(hint.contains("2048 MB"));
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_subdir_sql_discovery_and_directory_db_selection() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_subdir_sql_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("cfg");
+        let sites_dir = temp_dir.join("sites");
+        let site_folder = sites_dir.join("furniture-schools2");
+        let external_dir = temp_dir.join("external_backups");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(site_folder.join("app").join("sql")).unwrap();
+        std::fs::create_dir_all(site_folder.join("wp-content").join("exports")).unwrap();
+        std::fs::create_dir_all(sites_dir.join("_shared_backups").join("nested")).unwrap();
+        std::fs::create_dir_all(external_dir.join("client_archives")).unwrap();
+
+        std::fs::write(
+            site_folder.join("wp-config.php"),
+            "<?php define('DB_NAME', 'furniture_db'); $table_prefix = 'wpl8_'; define('WP_SITEURL', 'https://furnitureforschools.co.uk');",
+        )
+        .unwrap();
+
+        // Matching SQL dump inside nested subdirectory app/sql/
+        std::fs::write(
+            site_folder.join("app").join("sql").join("local.sql"),
+            "-- Database: `furniture_db`\nCREATE TABLE `wpl8_options` (id INT);\nINSERT INTO `wpl8_options` VALUES (1, 'siteurl', 'https://furnitureforschools.co.uk');\n",
+        )
+        .unwrap();
+
+        // Mismatched SQL dump (belongs to another site) inside wp-content/exports/
+        std::fs::write(
+            site_folder.join("wp-content").join("exports").join("other_blog.sql"),
+            "-- Database: `unrelated_blog`\nCREATE TABLE `other_options` (id INT);\nINSERT INTO `other_options` VALUES (1, 'siteurl', 'https://unrelated-blog.com');\n",
+        )
+        .unwrap();
+
+        // Sibling directory SQL dump under Default Websites Directory
+        std::fs::write(
+            sites_dir.join("_shared_backups").join("nested").join("furniture_alt.sql"),
+            "CREATE TABLE `wpl8_options` (id INT);\nINSERT INTO `wpl8_options` VALUES (1, 'siteurl', 'https://furnitureforschools.co.uk');\n",
+        )
+        .unwrap();
+
+        // External backup directory SQLite dump outside sites_dir
+        let ext_sqlite = external_dir.join("client_archives").join("chosen_from_dir.sqlite");
+        std::fs::write(&ext_sqlite, b"SQLite format 3\0dir-selected").unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir.clone()));
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        // 1. Discover folders searches arbitrary nested subdirectories recursively & scores match/mismatch
+        let disc: serde_json::Value = c
+            .get(format!("{}/desktop/discover-folders", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let folders = disc["folders"].as_array().unwrap();
+        let folder = folders.iter().find(|f| f["name"] == "furniture-schools2").unwrap();
+        let detected = folder["detected_db_files"].as_array().unwrap();
+        assert_eq!(detected.len(), 2);
+        // Matching SQL dump should rank first with matches_site = true and prefix/url populated
+        assert_eq!(detected[0]["relative_path"], "app/sql/local.sql");
+        assert_eq!(detected[0]["matches_site"], true);
+        assert_eq!(detected[0]["detected_prefix"], "wpl8_");
+        assert_eq!(detected[0]["detected_site_url"], "https://furnitureforschools.co.uk");
+        // Mismatched dump from another website should be flagged matches_site = false
+        assert_eq!(detected[1]["relative_path"], "wp-content/exports/other_blog.sql");
+        assert_eq!(detected[1]["matches_site"], false);
+
+        // Root/sibling directory scan also surfaces _shared_backups/nested/furniture_alt.sql
+        let root_dumps = disc["root_db_files"].as_array().unwrap();
+        assert!(root_dumps.iter().any(|d| d["name"] == "furniture_alt.sql"));
+
+        // 2. Inspect folder endpoint also returns recursive detected_db_files & other_directory_db_files
+        let insp: serde_json::Value = c
+            .post(format!("{}/desktop/inspect-folder", base))
+            .json(&serde_json::json!({ "path": site_folder.to_string_lossy().to_string() }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(insp["detected_db_files"].as_array().unwrap().len(), 2);
+        assert!(insp["other_directory_db_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == "furniture_alt.sql" && d["matches_site"] == true));
+
+        // 3. Scanning an external directory via /desktop/scan-db-files finds nested dumps & approves dir
+        let scan: serde_json::Value = c
+            .post(format!("{}/desktop/scan-db-files", base))
+            .json(&serde_json::json!({
+                "dir": external_dir.to_string_lossy().to_string(),
+                "site_dir": site_folder.to_string_lossy().to_string()
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ext_files = scan["files"].as_array().unwrap();
+        assert_eq!(ext_files.len(), 1);
+        assert_eq!(ext_files[0]["relative_path"], "client_archives/chosen_from_dir.sqlite");
+
+        // 4. Site can import the database file selected from that scanned external directory using local_path
+        let created: serde_json::Value = c
+            .post(format!("{}/sites", base))
+            .json(&serde_json::json!({
+                "domain": "furniture-schools2.test",
+                "runtime": "php",
+                "document_root": site_folder.to_string_lossy().to_string(),
+                "connect_existing": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let imp: serde_json::Value = c
+            .post(format!("{}/sites/{}/database/import", base, created["id"].as_str().unwrap()))
+            .json(&serde_json::json!({
+                "filename": "chosen_from_dir.sqlite",
+                "local_path": ext_files[0]["path"]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(imp["ok"], true);
+        assert_eq!(imp["engine"], "sqlite");
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_site_git_endpoints_lifecycle() {
+        if git_repo::find_git_binary().is_none() {
+            return;
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_site_git_api_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("cfg");
+        let sites_dir = temp_dir.join("sites");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&sites_dir).unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir));
+        let site = state
+            .create_site_with_options("git-admin.test", Some("php"), None, None, None, None)
+            .unwrap();
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        let st0: serde_json::Value = c
+            .get(format!("{}/sites/{}/git/status", base, site.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(st0["git_available"], true);
+        assert_eq!(st0["initialized"], false);
+
+        let init_res: serde_json::Value = c
+            .post(format!("{}/sites/{}/git/init", base, site.id))
+            .json(&serde_json::json!({
+                "branch": "main",
+                "gitignore_preset": "php",
+                "initial_commit": true,
+                "commit_message": "Admin initial commit"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(init_res["ok"], true);
+        assert_eq!(init_res["status"]["initialized"], true);
+        assert_eq!(init_res["status"]["branch"], "main");
+        assert_eq!(init_res["status"]["has_gitignore"], true);
+
+        let bad_url_resp = c
+            .post(format!("{}/sites/{}/git/connect", base, site.id))
+            .json(&serde_json::json!({ "repo_url": "file:///invalid/scheme" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_url_resp.status(), StatusCode::BAD_REQUEST);
 
         srv.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);

@@ -297,6 +297,116 @@ async fn laravel_migrate(
     }
 }
 
+#[derive(Deserialize)]
+pub struct GitInitReq {
+    pub branch: Option<String>,
+    pub gitignore_preset: Option<String>,
+    pub initial_commit: Option<bool>,
+    pub commit_message: Option<String>,
+    pub user_name: Option<String>,
+    pub user_email: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct GitConnectReq {
+    pub repo_url: String,
+    pub branch: Option<String>,
+    pub token: Option<String>,
+    pub mode: Option<String>,
+    pub gitignore_preset: Option<String>,
+    pub user_name: Option<String>,
+    pub user_email: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct GitPullReq {
+    pub branch: Option<String>,
+    pub token: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct GitCommitPushReq {
+    pub message: String,
+    pub branch: Option<String>,
+    pub token: Option<String>,
+    pub push: Option<bool>,
+}
+
+async fn git_status(Path(domain): Path<String>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let st = deploy::git_repo_status(&domain).map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(Json(serde_json::to_value(st).unwrap_or_default()))
+}
+
+async fn git_init(Path(domain): Path<String>, Json(body): Json<GitInitReq>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let (status, output) = deploy::git_repo_init(
+        &domain,
+        body.branch.as_deref(),
+        body.gitignore_preset.as_deref(),
+        body.initial_commit.unwrap_or(false),
+        body.commit_message.as_deref(),
+        body.user_name.as_deref(),
+        body.user_email.as_deref(),
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true, "status": status, "output": output })))
+}
+
+async fn git_connect(Path(domain): Path<String>, Json(body): Json<GitConnectReq>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let (status, output) = deploy::git_repo_connect(
+        &domain,
+        &body.repo_url,
+        body.branch.as_deref(),
+        body.token.as_deref(),
+        body.mode.as_deref(),
+        body.gitignore_preset.as_deref(),
+        body.user_name.as_deref(),
+        body.user_email.as_deref(),
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true, "status": status, "output": output })))
+}
+
+async fn git_pull(Path(domain): Path<String>, Json(body): Json<GitPullReq>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let (status, output) = deploy::git_repo_pull(&domain, body.branch.as_deref(), body.token.as_deref())
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true, "status": status, "output": output })))
+}
+
+async fn git_commit_push(Path(domain): Path<String>, Json(body): Json<GitCommitPushReq>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let (status, output) = deploy::git_repo_commit_push(
+        &domain,
+        &body.message,
+        body.branch.as_deref(),
+        body.token.as_deref(),
+        body.push.unwrap_or(false),
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true, "status": status, "output": output })))
+}
+
+async fn git_disconnect(Path(domain): Path<String>) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    let status = deploy::git_repo_disconnect(&domain).map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true, "status": status })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/deploy/run", post(run_deploy))
@@ -304,5 +414,11 @@ pub fn router() -> Router<AppState> {
         .route("/deploy/releases/{domain}", get(list_releases))
         .route("/deploy/activate", post(activate_release))
         .route("/deploy/keygen", post(keygen))
+        .route("/deploy/git/{domain}/status", get(git_status))
+        .route("/deploy/git/{domain}/init", post(git_init))
+        .route("/deploy/git/{domain}/connect", post(git_connect))
+        .route("/deploy/git/{domain}/pull", post(git_pull))
+        .route("/deploy/git/{domain}/commit-push", post(git_commit_push))
+        .route("/deploy/git/{domain}/disconnect", post(git_disconnect))
         .route("/sites/{domain}/laravel-migrate", post(laravel_migrate))
 }

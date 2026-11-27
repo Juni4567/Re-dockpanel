@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "DockPanel Desktop"
-#define MyAppVersion "2.254.0"
+#define MyAppVersion "2.255.0"
 #define MyAppPublisher "DockPanel Team"
 #define MyAppURL "https://dockpanel.dev"
 #define MyAppExeName "DockPanel Desktop.exe"

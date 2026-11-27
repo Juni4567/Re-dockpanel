@@ -129,14 +129,17 @@ pub fn read_wp_config_string(content: &str, key: &str) -> Option<String> {
     let needle_dq = format!("\"{}\"", key);
     for line in content.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with("define") {
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
             continue;
         }
         let pos = trimmed
             .find(&needle_sq)
-            .map(|i| i + needle_sq.len())
-            .or_else(|| trimmed.find(&needle_dq).map(|i| i + needle_dq.len()));
-        if let Some(after_key) = pos {
+            .map(|i| (i, i + needle_sq.len()))
+            .or_else(|| trimmed.find(&needle_dq).map(|i| (i, i + needle_dq.len())));
+        if let Some((key_idx, after_key)) = pos {
+            if !trimmed[..key_idx].contains("define") {
+                continue;
+            }
             let rest = &trimmed[after_key..];
             if let Some(comma) = rest.find(',') {
                 let after_comma = rest[comma + 1..].trim();
@@ -211,8 +214,12 @@ pub struct FolderInspection {
 pub fn parse_wp_table_prefix(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("$table_prefix") {
-            if let Some((_, rhs)) = trimmed.split_once('=') {
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+            continue;
+        }
+        if let Some(idx) = trimmed.find("$table_prefix") {
+            let after = &trimmed[idx + "$table_prefix".len()..];
+            if let Some((_, rhs)) = after.split_once('=') {
                 let rhs = rhs.trim();
                 let quote = rhs.chars().next()?;
                 if quote == '\'' || quote == '"' {
@@ -388,63 +395,188 @@ pub fn inspect_site_folder(path: &Path) -> FolderInspection {
     }
 }
 
-/// Scans an SQL dump for WordPress table prefix (`<prefix>options`) and `siteurl` / `home` URLs.
-pub fn detect_wp_sql_metadata(sql: &str) -> (Option<String>, Option<String>) {
-    let mut table_prefix: Option<String> = None;
-    let mut source_url: Option<String> = None;
+#[derive(Debug, Clone, Default)]
+pub struct SqlDumpPeek {
+    pub prefix: Option<String>,
+    pub site_url: Option<String>,
+    pub db_name: Option<String>,
+}
 
-    for line in sql.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
+fn extract_backtick_or_bare_ident(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix('`') {
+        if let Some(end) = rest.find('`') {
+            let ident = rest[..end].trim();
+            if !ident.is_empty() {
+                return Some(ident.to_string());
+            }
+        }
+    }
+    let ident: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
+}
 
-        if table_prefix.is_none() && lower.contains("create table") && lower.contains("options") {
-            if let Some(opt_idx) = lower.find("options") {
-                let before = &trimmed[..opt_idx];
-                let candidate: String = before
-                    .chars()
-                    .rev()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect();
-                if !candidate.is_empty() && candidate.ends_with('_') {
-                    table_prefix = Some(candidate);
+fn scan_sql_line_into_peek(line: &str, peek: &mut SqlDumpPeek) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if peek.db_name.is_none() {
+        if lower.starts_with("--") && lower.contains("database:") {
+            if let Some(pos) = lower.find("database:") {
+                if let Some(name) = extract_backtick_or_bare_ident(&trimmed[pos + 9..]) {
+                    peek.db_name = Some(name);
+                }
+            }
+        } else if lower.starts_with("use ") {
+            if let Some(name) = extract_backtick_or_bare_ident(&trimmed[4..]) {
+                if !name.eq_ignore_ascii_case("mysql") && !name.eq_ignore_ascii_case("information_schema") {
+                    peek.db_name = Some(name);
+                }
+            }
+        } else if lower.starts_with("create database") {
+            let after = trimmed[15..]
+                .trim_start()
+                .trim_start_matches(|c: char| !c.is_ascii_whitespace() && c != '`');
+            let candidate_str = trimmed[15..].trim();
+            let candidate_lower = candidate_str.to_ascii_lowercase();
+            let rest = if candidate_lower.starts_with("if not exists") {
+                candidate_str[13..].trim()
+            } else {
+                let _ = after;
+                candidate_str
+            };
+            if let Some(name) = extract_backtick_or_bare_ident(rest) {
+                peek.db_name = Some(name);
+            }
+        }
+    }
+
+    if peek.prefix.is_none() && lower.contains("create table") && lower.contains("options") {
+        if let Some(opt_idx) = lower.find("options") {
+            let before = &trimmed[..opt_idx];
+            let candidate: String = before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if !candidate.is_empty() && candidate.ends_with('_') {
+                peek.prefix = Some(candidate);
+            }
+        }
+    }
+
+    if peek.site_url.is_none() && (trimmed.contains("'siteurl'") || trimmed.contains("'home'")) {
+        let key = if trimmed.contains("'siteurl'") {
+            "'siteurl'"
+        } else {
+            "'home'"
+        };
+        if let Some(pos) = trimmed.find(key) {
+            let after = &trimmed[pos + key.len()..];
+            if let Some(q1) = after.find('\'') {
+                let rest = &after[q1 + 1..];
+                if let Some(q2) = rest.find('\'') {
+                    let url_candidate = rest[..q2].trim();
+                    if url_candidate.starts_with("http://") || url_candidate.starts_with("https://") {
+                        peek.site_url = Some(url_candidate.trim_end_matches('/').to_string());
+                    }
                 }
             }
         }
+    }
+}
 
-        if source_url.is_none() && (trimmed.contains("'siteurl'") || trimmed.contains("'home'")) {
-            let key = if trimmed.contains("'siteurl'") {
-                "'siteurl'"
-            } else {
-                "'home'"
-            };
-            if let Some(pos) = trimmed.find(key) {
-                let after = &trimmed[pos + key.len()..];
-                if let Some(q1) = after.find('\'') {
-                    let rest = &after[q1 + 1..];
-                    if let Some(q2) = rest.find('\'') {
-                        let url_candidate = rest[..q2].trim();
-                        if url_candidate.starts_with("http://")
-                            || url_candidate.starts_with("https://")
-                        {
-                            source_url = Some(url_candidate.trim_end_matches('/').to_string());
+fn scan_sql_reader_into_peek<R: std::io::Read>(reader: R, max_bytes: u64, max_lines: usize) -> SqlDumpPeek {
+    use std::io::{BufRead, BufReader};
+    let mut peek = SqlDumpPeek::default();
+    let limited = reader.take(max_bytes);
+    let mut buf = BufReader::new(limited);
+    let mut raw = Vec::with_capacity(4096);
+    for _ in 0..max_lines {
+        raw.clear();
+        match buf.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&raw);
+                scan_sql_line_into_peek(&line, &mut peek);
+                if peek.prefix.is_some() && peek.site_url.is_some() && peek.db_name.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    peek
+}
+
+/// Fast bounded header scan of a `.sql`, `.sql.gz`, or `.zip` database dump on disk
+/// to extract WordPress table prefix, `siteurl`/`home`, and SQL `DB_NAME`.
+pub fn peek_db_file_metadata(path: &Path) -> SqlDumpPeek {
+    let lower = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if lower.ends_with(".sql") {
+        if let Ok(file) = fs::File::open(path) {
+            return scan_sql_reader_into_peek(file, 4 * 1024 * 1024, 20_000);
+        }
+        return SqlDumpPeek::default();
+    }
+
+    if lower.ends_with(".sql.gz") || lower.ends_with(".gz") {
+        if let Ok(file) = fs::File::open(path) {
+            let gz = flate2::read::GzDecoder::new(file);
+            return scan_sql_reader_into_peek(gz, 2 * 1024 * 1024, 10_000);
+        }
+        return SqlDumpPeek::default();
+    }
+
+    if lower.ends_with(".zip") {
+        let meta_len = fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX);
+        if meta_len <= 128 * 1024 * 1024 {
+            if let Ok(file) = fs::File::open(path) {
+                if let Ok(mut archive) = zip::ZipArchive::new(file) {
+                    for i in 0..archive.len().min(16) {
+                        if let Ok(entry) = archive.by_index(i) {
+                            if !entry.is_dir() && entry.name().to_ascii_lowercase().ends_with(".sql") {
+                                return scan_sql_reader_into_peek(entry, 2 * 1024 * 1024, 10_000);
+                            }
                         }
                     }
                 }
             }
         }
+    }
 
-        if table_prefix.is_some() && source_url.is_some() {
+    SqlDumpPeek::default()
+}
+
+/// Scans an SQL dump for WordPress table prefix (`<prefix>options`) and `siteurl` / `home` URLs.
+pub fn detect_wp_sql_metadata(sql: &str) -> (Option<String>, Option<String>) {
+    let mut peek = SqlDumpPeek::default();
+    for line in sql.lines() {
+        scan_sql_line_into_peek(line, &mut peek);
+        if peek.prefix.is_some() && peek.site_url.is_some() {
             break;
         }
     }
-
-    (table_prefix, source_url)
+    (peek.prefix, peek.site_url)
 }
 
-fn unpack_uploaded_db_bytes(filename: &str, raw_bytes: &[u8]) -> Result<(bool, Vec<u8>, String), String> {
+pub fn unpack_uploaded_db_bytes(filename: &str, raw_bytes: &[u8]) -> Result<(bool, Vec<u8>, String), String> {
     let lower = filename.trim().to_ascii_lowercase();
     if lower.ends_with(".sqlite") || lower.ends_with(".db") || raw_bytes.starts_with(b"SQLite format 3\0") {
         return Ok((
@@ -607,13 +739,75 @@ pub fn import_existing_wp_database_with_progress<F>(
     filename: &str,
     raw_bytes: &[u8],
     source_url_override: Option<&str>,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<serde_json::Value, String>
 where
     F: FnMut(&str, &str, &str, Option<u8>, Option<&str>),
 {
+    import_existing_wp_database_with_options(
+        site_dir,
+        domain,
+        target_url,
+        mariadb_port,
+        filename,
+        raw_bytes,
+        source_url_override,
+        None,
+        on_progress,
+    )
+}
+
+/// Same as `import_existing_wp_database_with_progress`, with configurable import `memory_limit_mb`.
+pub fn import_existing_wp_database_with_options<F>(
+    site_dir: &Path,
+    domain: &str,
+    target_url: &str,
+    mariadb_port: Option<u16>,
+    filename: &str,
+    raw_bytes: &[u8],
+    source_url_override: Option<&str>,
+    memory_limit_mb: Option<i32>,
+    on_progress: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnMut(&str, &str, &str, Option<u8>, Option<&str>),
+{
+    import_existing_wp_database_with_compat(
+        site_dir,
+        domain,
+        target_url,
+        mariadb_port,
+        filename,
+        raw_bytes,
+        source_url_override,
+        memory_limit_mb,
+        true,
+        on_progress,
+    )
+    .map_err(|e| e.message().to_string())
+}
+
+/// Same as `import_existing_wp_database_with_options`, returning structured `CompatConfirm`
+/// when backward/forward or MySQL <-> MariaDB compatibility rewrites require user confirmation.
+pub fn import_existing_wp_database_with_compat<F>(
+    site_dir: &Path,
+    domain: &str,
+    target_url: &str,
+    mariadb_port: Option<u16>,
+    filename: &str,
+    raw_bytes: &[u8],
+    source_url_override: Option<&str>,
+    memory_limit_mb: Option<i32>,
+    apply_compat_fixes: bool,
+    mut on_progress: F,
+) -> Result<serde_json::Value, crate::mariadb::SqlImportError>
+where
+    F: FnMut(&str, &str, &str, Option<u8>, Option<&str>),
+{
+    use crate::mariadb::SqlImportError;
+
     if raw_bytes.is_empty() {
-        return Err("Uploaded database file is empty".to_string());
+        return Err(SqlImportError::Fatal("Uploaded database file is empty".to_string()));
     }
 
     on_progress(
@@ -631,7 +825,7 @@ where
         Ok(v) => v,
         Err(e) => {
             on_progress("unpack", "Failed unpacking database archive", "error", None, Some(&e));
-            return Err(e);
+            return Err(SqlImportError::Fatal(e));
         }
     };
     on_progress(
@@ -654,10 +848,10 @@ where
             Some(40),
             Some(&format!("Target path: {}", db_dir.join(".ht.sqlite").display())),
         );
-        fs::create_dir_all(&db_dir).map_err(|e| format!("Failed creating SQLite dir: {e}"))?;
+        fs::create_dir_all(&db_dir).map_err(|e| SqlImportError::Fatal(format!("Failed creating SQLite dir: {e}")))?;
         let sqlite_target = db_dir.join(".ht.sqlite");
         fs::write(&sqlite_target, &data_bytes)
-            .map_err(|e| format!("Failed writing SQLite database: {e}"))?;
+            .map_err(|e| SqlImportError::Fatal(format!("Failed writing SQLite database: {e}")))?;
         on_progress(
             "db_import",
             &format!(
@@ -680,7 +874,7 @@ where
             Some(50),
             None,
         );
-        let (mut cfg, cfg_src) = ensure_wp_config_base(site_dir)?;
+        let (mut cfg, cfg_src) = ensure_wp_config_base(site_dir).map_err(SqlImportError::Fatal)?;
         let clean_db_name = format!("{}_wp", domain.replace('.', "_").replace('-', "_"));
         cfg = upsert_wp_config_constant(&cfg, "DB_ENGINE", "'sqlite'");
         cfg = upsert_wp_config_constant(&cfg, "DB_DIR", "__DIR__ . '/wp-content/database'");
@@ -692,7 +886,7 @@ where
         cfg = upsert_wp_config_constant(&cfg, "WP_HOME", &format!("'{}'", esc_php(clean_target_url)));
         cfg = upsert_wp_config_constant(&cfg, "WP_SITEURL", &format!("'{}'", esc_php(clean_target_url)));
         fs::write(site_dir.join("wp-config.php"), cfg)
-            .map_err(|e| format!("Failed updating wp-config.php: {e}"))?;
+            .map_err(|e| SqlImportError::Fatal(format!("Failed updating wp-config.php: {e}")))?;
         on_progress(
             "wp_config",
             &format!("Updated wp-config.php (WP_HOME/WP_SITEURL -> {})", clean_target_url),
@@ -716,8 +910,10 @@ where
     }
 
     let port = mariadb_port.ok_or_else(|| {
-        "MariaDB is not running. Start or install MariaDB to import SQL database dumps."
-            .to_string()
+        SqlImportError::Fatal(
+            "MariaDB is not running. Start or install MariaDB to import SQL database dumps."
+                .to_string(),
+        )
     })?;
 
     on_progress(
@@ -828,20 +1024,20 @@ where
     let clean_db_name = format!("{}_wp", domain.replace('.', "_").replace('-', "_"));
     on_progress(
         "db_create",
-        &format!("Creating local MariaDB database '{}'...", clean_db_name),
+        &format!("Preparing clean MariaDB database '{}'...", clean_db_name),
         "in_progress",
         Some(30),
         Some(&format!("Target MariaDB instance: 127.0.0.1:{}", port)),
     );
-    if let Err(e) = crate::mariadb::create_database(port, &clean_db_name) {
+    if let Err(e) = crate::mariadb::reset_database(port, &clean_db_name) {
         on_progress(
             "db_create",
-            &format!("Failed creating database '{}'", clean_db_name),
+            &format!("Failed preparing database '{}'", clean_db_name),
             "error",
             None,
             Some(&e),
         );
-        return Err(e);
+        return Err(SqlImportError::Fatal(e));
     }
     on_progress(
         "db_create",
@@ -849,14 +1045,14 @@ where
         "done",
         Some(100),
         Some(&format!(
-            "Created/verified database '{}' (utf8mb4_unicode_ci) on 127.0.0.1:{}",
+            "Reset/created clean database '{}' (utf8mb4_unicode_ci) on 127.0.0.1:{}",
             clean_db_name, port
         )),
     );
 
     let tmp_sql = std::env::temp_dir().join(format!("dockpanel_wp_imp_{}.sql", uuid::Uuid::new_v4()));
     fs::write(&tmp_sql, final_sql.as_bytes())
-        .map_err(|e| format!("Failed staging SQL dump: {e}"))?;
+        .map_err(|e| SqlImportError::Fatal(format!("Failed staging SQL dump: {e}")))?;
 
     let t_imp = std::time::Instant::now();
     on_progress(
@@ -875,10 +1071,12 @@ where
         )),
     );
     let mut last_imp_msg = String::new();
-    let import_res = crate::mariadb::import_mysql_dump_with_progress(
+    let import_res = crate::mariadb::import_mysql_dump_with_compat(
         port,
         &clean_db_name,
         &tmp_sql,
+        memory_limit_mb,
+        apply_compat_fixes,
         |written, total, detail| {
             let pct = if total > 0 {
                 ((written as f64 / total as f64) * 100.0).round().clamp(5.0, 99.0) as u8
@@ -896,15 +1094,15 @@ where
         },
     );
     let _ = fs::remove_file(&tmp_sql);
-    if let Err(e) = import_res {
+    if let Err(err) = import_res {
         on_progress(
             "db_import",
             &format!("SQL import into '{}' failed", clean_db_name),
             "error",
             None,
-            Some(&e),
+            Some(err.message()),
         );
-        return Err(e);
+        return Err(err);
     }
     let imp_secs = t_imp.elapsed().as_secs_f32();
     on_progress(
@@ -946,7 +1144,7 @@ where
     }
 
     // Update wp-config.php with new local MariaDB credentials, table prefix, and site URL
-    let (mut cfg, cfg_src) = ensure_wp_config_base(site_dir)?;
+    let (mut cfg, cfg_src) = ensure_wp_config_base(site_dir).map_err(SqlImportError::Fatal)?;
     cfg_logs.push(format!("Base config source: {}", cfg_src));
     cfg = remove_wp_config_constant(&cfg, "DB_ENGINE");
     cfg = remove_wp_config_constant(&cfg, "DB_DIR");
@@ -967,7 +1165,7 @@ where
     ));
 
     fs::write(site_dir.join("wp-config.php"), cfg)
-        .map_err(|e| format!("Failed updating wp-config.php: {e}"))?;
+        .map_err(|e| SqlImportError::Fatal(format!("Failed updating wp-config.php: {e}")))?;
     on_progress(
         "wp_config",
         &format!("Updated wp-config.php (DB: {}, URL: {})", clean_db_name, clean_target_url),

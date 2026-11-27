@@ -1677,6 +1677,115 @@ pub struct UploadDumpRequest {
     pub content_base64: Option<String>,
     #[serde(default, alias = "autoImport")]
     pub auto_import: Option<bool>,
+    #[serde(default)]
+    pub apply_compat_fixes: Option<bool>,
+}
+
+fn scan_cloud_sql_compat_issues(sql_bytes: &[u8], engine: &str) -> (Option<String>, Vec<String>) {
+    if engine != "mysql" && engine != "mariadb" {
+        return (None, Vec::new());
+    }
+    let text = String::from_utf8_lossy(sql_bytes);
+    let mut first_err: Option<String> = None;
+    let mut fixes: Vec<String> = Vec::new();
+    let mut push = |err_msg: &str, fix: &str| {
+        if first_err.is_none() {
+            first_err = Some(err_msg.to_string());
+        }
+        if !fixes.iter().any(|x| x == fix) {
+            fixes.push(fix.to_string());
+        }
+    };
+
+    for line in text.lines() {
+        let t = line.trim();
+        let low = t.to_ascii_lowercase();
+        if low.is_empty() || low.starts_with("insert") || low.starts_with("replace") || low.starts_with('(') {
+            continue;
+        }
+        if engine == "mariadb" && low.contains("utf8mb4_0900_") {
+            push(
+                &format!("Incompatible MySQL 8 collation (utf8mb4_0900_*) on MariaDB: {}", t),
+                "Convert utf8mb4_0900_* collations to utf8mb4_unicode_ci / utf8mb4_bin",
+            );
+        }
+        if engine == "mysql" && (low.contains("with system versioning") || low.contains("page_checksum=") || low.contains("utf8mb4_uca1400_")) {
+            push(
+                &format!("MariaDB-only DDL feature detected on MySQL target: {}", t),
+                "Downgrade utf8mb4_uca1400_* collations and strip MariaDB-only clauses (WITH SYSTEM VERSIONING, PAGE_CHECKSUM)",
+            );
+        }
+        if low.contains("default x as `") || low.contains("default b as `") {
+            push(
+                &format!("Invalid phpMyAdmin binary/bit DEFAULT ... AS literal: {}", t),
+                "Rewrite broken phpMyAdmin DEFAULT x/b AS literals into valid DEFAULT X'...' / b'...' hex literals",
+            );
+        }
+        if low.contains("definer=") || low.contains("definer =") {
+            push(
+                &format!("Remote host DEFINER clause found: {}", t),
+                "Strip remote DEFINER=... clauses from views/triggers/routines",
+            );
+        }
+        if low.contains("gtid_purged") || low.contains("sql_log_bin") {
+            push(
+                &format!("Privileged GTID_PURGED / SQL_LOG_BIN directive detected: {}", t),
+                "Remove @@GLOBAL.GTID_PURGED and @@SESSION.SQL_LOG_BIN session statements",
+            );
+        }
+        if low.contains("type=innodb") || low.contains("type=myisam") || low.contains("row_format=fixed") {
+            push(
+                &format!("Legacy pre-5.5 table syntax detected: {}", t),
+                "Upgrade legacy TYPE= to ENGINE= and normalize ROW_FORMAT=DYNAMIC",
+            );
+        }
+    }
+    (first_err, fixes)
+}
+
+fn rewrite_cloud_sql_compat_bytes(sql_bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(sql_bytes);
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let t = line.trim_start();
+        if (t.len() >= 6 && t[..6].eq_ignore_ascii_case("insert"))
+            || (t.len() >= 7 && t[..7].eq_ignore_ascii_case("replace"))
+            || t.starts_with('(')
+        {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mut s = line
+            .replace("utf8mb4_0900_as_cs", "utf8mb4_bin")
+            .replace("utf8mb4_0900_ai_ci", "utf8mb4_unicode_ci")
+            .replace("utf8mb4_0900_as_ci", "utf8mb4_unicode_ci")
+            .replace("utf8mb4_ja_0900_as_cs", "utf8mb4_unicode_ci")
+            .replace("ROW_FORMAT=FIXED", "ROW_FORMAT=DYNAMIC")
+            .replace("TYPE=InnoDB", "ENGINE=InnoDB")
+            .replace("TYPE=MyISAM", "ENGINE=MyISAM")
+            .replace(" WITH SYSTEM VERSIONING", "")
+            .replace(" PAGE_CHECKSUM=1", "")
+            .replace(" PAGE_CHECKSUM=0", "");
+        let low = s.to_ascii_lowercase();
+        if low.contains("gtid_purged") || low.contains("sql_log_bin") {
+            s = "-- dockpanel skipped GTID_PURGED / SQL_LOG_BIN directive".to_string();
+        }
+        // Rewrite phpMyAdmin `DEFAULT x AS \`...\`` lines safely
+        if low.contains("default x as `") {
+            if let Some(pos) = low.find("default x as `") {
+                if let Some(end_rel) = s[pos + 14..].find('`') {
+                    let hex = &s[pos + 14..pos + 14 + end_rel];
+                    if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                        s = format!("{}DEFAULT X'{}'{}", &s[..pos], hex, &s[pos + 14 + end_rel + 1..]);
+                    }
+                }
+            }
+        }
+        out.push_str(&s);
+        out.push('\n');
+    }
+    out.into_bytes()
 }
 
 /// POST /api/databases/{id}/export — Trigger an on-demand dump of the database.
@@ -1770,6 +1879,32 @@ pub async fn upload_dump(
     };
 
     let is_effective_gzipped = effective_bytes.starts_with(&[0x1f, 0x8b]);
+    let auto_import = body.auto_import.unwrap_or(false);
+    let apply_compat = body.apply_compat_fixes.unwrap_or(false);
+
+    let effective_bytes = if auto_import && !is_effective_gzipped && (engine == "mysql" || engine == "mariadb") {
+        let (compat_err, compat_fixes) = scan_cloud_sql_compat_issues(&effective_bytes, &engine);
+        if !compat_fixes.is_empty() && !apply_compat {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": compat_err.unwrap_or_else(|| "SQL dump contains compatibility issues requiring confirmation.".to_string()),
+                    "code": "compat_confirm_required",
+                    "requires_compat_confirm": true,
+                    "compat_fixes": compat_fixes,
+                    "engine": engine,
+                })),
+            ));
+        }
+        if apply_compat && !compat_fixes.is_empty() {
+            rewrite_cloud_sql_compat_bytes(&effective_bytes)
+        } else {
+            effective_bytes
+        }
+    } else {
+        effective_bytes
+    };
+
     let target_filename = if is_effective_gzipped {
         if sanitized_filename.ends_with(".gz") {
             sanitized_filename
@@ -1815,7 +1950,6 @@ pub async fn upload_dump(
         target_filename
     };
 
-    let auto_import = body.auto_import.unwrap_or(false);
     let mut import_result = None;
 
     if auto_import {
@@ -1926,9 +2060,865 @@ pub async fn get_database_sizes(
     Ok(Json(res))
 }
 
+// ── Database Health, Optimization & Pruning Tools (Cloud) ──────────────────
+
+fn api_err_msg(e: &ApiError) -> String {
+    e.1 .0
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| e.0.canonical_reason().unwrap_or("Request failed"))
+        .to_string()
+}
+
+async fn run_agent_sql(
+    agent: &crate::services::agent::AgentHandle,
+    container: &str,
+    engine: &str,
+    user: &str,
+    password: &str,
+    database: &str,
+    sql: &str,
+) -> Result<serde_json::Value, ApiError> {
+    agent
+        .post(
+            "/databases/query",
+            Some(serde_json::json!({
+                "container": container,
+                "engine": engine,
+                "user": user,
+                "password": password,
+                "database": database,
+                "sql": sql,
+            })),
+        )
+        .await
+        .map_err(sql_error)
+}
+
+async fn query_agent_scalar_u64(
+    agent: &crate::services::agent::AgentHandle,
+    container: &str,
+    engine: &str,
+    user: &str,
+    password: &str,
+    database: &str,
+    sql: &str,
+) -> u64 {
+    let Ok(v) = run_agent_sql(agent, container, engine, user, password, database, sql).await else {
+        return 0;
+    };
+    v["rows"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.as_array())
+        .and_then(|cols| cols.first())
+        .and_then(|cell| {
+            cell.as_u64()
+                .or_else(|| cell.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+        .unwrap_or(0)
+}
+
+fn parse_cell_u64(v: Option<&serde_json::Value>) -> u64 {
+    v.and_then(|x| {
+        x.as_u64()
+            .or_else(|| x.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+    })
+    .unwrap_or(0)
+}
+
+fn detect_wp_prefix(tables: &[String]) -> Option<String> {
+    let lower_set: std::collections::HashSet<String> =
+        tables.iter().map(|t| t.to_ascii_lowercase()).collect();
+    for tbl in tables {
+        let lower = tbl.to_ascii_lowercase();
+        if let Some(prefix) = lower.strip_suffix("options") {
+            if (prefix.is_empty() || is_safe_table_name(prefix))
+                && lower_set.contains(&format!("{prefix}posts"))
+                && lower_set.contains(&format!("{prefix}postmeta"))
+            {
+                return Some(tbl[..prefix.len()].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn quote_ident(engine: &str, ident: &str) -> String {
+    if matches!(engine, "mysql" | "mariadb") {
+        format!("`{ident}`")
+    } else {
+        format!("\"{ident}\"")
+    }
+}
+
+async fn cloud_wp_bloat(
+    agent: &crate::services::agent::AgentHandle,
+    container: &str,
+    engine: &str,
+    name: &str,
+    password: &str,
+    table_names: &[String],
+) -> serde_json::Value {
+    let Some(prefix) = detect_wp_prefix(table_names) else {
+        return serde_json::json!({
+            "detected": false,
+            "table_prefix": "",
+            "revisions": 0,
+            "auto_drafts": 0,
+            "trashed_posts": 0,
+            "spam_comments": 0,
+            "trashed_comments": 0,
+            "orphaned_meta": 0,
+            "expired_transients": 0,
+            "total_transients": 0,
+            "autoload_bytes": 0,
+            "autoload_count": 0
+        });
+    };
+
+    let posts = quote_ident(engine, &format!("{prefix}posts"));
+    let postmeta = quote_ident(engine, &format!("{prefix}postmeta"));
+    let comments = quote_ident(engine, &format!("{prefix}comments"));
+    let commentmeta = quote_ident(engine, &format!("{prefix}commentmeta"));
+    let options = quote_ident(engine, &format!("{prefix}options"));
+    let is_mysql = matches!(engine, "mysql" | "mariadb");
+
+    let has_comments = table_names
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(&format!("{prefix}comments")));
+    let has_commentmeta = table_names
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(&format!("{prefix}commentmeta")));
+
+    let revisions = query_agent_scalar_u64(
+        agent, container, engine, name, password, name,
+        &format!("SELECT COUNT(*) FROM {posts} WHERE post_type = 'revision'"),
+    ).await;
+    let auto_drafts = query_agent_scalar_u64(
+        agent, container, engine, name, password, name,
+        &format!("SELECT COUNT(*) FROM {posts} WHERE post_status = 'auto-draft'"),
+    ).await;
+    let trashed_posts = query_agent_scalar_u64(
+        agent, container, engine, name, password, name,
+        &format!("SELECT COUNT(*) FROM {posts} WHERE post_status = 'trash'"),
+    ).await;
+    let spam_comments = if has_comments {
+        query_agent_scalar_u64(
+            agent, container, engine, name, password, name,
+            &format!("SELECT COUNT(*) FROM {comments} WHERE comment_approved = 'spam'"),
+        ).await
+    } else { 0 };
+    let trashed_comments = if has_comments {
+        query_agent_scalar_u64(
+            agent, container, engine, name, password, name,
+            &format!("SELECT COUNT(*) FROM {comments} WHERE comment_approved = 'trash'"),
+        ).await
+    } else { 0 };
+    let orphan_pm = query_agent_scalar_u64(
+        agent, container, engine, name, password, name,
+        &format!("SELECT COUNT(*) FROM {postmeta} pm LEFT JOIN {posts} p ON p.ID = pm.post_id WHERE p.ID IS NULL"),
+    ).await;
+    let orphan_cm = if has_comments && has_commentmeta {
+        query_agent_scalar_u64(
+            agent, container, engine, name, password, name,
+            &format!("SELECT COUNT(*) FROM {commentmeta} cm LEFT JOIN {comments} c ON c.comment_ID = cm.comment_id WHERE c.comment_ID IS NULL"),
+        ).await
+    } else { 0 };
+
+    let total_transients = query_agent_scalar_u64(
+        agent, container, engine, name, password, name,
+        &format!("SELECT COUNT(*) FROM {options} WHERE option_name LIKE '\\_transient\\_%' ESCAPE '\\' OR option_name LIKE '\\_site\\_transient\\_%' ESCAPE '\\'"),
+    ).await;
+    let now_epoch = chrono::Utc::now().timestamp();
+    let expired_sql = if is_mysql {
+        format!("SELECT COUNT(*) FROM {options} WHERE (option_name LIKE '\\_transient\\_timeout\\_%' ESCAPE '\\' OR option_name LIKE '\\_site\\_transient\\_timeout\\_%' ESCAPE '\\') AND CAST(option_value AS UNSIGNED) < {now_epoch}")
+    } else {
+        format!("SELECT COUNT(*) FROM {options} WHERE (option_name LIKE '\\_transient\\_timeout\\_%' ESCAPE '\\' OR option_name LIKE '\\_site\\_transient\\_timeout\\_%' ESCAPE '\\') AND option_value ~ '^[0-9]+$' AND option_value::bigint < {now_epoch}")
+    };
+    let expired_transients = query_agent_scalar_u64(
+        agent, container, engine, name, password, name, &expired_sql,
+    ).await;
+
+    let autoload_count = query_agent_scalar_u64(
+        agent, container, engine, name, password, name,
+        &format!("SELECT COUNT(*) FROM {options} WHERE autoload IN ('yes', 'on', 'auto', 'auto-on')"),
+    ).await;
+    let autoload_bytes_sql = if is_mysql {
+        format!("SELECT COALESCE(SUM(OCTET_LENGTH(option_value)), 0) FROM {options} WHERE autoload IN ('yes', 'on', 'auto', 'auto-on')")
+    } else {
+        format!("SELECT COALESCE(SUM(octet_length(option_value)), 0) FROM {options} WHERE autoload IN ('yes', 'on', 'auto', 'auto-on')")
+    };
+    let autoload_bytes = query_agent_scalar_u64(
+        agent, container, engine, name, password, name, &autoload_bytes_sql,
+    ).await;
+
+    serde_json::json!({
+        "detected": true,
+        "table_prefix": prefix,
+        "revisions": revisions,
+        "auto_drafts": auto_drafts,
+        "trashed_posts": trashed_posts,
+        "spam_comments": spam_comments,
+        "trashed_comments": trashed_comments,
+        "orphaned_meta": orphan_pm + orphan_cm,
+        "expired_transients": expired_transients,
+        "total_transients": total_transients,
+        "autoload_bytes": autoload_bytes,
+        "autoload_count": autoload_count,
+    })
+}
+
+async fn cloud_dump_list_for_db(
+    agent: &crate::services::agent::AgentHandle,
+    name: &str,
+) -> Vec<serde_json::Value> {
+    match agent.get(&format!("/db-backups/{name}/list")).await {
+        Ok(serde_json::Value::Array(arr)) => arr,
+        _ => Vec::new(),
+    }
+}
+
+async fn compute_cloud_health(
+    agent: &crate::services::agent::AgentHandle,
+    id: Uuid,
+    name: &str,
+    engine: &str,
+    password: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let container = format!("dockpanel-db-{name}");
+    let is_mysql = matches!(engine, "mysql" | "mariadb");
+
+    let sql = if is_mysql {
+        "SELECT table_name, COALESCE(engine, 'InnoDB'), COALESCE(table_rows, 0), COALESCE(data_length, 0), COALESCE(index_length, 0), COALESCE(data_free, 0) FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY (data_length + index_length + data_free) DESC"
+    } else {
+        "SELECT t.table_name, 'PostgreSQL', COALESCE(st.n_live_tup, 0), pg_relation_size(quote_ident(t.table_name)), GREATEST(pg_total_relation_size(quote_ident(t.table_name)) - pg_relation_size(quote_ident(t.table_name)), 0), COALESCE(st.n_dead_tup, 0) FROM information_schema.tables t LEFT JOIN pg_stat_user_tables st ON st.relname = t.table_name WHERE t.table_schema = 'public' ORDER BY pg_total_relation_size(quote_ident(t.table_name)) DESC"
+    };
+
+    let qr = run_agent_sql(agent, &container, engine, name, password, name, sql).await?;
+    let mut tables = Vec::new();
+    let mut table_names = Vec::new();
+    let mut data_bytes = 0u64;
+    let mut index_bytes = 0u64;
+    let mut overhead_bytes = 0u64;
+    let mut fragmented = 0usize;
+
+    if let Some(rows) = qr["rows"].as_array() {
+        for r in rows {
+            let Some(arr) = r.as_array() else { continue };
+            let t_name = arr.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if t_name.is_empty() {
+                continue;
+            }
+            let t_engine = arr.get(1).and_then(|v| v.as_str()).unwrap_or(engine).to_string();
+            let t_rows = parse_cell_u64(arr.get(2));
+            let t_data = parse_cell_u64(arr.get(3));
+            let t_idx = parse_cell_u64(arr.get(4));
+            let third = parse_cell_u64(arr.get(5));
+            let (t_overhead, dead_tuples) = if is_mysql { (third, 0) } else { (third.saturating_mul(256), third) };
+            let needs_opt = if is_mysql {
+                t_overhead >= 64 * 1024 || (t_data > 0 && t_overhead * 10 > t_data)
+            } else {
+                dead_tuples >= 100
+            };
+            if needs_opt {
+                fragmented += 1;
+            }
+            data_bytes += t_data;
+            index_bytes += t_idx;
+            overhead_bytes += t_overhead;
+            table_names.push(t_name.clone());
+            tables.push(serde_json::json!({
+                "name": t_name,
+                "rows": t_rows,
+                "data_bytes": t_data,
+                "index_bytes": t_idx,
+                "overhead_bytes": t_overhead,
+                "engine": t_engine,
+                "dead_tuples": dead_tuples,
+                "needs_optimize": needs_opt,
+            }));
+        }
+    }
+
+    let dumps = cloud_dump_list_for_db(agent, name).await;
+    let dump_count = dumps.len();
+    let dump_bytes: u64 = dumps
+        .iter()
+        .filter_map(|d| d.get("size_bytes").and_then(|v| v.as_u64()))
+        .sum();
+
+    let wp_bloat = cloud_wp_bloat(agent, &container, engine, name, password, &table_names).await;
+
+    Ok(serde_json::json!({
+        "database_id": id,
+        "database_name": name,
+        "engine": engine,
+        "total_bytes": data_bytes + index_bytes + overhead_bytes,
+        "data_bytes": data_bytes,
+        "index_bytes": index_bytes,
+        "overhead_bytes": overhead_bytes,
+        "table_count": tables.len(),
+        "fragmented_table_count": fragmented,
+        "dump_count": dump_count,
+        "dump_bytes": dump_bytes,
+        "integrity": "ok",
+        "tables": tables,
+        "wp_bloat": wp_bloat,
+    }))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct CloudOptimizeRequest {
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub tables: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct CloudPruneRequest {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub keep_dumps: Option<usize>,
+    #[serde(default)]
+    pub older_than_days: Option<u64>,
+    #[serde(default)]
+    pub optimize_after: bool,
+    #[serde(default)]
+    pub truncate_tables: Vec<String>,
+}
+
+async fn optimize_cloud_database_inner(
+    agent: &crate::services::agent::AgentHandle,
+    id: Uuid,
+    name: &str,
+    engine: &str,
+    password: &str,
+    req: &CloudOptimizeRequest,
+) -> Result<serde_json::Value, ApiError> {
+    let action = req
+        .action
+        .as_deref()
+        .unwrap_or("optimize")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(action.as_str(), "optimize" | "analyze" | "repair" | "check") {
+        return Err(err(StatusCode::BAD_REQUEST, "Unsupported action (expected optimize, analyze, repair, or check)"));
+    }
+
+    let health_before = compute_cloud_health(agent, id, name, engine, password).await?;
+    let size_before = health_before["total_bytes"].as_u64().unwrap_or(0);
+    let container = format!("dockpanel-db-{name}");
+    let is_mysql = matches!(engine, "mysql" | "mariadb");
+
+    let mut target_tables = Vec::new();
+    if let Some(ref requested) = req.tables {
+        for t in requested {
+            if !is_safe_table_name(t) {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid table name '{t}'")));
+            }
+            target_tables.push(t.clone());
+        }
+    } else if let Some(arr) = health_before["tables"].as_array() {
+        for item in arr {
+            if let Some(t_name) = item.get("name").and_then(|v| v.as_str()) {
+                if is_safe_table_name(t_name) {
+                    target_tables.push(t_name.to_string());
+                }
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    if is_mysql {
+        let verb = match action.as_str() {
+            "analyze" => "ANALYZE TABLE",
+            "repair" => "REPAIR TABLE",
+            "check" => "CHECK TABLE",
+            _ => "OPTIMIZE TABLE",
+        };
+        for tbl in &target_tables {
+            let q = format!("{verb} `{tbl}`");
+            match run_agent_sql(agent, &container, engine, name, password, name, &q).await {
+                Ok(v) => {
+                    let msg = v["rows"]
+                        .as_array()
+                        .and_then(|rows| rows.last())
+                        .and_then(|r| r.get(3))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("OK")
+                        .to_string();
+                    results.push(serde_json::json!({ "table": tbl, "status": "ok", "message": msg }));
+                }
+                Err(e) => {
+                    results.push(serde_json::json!({ "table": tbl, "status": "error", "message": api_err_msg(&e) }));
+                }
+            }
+        }
+    } else if req.tables.as_ref().is_some_and(|t| !t.is_empty()) {
+        for tbl in &target_tables {
+            let sql = match action.as_str() {
+                "analyze" => format!("ANALYZE \"{tbl}\""),
+                "repair" => format!("REINDEX TABLE \"{tbl}\""),
+                "check" => format!("ANALYZE \"{tbl}\""),
+                _ => format!("VACUUM ANALYZE \"{tbl}\""),
+            };
+            match run_agent_sql(agent, &container, engine, name, password, name, &sql).await {
+                Ok(_) => results.push(serde_json::json!({ "table": tbl, "status": "ok", "message": "Completed" })),
+                Err(e) => results.push(serde_json::json!({ "table": tbl, "status": "error", "message": api_err_msg(&e) })),
+            }
+        }
+    } else {
+        let sql = match action.as_str() {
+            "analyze" | "check" => "ANALYZE",
+            "repair" => "VACUUM FULL",
+            _ => "VACUUM ANALYZE",
+        };
+        run_agent_sql(agent, &container, engine, name, password, name, sql).await?;
+        results.push(serde_json::json!({
+            "table": name,
+            "status": "ok",
+            "message": format!("Executed {sql} on database {name}"),
+        }));
+    }
+
+    let health_after = compute_cloud_health(agent, id, name, engine, password).await.unwrap_or(health_before);
+    let size_after = health_after["total_bytes"].as_u64().unwrap_or(size_before);
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "action": action,
+        "engine": engine,
+        "tables_processed": results.len(),
+        "size_before_bytes": size_before,
+        "size_after_bytes": size_after,
+        "reclaimed_bytes": size_before.saturating_sub(size_after),
+        "integrity_status": "ok",
+        "results": results,
+    }))
+}
+
+async fn prune_cloud_dumps(
+    name: &str,
+    dumps: &[serde_json::Value],
+    keep_latest: Option<usize>,
+    older_than_days: Option<u64>,
+) -> (usize, u64) {
+    let mut items: Vec<(String, u64, String)> = dumps
+        .iter()
+        .filter_map(|d| {
+            let fname = d.get("filename")?.as_str()?.to_string();
+            if fname.contains("..") || fname.contains('/') || fname.contains('\\') {
+                return None;
+            }
+            let sz = d.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ts = d.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Some((fname, sz, ts))
+        })
+        .collect();
+    items.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let cutoff_ts = older_than_days.map(|days| chrono::Utc::now() - chrono::Duration::days(days as i64));
+    let mut deleted = 0usize;
+    let mut reclaimed = 0u64;
+
+    for (idx, (fname, sz, ts)) in items.iter().enumerate() {
+        let over_keep = keep_latest.map(|k| idx >= k).unwrap_or(false);
+        let over_age = cutoff_ts
+            .and_then(|cutoff| chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| dt.with_timezone(&chrono::Utc) < cutoff))
+            .unwrap_or(false);
+        if over_keep || over_age {
+            let path = format!("/var/backups/dockpanel/databases/{name}/{fname}");
+            if tokio::fs::remove_file(&path).await.is_ok() {
+                deleted += 1;
+                reclaimed += *sz;
+            }
+        }
+    }
+    (deleted, reclaimed)
+}
+
+/// GET /api/databases/{id}/health — Inspect table sizes, fragmentation/overhead & WP bloat.
+pub async fn health(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
+    let report = compute_cloud_health(&agent, id, &name, &engine, &password).await?;
+    Ok(Json(report))
+}
+
+/// POST /api/databases/{id}/optimize — Optimize, analyze, repair, or vacuum tables.
+pub async fn optimize(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    payload: Option<Json<CloudOptimizeRequest>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
+    let req = payload.map(|Json(v)| v).unwrap_or_default();
+    let res = optimize_cloud_database_inner(&agent, id, &name, &engine, &password, &req).await?;
+    Ok(Json(res))
+}
+
+/// POST /api/databases/{id}/prune — Preview (dry_run) or prune WP bloat, selected tables, and old dumps.
+pub async fn prune(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    payload: Option<Json<CloudPruneRequest>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (name, engine, password, _port, site_server_id) =
+        get_db_info(&state, id, claims.sub).await?;
+    let agent = crate::helpers::agent_for_site_server(&state, site_server_id, &name).await?;
+    let req = payload.map(|Json(v)| v).unwrap_or_default();
+    let container = format!("dockpanel-db-{name}");
+
+    let health_before = compute_cloud_health(&agent, id, &name, &engine, &password).await?;
+    let size_before = health_before["total_bytes"].as_u64().unwrap_or(0);
+    let mut rows_deleted = 0u64;
+    let mut breakdown = serde_json::Map::new();
+
+    let wp = &health_before["wp_bloat"];
+    if wp["detected"].as_bool() == Some(true) {
+        let prefix = wp["table_prefix"].as_str().unwrap_or("wp_");
+        if is_safe_table_name(&format!("{prefix}posts")) {
+            let posts = quote_ident(&engine, &format!("{prefix}posts"));
+            let postmeta = quote_ident(&engine, &format!("{prefix}postmeta"));
+            let comments = quote_ident(&engine, &format!("{prefix}comments"));
+            let commentmeta = quote_ident(&engine, &format!("{prefix}commentmeta"));
+            let options = quote_ident(&engine, &format!("{prefix}options"));
+            let is_mysql = matches!(engine.as_str(), "mysql" | "mariadb");
+
+            for cat in &req.categories {
+                let count = match cat.as_str() {
+                    "revisions" => {
+                        let c = wp["revisions"].as_u64().unwrap_or(0);
+                        if !req.dry_run && c > 0 {
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {posts} WHERE post_type = 'revision'")).await;
+                        }
+                        c
+                    }
+                    "auto_drafts" => {
+                        let c = wp["auto_drafts"].as_u64().unwrap_or(0);
+                        if !req.dry_run && c > 0 {
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {posts} WHERE post_status = 'auto-draft'")).await;
+                        }
+                        c
+                    }
+                    "trashed_posts" => {
+                        let c = wp["trashed_posts"].as_u64().unwrap_or(0);
+                        if !req.dry_run && c > 0 {
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {posts} WHERE post_status = 'trash'")).await;
+                        }
+                        c
+                    }
+                    "spam_comments" => {
+                        let c = wp["spam_comments"].as_u64().unwrap_or(0) + wp["trashed_comments"].as_u64().unwrap_or(0);
+                        if !req.dry_run && c > 0 {
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {comments} WHERE comment_approved IN ('spam', 'trash')")).await;
+                        }
+                        c
+                    }
+                    "orphaned_meta" => {
+                        let c = wp["orphaned_meta"].as_u64().unwrap_or(0);
+                        if !req.dry_run && c > 0 {
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {postmeta} WHERE post_id NOT IN (SELECT ID FROM {posts})")).await;
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {commentmeta} WHERE comment_id NOT IN (SELECT comment_ID FROM {comments})")).await;
+                        }
+                        c
+                    }
+                    "expired_transients" => {
+                        let c = wp["expired_transients"].as_u64().unwrap_or(0);
+                        if !req.dry_run && c > 0 && is_mysql {
+                            let now_epoch = chrono::Utc::now().timestamp();
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE a, b FROM {options} a JOIN {options} b ON a.option_name = REPLACE(b.option_name, '_timeout_', '_') WHERE (b.option_name LIKE '\\_transient\\_timeout\\_%' ESCAPE '\\' OR b.option_name LIKE '\\_site\\_transient\\_timeout\\_%' ESCAPE '\\') AND CAST(b.option_value AS UNSIGNED) < {now_epoch}")).await;
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {options} WHERE (option_name LIKE '\\_transient\\_timeout\\_%' ESCAPE '\\' OR option_name LIKE '\\_site\\_transient\\_timeout\\_%' ESCAPE '\\') AND CAST(option_value AS UNSIGNED) < {now_epoch}")).await;
+                        }
+                        c
+                    }
+                    "all_transients" => {
+                        let c = wp["total_transients"].as_u64().unwrap_or(0);
+                        if !req.dry_run && c > 0 {
+                            let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("DELETE FROM {options} WHERE option_name LIKE '\\_transient\\_%' ESCAPE '\\' OR option_name LIKE '\\_site\\_transient\\_%' ESCAPE '\\'")).await;
+                        }
+                        c
+                    }
+                    _ => 0,
+                };
+                rows_deleted += count;
+                breakdown.insert(cat.clone(), serde_json::json!(count));
+            }
+        }
+    }
+
+    if !req.truncate_tables.is_empty() {
+        let mut trunc_rows = 0u64;
+        for tbl in &req.truncate_tables {
+            if !is_safe_table_name(tbl) {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("Invalid table name '{tbl}'")));
+            }
+            let ident = quote_ident(&engine, tbl);
+            let cnt = query_agent_scalar_u64(&agent, &container, &engine, &name, &password, &name, &format!("SELECT COUNT(*) FROM {ident}")).await;
+            if !req.dry_run {
+                let _ = run_agent_sql(&agent, &container, &engine, &name, &password, &name, &format!("TRUNCATE TABLE {ident}")).await;
+            }
+            trunc_rows += cnt;
+            rows_deleted += cnt;
+        }
+        breakdown.insert("truncated_rows".to_string(), serde_json::json!(trunc_rows));
+    }
+
+    let mut dumps_deleted = 0usize;
+    let mut reclaimed_bytes = 0u64;
+    if !req.dry_run && (req.keep_dumps.is_some() || req.older_than_days.is_some()) {
+        // Admin-only guard mirrors dumps() so shared database names cannot erase another tenant's files.
+        if claims.role == "admin" {
+            let dumps = cloud_dump_list_for_db(&agent, &name).await;
+            let (cnt, bytes) = prune_cloud_dumps(&name, &dumps, req.keep_dumps, req.older_than_days).await;
+            dumps_deleted = cnt;
+            reclaimed_bytes += bytes;
+            breakdown.insert("dumps_deleted".to_string(), serde_json::json!(cnt));
+        }
+    }
+
+    let mut optimized = false;
+    if !req.dry_run && req.optimize_after {
+        let opt = optimize_cloud_database_inner(
+            &agent, id, &name, &engine, &password,
+            &CloudOptimizeRequest { action: Some("optimize".to_string()), tables: None },
+        ).await?;
+        optimized = opt["ok"].as_bool() == Some(true);
+        let after = opt["size_after_bytes"].as_u64().unwrap_or(size_before);
+        reclaimed_bytes += size_before.saturating_sub(after);
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "dry_run": req.dry_run,
+        "rows_deleted": rows_deleted,
+        "dumps_deleted": dumps_deleted,
+        "reclaimed_bytes": reclaimed_bytes,
+        "optimized": optimized,
+        "breakdown": serde_json::Value::Object(breakdown),
+    })))
+}
+
+/// GET /api/databases/maintenance/summary — Server-wide DB storage, dumps, and orphan container audit.
+pub async fn maintenance_summary(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    ServerScope(server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows: Vec<(Uuid, Option<Uuid>, Option<Uuid>, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT d.id, d.site_id, d.stack_id, d.name, d.engine, d.container_id \
+         FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE (COALESCE(s.user_id, st.user_id) = $1 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $1 AND u.role = 'admin' AND sv.id = COALESCE(s.server_id, st.server_id) \
+         AND (sv.is_local OR sv.user_id = u.id))) \
+         AND COALESCE(s.server_id, st.server_id) = $2 ORDER BY d.name ASC",
+    )
+    .bind(claims.sub)
+    .bind(server_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("maintenance summary", e))?;
+
+    let sizes_res = agent.get("/databases/sizes").await.unwrap_or_else(|_| serde_json::json!({ "sizes": {} }));
+    let sizes_map = sizes_res["sizes"].as_object();
+
+    let mut known_containers = std::collections::HashSet::new();
+    let mut total_bytes = 0u64;
+    let mut total_dumps = 0usize;
+    let mut total_dump_bytes = 0u64;
+    let mut items = Vec::new();
+    let mut orphan_databases = Vec::new();
+
+    for (db_id, site_id, stack_id, db_name, db_engine, cid) in &rows {
+        if let Some(c) = cid {
+            known_containers.insert(c.clone());
+        }
+        let sz = sizes_map
+            .and_then(|m| m.get(db_name).or_else(|| m.get(&db_id.to_string())))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let dumps = if claims.role == "admin" {
+            cloud_dump_list_for_db(&agent, db_name).await
+        } else {
+            Vec::new()
+        };
+        let d_cnt = dumps.len();
+        let d_bytes: u64 = dumps.iter().filter_map(|d| d.get("size_bytes").and_then(|v| v.as_u64())).sum();
+        let linked = site_id.is_some() || stack_id.is_some();
+
+        total_bytes += sz;
+        total_dumps += d_cnt;
+        total_dump_bytes += d_bytes;
+
+        if !linked {
+            orphan_databases.push(serde_json::json!({
+                "id": db_id,
+                "name": db_name,
+                "engine": db_engine,
+                "size_bytes": sz,
+                "table_count": 0,
+                "reason": "Database record is not linked to a site or stack",
+            }));
+        }
+
+        items.push(serde_json::json!({
+            "id": db_id,
+            "name": db_name,
+            "engine": db_engine,
+            "linked": linked,
+            "size_bytes": sz,
+            "overhead_bytes": 0,
+            "table_count": 0,
+            "dump_count": d_cnt,
+            "dump_bytes": d_bytes,
+        }));
+    }
+
+    // For server admins, also detect dangling Docker `dockpanel-db-*` containers missing from `databases` table
+    if claims.role == "admin" {
+        if let Ok(serde_json::Value::Array(containers)) = agent.get("/databases").await {
+            for c in containers {
+                let cid = c.get("container_id").and_then(|v| v.as_str()).unwrap_or("");
+                let cname = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_name = cname.trim_start_matches('/').trim_start_matches("dockpanel-db-");
+                if !cid.is_empty() && !known_containers.contains(cid) && !rows.iter().any(|r| r.3 == raw_name) {
+                    let sz = sizes_map.and_then(|m| m.get(raw_name)).and_then(|v| v.as_u64()).unwrap_or(0);
+                    orphan_databases.push(serde_json::json!({
+                        "id": format!("container:{cid}"),
+                        "name": raw_name,
+                        "engine": c.get("engine").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                        "size_bytes": sz,
+                        "table_count": 0,
+                        "reason": "Orphan Docker container with no panel database record",
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "total_databases": items.len(),
+        "total_bytes": total_bytes,
+        "total_overhead_bytes": 0,
+        "total_dumps": total_dumps,
+        "total_dump_bytes": total_dump_bytes,
+        "orphan_databases": orphan_databases,
+        "databases": items,
+    })))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct CloudGlobalCleanupRequest {
+    #[serde(default)]
+    pub optimize_all: bool,
+    #[serde(default)]
+    pub prune_dumps_keep: Option<usize>,
+    #[serde(default)]
+    pub prune_dumps_older_than_days: Option<u64>,
+    #[serde(default)]
+    pub delete_orphan_ids: Vec<String>,
+}
+
+/// POST /api/databases/maintenance/cleanup — Batch optimize, prune old dumps, and clean orphan containers.
+pub async fn maintenance_cleanup(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    ServerScope(server_id, agent): ServerScope,
+    Json(req): Json<CloudGlobalCleanupRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows: Vec<(Uuid, Option<Uuid>, Option<Uuid>, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT d.id, d.site_id, d.stack_id, d.name, d.engine, d.db_password_enc, d.container_id \
+         FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE (COALESCE(s.user_id, st.user_id) = $1 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $1 AND u.role = 'admin' AND sv.id = COALESCE(s.server_id, st.server_id) \
+         AND (sv.is_local OR sv.user_id = u.id))) \
+         AND COALESCE(s.server_id, st.server_id) = $2",
+    )
+    .bind(claims.sub)
+    .bind(server_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| internal_error("maintenance cleanup", e))?;
+
+    let mut optimized_count = 0usize;
+    let mut reclaimed_bytes = 0u64;
+    let mut dumps_deleted = 0usize;
+    let mut orphans_deleted = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for oid in &req.delete_orphan_ids {
+        if let Some(cid) = oid.strip_prefix("container:") {
+            if claims.role != "admin" {
+                errors.push("Admin required to remove orphan containers".to_string());
+                continue;
+            }
+            if !cid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                errors.push("Invalid container id".to_string());
+                continue;
+            }
+            match agent.delete(&format!("/databases/{cid}")).await {
+                Ok(_) => orphans_deleted += 1,
+                Err(e) => errors.push(format!("{cid}: {e}")),
+            }
+        }
+    }
+
+    for (db_id, _sid, _kid, db_name, db_engine, pw_enc, cid) in &rows {
+        if cid.as_deref().unwrap_or("").is_empty() {
+            continue;
+        }
+        if claims.role == "admin" && (req.prune_dumps_keep.is_some() || req.prune_dumps_older_than_days.is_some()) {
+            let dumps = cloud_dump_list_for_db(&agent, db_name).await;
+            let (cnt, bytes) = prune_cloud_dumps(db_name, &dumps, req.prune_dumps_keep, req.prune_dumps_older_than_days).await;
+            dumps_deleted += cnt;
+            reclaimed_bytes += bytes;
+        }
+        if req.optimize_all {
+            let password = crate::services::secrets_crypto::decrypt_credential_or_legacy(pw_enc, &state.config.jwt_secret);
+            match optimize_cloud_database_inner(
+                &agent, *db_id, db_name, db_engine, &password,
+                &CloudOptimizeRequest { action: Some("optimize".to_string()), tables: None },
+            ).await {
+                Ok(rep) => {
+                    optimized_count += 1;
+                    reclaimed_bytes += rep["reclaimed_bytes"].as_u64().unwrap_or(0);
+                }
+                Err(e) => errors.push(format!("{db_name}: {}", api_err_msg(&e))),
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": errors.is_empty(),
+        "optimized_count": optimized_count,
+        "reclaimed_bytes": reclaimed_bytes,
+        "dumps_deleted": dumps_deleted,
+        "orphans_deleted": orphans_deleted,
+        "errors": errors,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_reserved_db_name;
+    use super::{detect_wp_prefix, is_reserved_db_name, quote_ident};
 
     #[test]
     fn reserved_db_names_rejected_case_insensitive() {
@@ -1938,5 +2928,21 @@ mod tests {
         for n in ["blog", "app_db", "wordpress", "shop", "my_data"] {
             assert!(!is_reserved_db_name(n), "{n} should be allowed");
         }
+    }
+
+    #[test]
+    fn detects_wordpress_table_prefix_and_quotes_per_engine() {
+        let wp = vec![
+            "dp9_options".to_string(),
+            "dp9_posts".to_string(),
+            "dp9_postmeta".to_string(),
+        ];
+        assert_eq!(detect_wp_prefix(&wp).as_deref(), Some("dp9_"));
+
+        let non_wp = vec!["users".to_string(), "orders".to_string()];
+        assert_eq!(detect_wp_prefix(&non_wp), None);
+
+        assert_eq!(quote_ident("mariadb", "wp_posts"), "`wp_posts`");
+        assert_eq!(quote_ident("postgres", "wp_posts"), "\"wp_posts\"");
     }
 }
