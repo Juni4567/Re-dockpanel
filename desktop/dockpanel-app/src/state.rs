@@ -79,6 +79,14 @@ pub struct PhpInstallJob {
     pub done: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StartupReadiness {
+    pub mariadb: String,
+    pub mariadb_error: Option<String>,
+    pub php_workers: String,
+    pub mail_catcher: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalNotification {
     pub id: String,
@@ -226,6 +234,7 @@ pub struct AppState {
     pub metrics_history: Arc<Mutex<Vec<serde_json::Value>>>,
     pub update_cache: Arc<Mutex<Option<(std::time::Instant, serde_json::Value)>>>,
     pub approved_db_scan_dirs: Arc<Mutex<Vec<PathBuf>>>,
+    pub startup_readiness: Arc<Mutex<StartupReadiness>>,
     pub notif_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     #[cfg(windows)]
     pub worker_job: Option<Arc<WorkerJobGuard>>,
@@ -584,6 +593,20 @@ impl AppState {
         let cert_resolver = Arc::new(crate::ssl::DynamicCertResolver::new());
         cert_resolver.load_existing_certs(&config_dir.join("certs"));
         let mail_catcher = crate::mail_catcher::MailCatcherStore::new(&config_dir);
+        let initial_mariadb = if cfg!(not(test)) && crate::mariadb::find_mariadbd_binary().is_some() {
+            "starting"
+        } else if crate::mariadb::find_mariadbd_binary().is_some() {
+            "stopped"
+        } else {
+            "not_installed"
+        };
+        let initial_workers = if cfg!(not(test))
+            && data.sites.iter().any(|s| s.status.eq_ignore_ascii_case("active"))
+        {
+            "starting"
+        } else {
+            "ready"
+        };
         Self {
             data: Arc::new(Mutex::new(data)),
             router_config: Arc::new(Mutex::new(router_config)),
@@ -603,6 +626,12 @@ impl AppState {
             metrics_history: Arc::new(Mutex::new(Vec::new())),
             update_cache: Arc::new(Mutex::new(None)),
             approved_db_scan_dirs: Arc::new(Mutex::new(Vec::new())),
+            startup_readiness: Arc::new(Mutex::new(StartupReadiness {
+                mariadb: initial_mariadb.to_string(),
+                mariadb_error: None,
+                php_workers: initial_workers.to_string(),
+                mail_catcher: "starting".to_string(),
+            })),
             notif_tx,
             #[cfg(windows)]
             worker_job: create_kill_on_close_job(),
@@ -2253,6 +2282,7 @@ if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string)$_SERVER['HT
                 if let Ok(mut guard) = self.mariadb_process.lock() {
                     *guard = Some((child, port));
                 }
+                self.set_startup_phase(Some("ready"), None, None, None);
                 return Ok(port);
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -2263,7 +2293,37 @@ if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string)$_SERVER['HT
             let _ = c.kill();
             let _ = c.wait();
         };
-        Err(format!("MariaDB daemon started but port {} did not become ready in time", port))
+        let err_msg = format!("MariaDB daemon started but port {} did not become ready in time", port);
+        self.set_startup_phase(Some("error"), Some(err_msg.clone()), None, None);
+        Err(err_msg)
+    }
+
+    pub fn get_startup_readiness(&self) -> StartupReadiness {
+        self.startup_readiness
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_startup_phase(
+        &self,
+        mariadb: Option<&str>,
+        mariadb_error: Option<String>,
+        php_workers: Option<&str>,
+        mail_catcher: Option<&str>,
+    ) {
+        if let Ok(mut guard) = self.startup_readiness.lock() {
+            if let Some(m) = mariadb {
+                guard.mariadb = m.to_string();
+                guard.mariadb_error = mariadb_error;
+            }
+            if let Some(p) = php_workers {
+                guard.php_workers = p.to_string();
+            }
+            if let Some(mc) = mail_catcher {
+                guard.mail_catcher = mc.to_string();
+            }
+        }
     }
 
     pub fn stop_mariadb(&self) {
@@ -2273,6 +2333,12 @@ if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string)$_SERVER['HT
                 let _ = child.wait();
             }
         }
+        let mdb_state = if crate::mariadb::find_mariadbd_binary().is_some() {
+            "stopped"
+        } else {
+            "not_installed"
+        };
+        self.set_startup_phase(Some(mdb_state), None, None, None);
     }
 
     pub fn stop_all_workers(&self) {

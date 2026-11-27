@@ -7642,12 +7642,25 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
     let cfg = state.get_router_config();
     let ssl_port = state.get_ssl_port();
     let mdb_port = state.get_mariadb_port();
+    let readiness = state.get_startup_readiness();
+    let mariadb_status = if mdb_port.is_some() {
+        "ready".to_string()
+    } else if mariadb::find_mariadbd_binary().is_none() {
+        "not_installed".to_string()
+    } else {
+        readiness.mariadb.clone()
+    };
+    let ready = mariadb_status != "starting" && readiness.php_workers == "ready";
     Json(serde_json::json!({
         "status": "ok",
         "db": "ok",
         "agent": "ok",
         "database": true,
         "agentOk": true,
+        "ready": ready,
+        "initializing": !ready,
+        "mariadb_status": mariadb_status,
+        "php_workers_status": readiness.php_workers,
         "uptime": uptime,
         "active_port": cfg.active_port,
         "preferred_port": cfg.preferred_port,
@@ -7658,6 +7671,168 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
         "mariadb_port": mdb_port,
         "default_sites_dir": state.get_default_sites_dir().to_string_lossy().to_string(),
         "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+async fn system_services_status_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cfg = state.get_router_config();
+    let ssl_port = state.get_ssl_port();
+    let mdb_port = state.get_mariadb_port();
+    let smtp_port = state.mail_catcher.smtp_port();
+    let readiness = state.get_startup_readiness();
+    let php_versions: Vec<String> = state
+        .list_php_versions()
+        .into_iter()
+        .filter(|v| v["installed"].as_bool() == Some(true))
+        .filter_map(|v| v["version"].as_str().map(String::from))
+        .collect();
+    let active_sites = state
+        .list_sites()
+        .into_iter()
+        .filter(|s| s.status.eq_ignore_ascii_case("active"))
+        .count();
+    let active_workers = state
+        .worker_ports
+        .lock()
+        .map(|m| m.values().filter(|p| !p.is_empty()).count())
+        .unwrap_or(0);
+
+    let mdb_installed = mariadb::find_mariadbd_binary().is_some();
+    let mariadb_status = if mdb_port.is_some() {
+        "ready"
+    } else if !mdb_installed {
+        "not_installed"
+    } else if readiness.mariadb == "starting" {
+        "starting"
+    } else if readiness.mariadb == "error" {
+        "error"
+    } else {
+        "stopped"
+    };
+    let mariadb_detail = if let Some(p) = mdb_port {
+        format!("Listening on 127.0.0.1:{}", p)
+    } else if !mdb_installed {
+        "Not installed (optional for MySQL/WP sites)".to_string()
+    } else if mariadb_status == "starting" {
+        "Starting MariaDB daemon...".to_string()
+    } else if let Some(ref e) = readiness.mariadb_error {
+        e.clone()
+    } else {
+        "Stopped".to_string()
+    };
+
+    let php_status = if php_versions.is_empty() {
+        "not_installed"
+    } else if readiness.php_workers == "starting" {
+        "starting"
+    } else {
+        "ready"
+    };
+    let php_detail = if php_versions.is_empty() {
+        "No PHP runtime detected".to_string()
+    } else if readiness.php_workers == "starting" {
+        format!("Starting workers ({}/{})...", active_workers, active_sites)
+    } else {
+        format!(
+            "PHP {} · {} active site worker(s)",
+            php_versions.join(", "),
+            active_workers
+        )
+    };
+
+    let mail_status = if smtp_port.is_some() {
+        "ready"
+    } else if readiness.mail_catcher == "error" {
+        "error"
+    } else {
+        "starting"
+    };
+    let mail_detail = match smtp_port {
+        Some(p) => format!("SMTP listening on 127.0.0.1:{}", p),
+        None if readiness.mail_catcher == "error" => "Failed to bind local SMTP".to_string(),
+        None => "Starting SMTP server...".to_string(),
+    };
+
+    let helper_ok = hosts_manager::is_host_helper_pipe_present();
+    let helper_status = if helper_ok { "ready" } else { "standby" };
+    let helper_detail = if helper_ok {
+        "Zero-UAC hosts pipe active".to_string()
+    } else {
+        "Using fallback hosts sync".to_string()
+    };
+
+    let initializing = mariadb_status == "starting" || php_status == "starting";
+    let ready = !initializing;
+    let summary = if initializing {
+        if mariadb_status == "starting" {
+            "Starting MariaDB database server — wait a moment before opening database sites...".to_string()
+        } else {
+            "Starting active PHP site workers...".to_string()
+        }
+    } else if mariadb_status == "error" || mariadb_status == "stopped" {
+        "Core router ready · MariaDB is offline".to_string()
+    } else {
+        format!(
+            "All services ready ({}HTTP :{}{})",
+            mdb_port.map(|p| format!("MariaDB :{} · ", p)).unwrap_or_default(),
+            cfg.active_port,
+            smtp_port.map(|p| format!(" · Mail :{}", p)).unwrap_or_default()
+        )
+    };
+
+    Json(serde_json::json!({
+        "ready": ready,
+        "initializing": initializing,
+        "uptime_secs": state.started_at.elapsed().as_secs(),
+        "summary": summary,
+        "services": [
+            {
+                "id": "mariadb",
+                "name": "MariaDB",
+                "status": mariadb_status,
+                "detail": mariadb_detail,
+                "port": mdb_port,
+            },
+            {
+                "id": "php",
+                "name": "PHP & Workers",
+                "status": php_status,
+                "detail": php_detail,
+                "versions": php_versions,
+                "active_workers": active_workers,
+                "active_sites": active_sites,
+            },
+            {
+                "id": "http_router",
+                "name": "HTTP Router",
+                "status": "ready",
+                "detail": format!("Listening on 127.0.0.1:{}", cfg.active_port),
+                "port": cfg.active_port,
+            },
+            {
+                "id": "https_router",
+                "name": "HTTPS Router",
+                "status": if ssl_port.is_some() { "ready" } else { "standby" },
+                "detail": match ssl_port {
+                    Some(p) => format!("TLS listening on 127.0.0.1:{}", p),
+                    None => "Standby (starts when SSL is enabled)".to_string(),
+                },
+                "port": ssl_port,
+            },
+            {
+                "id": "mail_catcher",
+                "name": "Mail Catcher",
+                "status": mail_status,
+                "detail": mail_detail,
+                "port": smtp_port,
+            },
+            {
+                "id": "host_helper",
+                "name": "Host Helper",
+                "status": helper_status,
+                "detail": helper_detail,
+            }
+        ]
     }))
 }
 
@@ -9107,6 +9282,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             }),
         )
         .route("/system/info", get(system_info_handler))
+        .route("/system/services-status", get(system_services_status_handler))
         .route("/system/processes", get(system_processes_handler))
         .route("/system/network", get(system_network_handler))
         .route("/telemetry/update-status", get(telemetry_update_status_handler))
@@ -9366,24 +9542,48 @@ fn start_embedded_server(state: Arc<AppState>) -> u16 {
                 .await
                 {
                     Ok(smtp_port) => {
+                        state.set_startup_phase(None, None, None, Some("ready"));
                         println!("DockPanel Local Mail Catcher listening on 127.0.0.1:{}", smtp_port);
                     }
                     Err(e) => {
+                        state.set_startup_phase(None, None, None, Some("error"));
                         eprintln!("Local Mail Catcher failed to start: {}", e);
                     }
                 }
             }
 
-            // Reconcile and start PHP workers for all active sites in the background
-            // so GUI window creation is not delayed. Clean up any orphaned PHP processes
-            // left over from crashed/killed sessions first.
+            // Start MariaDB BEFORE active PHP/Node site workers so database-backed sites
+            // never encounter connection errors when opened shortly after launch.
             let reconcile_state = state.clone();
             tokio::task::spawn_blocking(move || {
                 reconcile_state.cleanup_orphan_php_workers();
-                reconcile_state.reconcile_active_sites();
                 if mariadb::find_mariadbd_binary().is_some() {
-                    let _ = reconcile_state.start_mariadb();
+                    reconcile_state.set_startup_phase(Some("starting"), None, None, None);
+                    if let Err(e) = reconcile_state.start_mariadb() {
+                        reconcile_state.set_startup_phase(Some("error"), Some(e), None, None);
+                    }
+                } else {
+                    reconcile_state.set_startup_phase(Some("not_installed"), None, None, None);
                 }
+                reconcile_state.set_startup_phase(None, None, Some("starting"), None);
+                reconcile_state.reconcile_active_sites();
+                reconcile_state.set_startup_phase(None, None, Some("ready"), None);
+                let mdb_port = reconcile_state.get_mariadb_port();
+                let r_port = reconcile_state.get_router_config().active_port;
+                let smtp_port = reconcile_state.mail_catcher.smtp_port();
+                reconcile_state.record_event(
+                    "system_ready",
+                    "system",
+                    "DockPanel Desktop",
+                    "System Services Ready",
+                    &format!(
+                        "All services online (HTTP :{} · {}{})",
+                        r_port,
+                        mdb_port.map(|p| format!("MariaDB :{} · ", p)).unwrap_or_default(),
+                        smtp_port.map(|p| format!("Mail :{}", p)).unwrap_or_else(|| "Mail starting".into())
+                    ),
+                    "success",
+                );
             });
 
             axum::serve(
@@ -11559,6 +11759,62 @@ mod tests {
         assert_eq!(del["kept_files"], true);
         assert!(site_dir.join("marker.txt").is_file());
         assert!(!bin_path.exists());
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_system_services_status_and_startup_readiness() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "dockpanel_svc_status_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_dir = temp_dir.join("cfg");
+        let sites_dir = temp_dir.join("sites");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&sites_dir).unwrap();
+
+        let state = Arc::new(AppState::new_with_dirs(config_dir, sites_dir));
+        let app = build_api_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://127.0.0.1:{}", port);
+        let c = reqwest::Client::new();
+
+        // Simulate startup in progress -> should report initializing=true, ready=false
+        state.set_startup_phase(Some("starting"), None, Some("starting"), Some("ready"));
+        let res1: serde_json::Value = c
+            .get(format!("{}/system/services-status", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(res1["initializing"], true);
+        assert_eq!(res1["ready"], false);
+        let services1 = res1["services"].as_array().unwrap();
+        assert!(services1.iter().any(|s| s["id"] == "php" && s["status"] == "starting"));
+        assert!(services1.iter().any(|s| s["id"] == "http_router" && s["status"] == "ready"));
+        assert!(services1.iter().any(|s| s["id"] == "mail_catcher"));
+
+        // Finish startup phase -> ready=true, initializing=false
+        state.set_startup_phase(Some("ready"), None, Some("ready"), Some("ready"));
+        let res2: serde_json::Value = c
+            .get(format!("{}/system/services-status", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(res2["initializing"], false);
+        assert_eq!(res2["ready"], true);
 
         srv.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);

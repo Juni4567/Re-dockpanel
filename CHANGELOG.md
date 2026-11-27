@@ -4,6 +4,20 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.257.0] - 2026-11-27
+
+### Release: DockPanel Desktop v2.257.0 — Launch Service Readiness Bar & MariaDB-First Startup Ordering
+*Note: DockPanel Desktop (`desktop/`) is versioned independently (`2.257.0`) from live Linux server components (`panel/backend`, `panel/agent`, `panel/cli`).*
+
+#### Added & Fixed
+- **MariaDB-First Launch Ordering & Readiness Tracking (`main.rs`, `state.rs`, `hosts_manager.rs`):**
+  - Reordered desktop launch startup so `start_mariadb()` executes **before** `reconcile_active_sites()`, ensuring MariaDB is accepting connections on `127.0.0.1:3306` before PHP/site workers become live and eliminating premature database connection errors when opening sites immediately after launch.
+  - Added `StartupReadiness` phase tracking (`mariadb`, `php_workers`, `mail_catcher`) on `AppState` plus `is_host_helper_pipe_present()` in `hosts_manager.rs`, emitting a `system_ready` SSE event once all startup tasks finish.
+- **Service Readiness Status Endpoint & Enriched Health Check (`main.rs`):**
+  - Added `/api/system/services-status` (`system_services_status_handler`) and enriched `/api/health` (`health_handler`) with live per-service readiness (`mariadb`, `php`, `http_router`, `https_router`, `mail_catcher`, `host_helper`), `ready`, `initializing`, `uptime_secs`, and summary status.
+- **Launch Service Readiness Banner (`ServiceReadinessBanner.tsx`, `CommandLayout.tsx`, `GlassLayout.tsx`, `AtlasLayout.tsx`):**
+  - Mounted a prominent, collapsible live readiness bar across all desktop layouts showing real-time `Starting...` → `Ready` / `Stopped` / `Error` badges for **MariaDB**, **PHP & Workers**, **HTTP Router**, **HTTPS Router**, **Mail Catcher**, and **Host Helper**, plus a 1-click **Start MariaDB** recovery button.
+
 ## [2.256.0] - 2026-11-27
 
 ### Release: DockPanel Desktop v2.256.0 — Direct-DB WordPress Recovery Engine, Manual Folder Scan, Keep-Files Deletion, Coalesced Alerts & Cached Site Previews

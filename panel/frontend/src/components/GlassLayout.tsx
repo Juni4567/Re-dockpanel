@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { Navigate, Outlet, NavLink, Link } from "react-router-dom";
 import { GlobalNotificationBanner } from "../context/NotificationContext";
+import ServiceReadinessBanner from "./ServiceReadinessBanner";
 import { useLayoutState, badgeCount } from "../hooks/useLayoutState";
 import { useServer } from "../context/ServerContext";
 import { Icon } from "../data/icons";
@@ -461,6 +462,7 @@ export default function GlassLayout() {
           </div>
         )}
 
+        <ServiceReadinessBanner />
         <GlobalNotificationBanner />
         <Outlet />
       </main>
