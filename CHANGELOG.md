@@ -4,6 +4,26 @@ All notable changes to DockPanel / Re-dockpanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.258.0] - 2026-11-27
+
+### Release: Re-dockpanel v2.258.0 — Unified Cloud & Desktop Production Release
+*Aligns all Cloud/Server crates (`panel/backend`, `panel/agent`, `panel/cli`, `panel/mcp`), `panel/frontend`, and Desktop (`desktop/dockpanel-app`, `desktop/host-helper`, installers) to `v2.258.0` and integrates `feat/dockpanel-desktop` into `main`.*
+
+#### Added & Changed (Cloud / Server & Shared Frontend)
+- **Git Repository Management (`panel/backend/src/routes/deploy.rs`, `panel/agent/src/routes/deploy.rs`, `panel/agent/src/services/deploy.rs`, `SiteGitRepoPanel.tsx`, `Deploy.tsx`, `GitDeploys.tsx`):**
+  - Added admin-gated `git init`, remote `origin` connect/pull/clone (HTTPS token or SSH), commit & push, and disconnect workflows for Cloud site directories alongside Desktop parity.
+- **Direct-DB WordPress Recovery Engine (`panel/agent/src/services/wordpress.rs`, `panel/backend/src/routes/wordpress.rs`, `WordPress.tsx`, `WordPressToolkit.tsx`):**
+  - Bypassed `wp-load.php` / `wp-config.php` execution for listing plugins & themes, activating/deactivating themes, toggling/deactivating plugins, auto-updates, `blog_public`, setup/password resets, transient clearing, and WP-CLI actions so broken themes/plugins never break toolkit recovery.
+  - Added theme `deactivate` support with automatic DB fallback to a healthy installed theme.
+- **Keep-Files Site Deletion & Cached Preview Thumbnails (`panel/backend/src/routes/sites.rs`, `panel/agent/src/routes/nginx.rs`, `SiteDetail.tsx`, `SiteThumbnail.tsx`):**
+  - Added `?keep_files=true` support and UI checkbox in Delete Site confirmation dialogs so operators can unregister a site while keeping its files on disk.
+  - Added persistent disk-cached `/api/sites/thumbnail` endpoints and client cache versioning with manual refresh.
+- **Database Cleanup, SQL Compatibility & Notification Coalescing (`panel/backend/src/routes/databases.rs`, `DatabaseMaintenanceTab.tsx`, `DatabaseCleanupModal.tsx`, `NotificationContext.tsx`):**
+  - Added database inspection, bloat/autoload pruning, revision/transient cleanup, and table optimization tools.
+  - Added coalesced notification cards with brief timestamped logs, expandable diagnostics, and Launch Service Readiness Bar (`ServiceReadinessBanner.tsx`).
+- **Version & License Alignment:**
+  - Unified all first-party manifests (`panel/agent`, `panel/backend`, `panel/cli`, `panel/mcp`, `panel/frontend`, `desktop/dockpanel-app`, `desktop/host-helper`, installers, `FEATURES.md`, `docs/testing.md`) to `2.258.0` and declared `AGPL-3.0-only` across desktop manifests.
+
 ## [2.257.0] - 2026-11-27
 
 ### Release: DockPanel Desktop v2.257.0 — Launch Service Readiness Bar & MariaDB-First Startup Ordering

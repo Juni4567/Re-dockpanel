@@ -1,6 +1,7 @@
 [package]
 name = "dockpanel-host-helper"
-version = "2.257.0"
+version = "2.258.0"
+license = "AGPL-3.0-only"
 edition = "2021"
 
 [dependencies]
